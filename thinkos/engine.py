@@ -1,0 +1,155 @@
+"""Engine — core dispatch loop."""
+
+import uuid
+from datetime import datetime, timezone
+from thinkos.schema.context_packet import ContextPacket, validate as validate_packet, serialize as serialize_packet
+from thinkos.schema.receipt import Receipt, Action, Result, GateInfo, validate as validate_receipt, serialize as serialize_receipt
+from thinkos.config import resolve_gate
+
+
+class Engine:
+    """Core dispatch loop: parse message → resolve tool → evaluate gate → execute → record receipt."""
+
+    def __init__(self, store, connector, tool_registry, gate_registry, config):
+        self.store = store
+        self.connector = connector
+        self.tool_registry = tool_registry
+        self.gate_registry = gate_registry
+        self.config = config
+        self._sequence = 0
+
+    def _next_sequence(self) -> int:
+        self._sequence += 1
+        return self._sequence
+
+    def _make_receipt(self, session_id: str, action_type: str, tool: str | None,
+                      params: dict | None, agent: str, result_status: str,
+                      result_summary: str, packet_ids: list, error: str | None,
+                      gate_name: str | None, gate_decision: str | None,
+                      gate_reason: str | None) -> Receipt:
+        rid = f"rct_{uuid.uuid4()}"
+        now = datetime.now(timezone.utc).isoformat()
+        gate = None
+        if gate_name:
+            gate = GateInfo(gate_name=gate_name, decision=gate_decision, reason=gate_reason)
+        return Receipt(
+            receipt_id=rid,
+            session_id=session_id,
+            sequence=self._next_sequence(),
+            timestamp=now,
+            action=Action(type=action_type, tool=tool, params=params, agent=agent),
+            result=Result(status=result_status, summary=result_summary, packet_ids=packet_ids, error=error),
+            gate=gate,
+        )
+
+    def run(self):
+        while True:
+            msg = self.connector.read_message()
+            if msg is None:
+                break  # EOF
+
+            session_id = msg.get("session_id", "default")
+            sender = msg.get("sender", "unknown")
+            tool_calls = msg.get("content", {}).get("tool_calls", [])
+            response_text = ""
+            tool_results = []
+            context_packets = []
+            receipt_ids = []
+
+            for tc in tool_calls:
+                tool_name = tc.get("tool", "")
+                params = tc.get("params", {})
+                call_id = tc.get("call_id", "")
+
+                # Resolve tool
+                tool_adapter = self.tool_registry.get(tool_name)
+                if tool_adapter is None:
+                    receipt = self._make_receipt(
+                        session_id, "tool_call", tool_name, params, sender,
+                        "error", f"Unknown tool: '{tool_name}'", [], f"Unknown tool: '{tool_name}'",
+                        None, None, None
+                    )
+                    self.store.write_receipt(receipt)
+                    tool_results.append({"tool": tool_name, "call_id": call_id,
+                                         "status": "error", "output": "", "receipt_id": receipt.receipt_id})
+                    receipt_ids.append(receipt.receipt_id)
+                    continue
+
+                # Resolve gate
+                try:
+                    gate = resolve_gate(tool_name, self.config, self.gate_registry)
+                except ValueError as e:
+                    receipt = self._make_receipt(
+                        session_id, "tool_call", tool_name, params, sender,
+                        "error", str(e), [], str(e), None, None, None
+                    )
+                    self.store.write_receipt(receipt)
+                    tool_results.append({"tool": tool_name, "call_id": call_id,
+                                         "status": "error", "output": "", "receipt_id": receipt.receipt_id})
+                    receipt_ids.append(receipt.receipt_id)
+                    continue
+
+                # Evaluate gate
+                gate_decision = gate.evaluate(tool_name, params)
+                if gate_decision["action"] == "deny":
+                    receipt = self._make_receipt(
+                        session_id, "tool_call", tool_name, params, sender,
+                        "denied", gate_decision.get("reason", "Denied by gate"), [],
+                        gate_decision.get("reason"), gate.name, "deny", gate_decision.get("reason")
+                    )
+                    self.store.write_receipt(receipt)
+                    tool_results.append({"tool": tool_name, "call_id": call_id,
+                                         "status": "denied", "output": "", "receipt_id": receipt.receipt_id})
+                    receipt_ids.append(receipt.receipt_id)
+                    continue
+
+                if gate_decision["action"] == "ask":
+                    # Interactive prompt already handled by gate.evaluate
+                    # If user said no, gate returns deny
+                    if gate_decision.get("action") == "deny":
+                        receipt = self._make_receipt(
+                            session_id, "tool_call", tool_name, params, sender,
+                            "denied", gate_decision.get("reason", "Denied by user"), [],
+                            gate_decision.get("reason"), gate.name, "deny", gate_decision.get("reason")
+                        )
+                        self.store.write_receipt(receipt)
+                        tool_results.append({"tool": tool_name, "call_id": call_id,
+                                             "status": "denied", "output": "", "receipt_id": receipt.receipt_id})
+                        receipt_ids.append(receipt.receipt_id)
+                        continue
+
+                # Execute tool
+                context = {"session_id": session_id, "agent_id": sender, "store": self.store}
+                result = tool_adapter.execute(params, context)
+
+                receipt = self._make_receipt(
+                    session_id, "tool_call", tool_name, params, sender,
+                    result.get("status", "ok"), result.get("output", "")[:200],
+                    [], result.get("error"), gate.name, "allow",
+                    gate_decision.get("reason", "Allowed by gate")
+                )
+                self.store.write_receipt(receipt)
+
+                tool_results.append({
+                    "tool": tool_name,
+                    "call_id": call_id,
+                    "status": result.get("status", "ok"),
+                    "output": result.get("output", ""),
+                    "receipt_id": receipt.receipt_id,
+                })
+                receipt_ids.append(receipt.receipt_id)
+
+            # Build response
+            response = {
+                "type": "agent_response",
+                "in_response_to": msg.get("message_id", ""),
+                "session_id": session_id,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "content": {
+                    "text": response_text,
+                    "tool_results": tool_results,
+                    "context_packets": context_packets,
+                    "receipts": receipt_ids,
+                }
+            }
+            self.connector.write_response(response)

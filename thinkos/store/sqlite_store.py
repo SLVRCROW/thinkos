@@ -1,0 +1,257 @@
+"""SQLite-backed append-only store for context packets and receipts."""
+
+import json
+import sqlite3
+from typing import Optional
+from thinkos.schema.context_packet import ContextPacket, check_dag_depth
+from thinkos.schema.receipt import Receipt, Action, Result, GateInfo
+
+
+class CycleError(Exception):
+    pass
+
+
+class DepthError(Exception):
+    pass
+
+
+class DuplicateError(Exception):
+    pass
+
+
+class SQLiteStore:
+    """Append-only store using SQLite. No update or delete methods exposed."""
+
+    def __init__(self, db_path: str = ":memory:"):
+        self._conn = sqlite3.connect(db_path)
+        self._conn.execute("PRAGMA journal_mode=WAL")
+        self._init_tables()
+
+    def _init_tables(self):
+        self._conn.executescript("""
+            CREATE TABLE IF NOT EXISTS packets (
+                packet_id TEXT PRIMARY KEY,
+                schema_version INTEGER NOT NULL,
+                session_id TEXT NOT NULL,
+                parent_id TEXT,
+                timestamp TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                source TEXT NOT NULL,
+                content_text TEXT NOT NULL,
+                content_structured TEXT,
+                tags TEXT,
+                refs TEXT,
+                metadata TEXT
+            );
+            CREATE TABLE IF NOT EXISTS receipts (
+                receipt_id TEXT PRIMARY KEY,
+                schema_version INTEGER NOT NULL,
+                session_id TEXT NOT NULL,
+                sequence INTEGER NOT NULL,
+                timestamp TEXT NOT NULL,
+                action_type TEXT NOT NULL,
+                action_tool TEXT,
+                action_params TEXT,
+                action_agent TEXT NOT NULL,
+                result_status TEXT NOT NULL,
+                result_summary TEXT NOT NULL,
+                result_packet_ids TEXT,
+                result_error TEXT,
+                gate_name TEXT,
+                gate_decision TEXT,
+                gate_reason TEXT,
+                supersedes TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_receipts_session_seq
+                ON receipts(session_id, sequence);
+            CREATE INDEX IF NOT EXISTS idx_packets_session
+                ON packets(session_id, kind);
+        """)
+        self._conn.commit()
+
+    def _get_parent_depth(self, packet_id: str) -> int:
+        """Traverse parent_id chain to find depth. Returns 0 if not found."""
+        depth = 0
+        current = packet_id
+        visited = set()
+        while current is not None:
+            if current in visited:
+                return depth  # cycle detected, return current depth
+            visited.add(current)
+            row = self._conn.execute(
+                "SELECT parent_id FROM packets WHERE packet_id = ?", (current,)
+            ).fetchone()
+            if row is None:
+                break
+            current = row[0]
+            depth += 1
+            if depth > 5:
+                break
+        return depth
+
+    def _check_cycle(self, packet: ContextPacket) -> bool:
+        """Return True if writing this packet would create a cycle."""
+        if packet.parent_id is None:
+            return False
+        current = packet.parent_id
+        visited = set()
+        while current is not None:
+            if current == packet.packet_id:
+                return True
+            if current in visited:
+                return True
+            visited.add(current)
+            row = self._conn.execute(
+                "SELECT parent_id FROM packets WHERE packet_id = ?", (current,)
+            ).fetchone()
+            if row is None:
+                break
+            current = row[0]
+        return False
+
+    def write_packet(self, packet: ContextPacket):
+        if self._conn.execute(
+            "SELECT 1 FROM packets WHERE packet_id = ?", (packet.packet_id,)
+        ).fetchone():
+            raise DuplicateError(f"packet_id '{packet.packet_id}' already exists")
+
+        if self._check_cycle(packet):
+            raise CycleError("Writing this packet would create a cycle")
+
+        depth = self._get_parent_depth(packet.parent_id) if packet.parent_id else 0
+        if depth >= 5:
+            raise DepthError(f"DAG depth exceeds maximum of 5")
+
+        content_structured = json.dumps(packet.content.get("structured")) if packet.content.get("structured") else None
+        tags = json.dumps(packet.tags) if packet.tags else None
+        refs = json.dumps(packet.refs) if packet.refs else None
+        metadata = json.dumps(packet.metadata) if packet.metadata else None
+
+        self._conn.execute(
+            """INSERT INTO packets
+               (packet_id, schema_version, session_id, parent_id, timestamp, kind, source,
+                content_text, content_structured, tags, refs, metadata)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (packet.packet_id, packet.schema_version, packet.session_id, packet.parent_id,
+             packet.timestamp, packet.kind, packet.source,
+             packet.content.get("text", ""), content_structured, tags, refs, metadata)
+        )
+        self._conn.commit()
+
+    def read_packet(self, packet_id: str) -> ContextPacket | None:
+        row = self._conn.execute(
+            "SELECT * FROM packets WHERE packet_id = ?", (packet_id,)
+        ).fetchone()
+        if row is None:
+            return None
+        return self._row_to_packet(row)
+
+    def list_packets(self, session_id: str | None = None, kind: str | None = None,
+                     tags: list[str] | None = None, limit: int = 100) -> list[ContextPacket]:
+        query = "SELECT * FROM packets WHERE 1=1"
+        params = []
+        if session_id:
+            query += " AND session_id = ?"
+            params.append(session_id)
+        if kind:
+            query += " AND kind = ?"
+            params.append(kind)
+        query += " ORDER BY timestamp ASC LIMIT ?"
+        params.append(limit)
+        rows = self._conn.execute(query, params).fetchall()
+        return [self._row_to_packet(r) for r in rows]
+
+    def _row_to_packet(self, row) -> ContextPacket:
+        return ContextPacket(
+            packet_id=row[0],
+            schema_version=row[1],
+            session_id=row[2],
+            parent_id=row[3],
+            timestamp=row[4],
+            kind=row[5],
+            source=row[6],
+            content={"text": row[7], "structured": json.loads(row[8]) if row[8] else None},
+            tags=json.loads(row[9]) if row[9] else [],
+            refs=json.loads(row[10]) if row[10] else [],
+            metadata=json.loads(row[11]) if row[11] else {},
+        )
+
+    def write_receipt(self, receipt: Receipt):
+        if self._conn.execute(
+            "SELECT 1 FROM receipts WHERE receipt_id = ?", (receipt.receipt_id,)
+        ).fetchone():
+            raise DuplicateError(f"receipt_id '{receipt.receipt_id}' already exists")
+
+        action_params = json.dumps(receipt.action.params) if receipt.action.params else None
+        packet_ids = json.dumps(receipt.result.packet_ids) if receipt.result.packet_ids else None
+
+        self._conn.execute(
+            """INSERT INTO receipts
+               (receipt_id, schema_version, session_id, sequence, timestamp,
+                action_type, action_tool, action_params, action_agent,
+                result_status, result_summary, result_packet_ids, result_error,
+                gate_name, gate_decision, gate_reason, supersedes)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (receipt.receipt_id, receipt.schema_version, receipt.session_id, receipt.sequence,
+             receipt.timestamp,
+             receipt.action.type, receipt.action.tool, action_params, receipt.action.agent,
+             receipt.result.status, receipt.result.summary, packet_ids, receipt.result.error,
+             receipt.gate.gate_name if receipt.gate else None,
+             receipt.gate.decision if receipt.gate else None,
+             receipt.gate.reason if receipt.gate else None,
+             receipt.supersedes)
+        )
+        self._conn.commit()
+
+    def read_receipt(self, receipt_id: str) -> Receipt | None:
+        row = self._conn.execute(
+            "SELECT * FROM receipts WHERE receipt_id = ?", (receipt_id,)
+        ).fetchone()
+        if row is None:
+            return None
+        return self._row_to_receipt(row)
+
+    def list_receipts(self, session_id: str | None = None, limit: int = 100) -> list[Receipt]:
+        query = "SELECT * FROM receipts WHERE 1=1"
+        params = []
+        if session_id:
+            query += " AND session_id = ?"
+            params.append(session_id)
+        query += " ORDER BY sequence ASC LIMIT ?"
+        params.append(limit)
+        rows = self._conn.execute(query, params).fetchall()
+        return [self._row_to_receipt(r) for r in rows]
+
+    def rehydrate(self, session_id: str) -> tuple[list[ContextPacket], list[Receipt]]:
+        receipts = self.list_receipts(session_id=session_id)
+        packet_ids = set()
+        for r in receipts:
+            if r.result.packet_ids:
+                packet_ids.update(r.result.packet_ids)
+        packets = []
+        for pid in packet_ids:
+            p = self.read_packet(pid)
+            if p:
+                packets.append(p)
+        return packets, receipts
+
+    def _row_to_receipt(self, row) -> Receipt:
+        action_params = json.loads(row[7]) if row[7] else None
+        packet_ids = json.loads(row[11]) if row[11] else []
+        gate = None
+        if row[13] or row[14]:
+            gate = GateInfo(gate_name=row[13], decision=row[14], reason=row[15])
+        return Receipt(
+            receipt_id=row[0],
+            schema_version=row[1],
+            session_id=row[2],
+            sequence=row[3],
+            timestamp=row[4],
+            action=Action(type=row[5], tool=row[6], params=action_params, agent=row[8]),
+            result=Result(status=row[9], summary=row[10], packet_ids=packet_ids, error=row[12]),
+            gate=gate,
+            supersedes=row[16],
+        )
+
+    def close(self):
+        self._conn.close()

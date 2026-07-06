@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[project]
+name = "thinkos"
+version = "0.1.0"
+description = "Agent-native, harness-agnostic operating layer for externalizing project memory"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.scripts]
+thinkos = "thinkos.__main__:main"
+
+[tool.setuptools.packages.find]
+include = ["thinkos*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
