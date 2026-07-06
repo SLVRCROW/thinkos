@@ -12,7 +12,7 @@ from thinkos.gates import GATE_REGISTRY, register_gate
 from thinkos.gates.always_allow import AlwaysAllowGate
 from thinkos.gates.confirm import ConfirmGate
 from thinkos.gates.deny_all import DenyAllGate
-from thinkos.config import DEFAULT_CONFIG
+from thinkos.config import load_config
 
 
 @pytest.fixture
@@ -24,7 +24,9 @@ def engine():
     register_gate("always_allow", AlwaysAllowGate())
     register_gate("confirm", ConfirmGate())
     register_gate("deny_all", DenyAllGate())
-    eng = Engine(store, connector, TOOL_REGISTRY, GATE_REGISTRY, DEFAULT_CONFIG)
+    # Use a config with explicit allowed_root to avoid CWD dependency
+    config = load_config("/nonexistent/path.json")
+    eng = Engine(store, connector, TOOL_REGISTRY, GATE_REGISTRY, config)
     return eng, store
 
 
@@ -43,14 +45,12 @@ class TestEngineDispatch:
                 "context_refs": [],
             }
         }
-        # We can't easily test run() interactively, so test the dispatch logic directly
         from thinkos.config import resolve_gate
         tool_adapter = eng.tool_registry.get("nonexistent")
         assert tool_adapter is None
 
     def test_receipt_created_for_every_action(self, engine):
         eng, store = engine
-        # Simulate a tool call through the engine's internal methods
         session_id = "sess_test"
         receipt = eng._make_receipt(
             session_id, "tool_call", "read_file", {"path": "/tmp/test"}, "test",

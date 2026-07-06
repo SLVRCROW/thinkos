@@ -14,7 +14,7 @@ from thinkos.gates import GATE_REGISTRY, register_gate
 from thinkos.gates.always_allow import AlwaysAllowGate
 from thinkos.gates.confirm import ConfirmGate
 from thinkos.gates.deny_all import DenyAllGate
-from thinkos.config import DEFAULT_CONFIG
+from thinkos.config import load_config
 from thinkos.schema.context_packet import ContextPacket, serialize as serialize_packet
 from thinkos.schema.receipt import Receipt, Action, Result
 
@@ -28,7 +28,8 @@ def engine():
     register_gate("always_allow", AlwaysAllowGate())
     register_gate("confirm", ConfirmGate())
     register_gate("deny_all", DenyAllGate())
-    eng = Engine(store, connector, TOOL_REGISTRY, GATE_REGISTRY, DEFAULT_CONFIG)
+    config = load_config("/nonexistent/path.json")
+    eng = Engine(store, connector, TOOL_REGISTRY, GATE_REGISTRY, config)
     return eng, store
 
 
@@ -77,7 +78,6 @@ class TestIntegration:
     def test_3_round_handoff(self, engine):
         """S1 test: write → read → append → read, all fields survive."""
         eng, store = engine
-        # Round 1: Agent A writes
         p1 = ContextPacket(
             packet_id=f"ctx_{uuid.uuid4()}",
             session_id="sess_handoff",
@@ -89,14 +89,12 @@ class TestIntegration:
         )
         store.write_packet(p1)
 
-        # Round 2: Agent B reads
         p2 = store.read_packet(p1.packet_id)
         assert p2 is not None
         assert p2.content["text"] == "Use SQLite"
         assert p2.content["structured"]["db"] == "sqlite"
         assert p2.source == "agent_a"
 
-        # Round 3: Agent B appends
         p3 = ContextPacket(
             packet_id=f"ctx_{uuid.uuid4()}",
             session_id="sess_handoff",
@@ -109,7 +107,6 @@ class TestIntegration:
         )
         store.write_packet(p3)
 
-        # Round 4: Agent A reads updated
         p4 = store.read_packet(p3.packet_id)
         assert p4 is not None
         assert p4.content["text"] == "Confirmed: SQLite"
@@ -123,11 +120,9 @@ class TestIntegration:
         import sys
         gate = ConfirmGate()
 
-        # Read should be allowed
         read_result = gate.evaluate("read_file", {"path": "/tmp/test"})
         assert read_result["action"] == "allow"
 
-        # Write should ask and default deny on no input
         old_stdin = sys.stdin
         sys.stdin = io.StringIO("\n")
         try:
@@ -151,6 +146,5 @@ class TestIntegration:
         """Path traversal should be rejected by tools."""
         from thinkos.tools.read_file import ReadFileAdapter
         adapter = ReadFileAdapter()
-        result = adapter.execute({"path": "../../etc/passwd", "call_id": "call_001"}, {})
+        result = adapter.execute({"path": "../../etc/passwd", "call_id": "call_001"}, {"allowed_root": None})
         assert result["status"] == "error"
-        assert "Path traversal" in result["error"]

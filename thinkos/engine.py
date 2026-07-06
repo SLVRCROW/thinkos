@@ -4,7 +4,7 @@ import uuid
 from datetime import datetime, timezone
 from thinkos.schema.context_packet import ContextPacket, validate as validate_packet, serialize as serialize_packet
 from thinkos.schema.receipt import Receipt, Action, Result, GateInfo, validate as validate_receipt, serialize as serialize_receipt
-from thinkos.config import resolve_gate
+from thinkos.config import resolve_gate, get_allowed_root
 
 
 class Engine:
@@ -119,7 +119,12 @@ class Engine:
                         continue
 
                 # Execute tool
-                context = {"session_id": session_id, "agent_id": sender, "store": self.store}
+                context = {
+                    "session_id": session_id,
+                    "agent_id": sender,
+                    "store": self.store,
+                    "allowed_root": get_allowed_root(self.config),
+                }
                 result = tool_adapter.execute(params, context)
 
                 receipt = self._make_receipt(

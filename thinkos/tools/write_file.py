@@ -1,6 +1,10 @@
-"""WriteFileAdapter — write text content to files."""
+"""WriteFileAdapter — write text content to files.
+
+Path sandboxing is enforced by default. See thinkos/tools/sandbox.py.
+"""
 
 import os
+from thinkos.tools.sandbox import resolve_path, SandboxError
 
 
 class WriteFileAdapter:
@@ -9,43 +13,49 @@ class WriteFileAdapter:
 
     def execute(self, params: dict, context: dict) -> dict:
         path = params.get("path", "")
-        content = params.get("content", "")
+        call_id = params.get("call_id", "")
 
         if not path:
-            return {"status": "error", "call_id": params.get("call_id", ""),
-                    "output": "", "error": "Missing required parameter: 'path'",
-                    "artifacts": [], "receipts": []}
-        if not content:
-            return {"status": "error", "call_id": params.get("call_id", ""),
-                    "output": "", "error": "Missing required parameter: 'content'",
-                    "artifacts": [], "receipts": []}
+            return _error(call_id, "Missing required parameter: 'path'")
 
-        # Path traversal check
-        if ".." in path.split(os.sep):
-            return {"status": "error", "call_id": params.get("call_id", ""),
-                    "output": "", "error": "Path traversal rejected",
-                    "artifacts": [], "receipts": []}
+        # content is allowed to be empty string; only reject if key is absent
+        if "content" not in params:
+            return _error(call_id, "Missing required parameter: 'content'")
+        content = params.get("content", "")
+
+        allowed_root = context.get("allowed_root")
+        try:
+            safe_path = resolve_path(path, allowed_root)
+        except SandboxError as e:
+            return _error(call_id, str(e))
 
         try:
-            parent = os.path.dirname(path)
+            parent = os.path.dirname(safe_path)
             if parent and not os.path.exists(parent):
                 os.makedirs(parent, exist_ok=True)
-            with open(path, "w", encoding="utf-8") as f:
+            with open(safe_path, "w", encoding="utf-8") as f:
                 f.write(content)
         except PermissionError:
-            return {"status": "error", "call_id": params.get("call_id", ""),
-                    "output": "", "error": f"Permission denied: {path}",
-                    "artifacts": [], "receipts": []}
+            return _error(call_id, f"Permission denied: {path}")
         except Exception as e:
-            return {"status": "error", "call_id": params.get("call_id", ""),
-                    "output": "", "error": str(e),
-                    "artifacts": [], "receipts": []}
+            return _error(call_id, str(e))
 
         return {
             "status": "ok",
-            "call_id": params.get("call_id", ""),
+            "call_id": call_id,
             "output": f"Wrote {len(content)} bytes to {path}",
             "error": None,
-            "artifacts": [{"path": path, "bytes_written": len(content)}],
+            "artifacts": [{"path": safe_path, "bytes_written": len(content)}],
+            "receipts": [],
+        }
+
+
+def _error(call_id: str, msg: str) -> dict:
+        return {
+            "status": "error",
+            "call_id": call_id,
+            "output": "",
+            "error": msg,
+            "artifacts": [],
             "receipts": [],
         }

@@ -1,19 +1,48 @@
-"""Tests for config loader."""
+"""Tests for config loader — including allowed_root sandbox defaults."""
 
 import json
 import tempfile
 import os
-from thinkos.config import load_config, resolve_gate, DEFAULT_CONFIG
+import pytest
+from thinkos.config import load_config, resolve_gate, get_allowed_root
 from thinkos.gates.always_allow import AlwaysAllowGate
 from thinkos.gates.confirm import ConfirmGate
 
 
 class TestLoadConfig:
-    def test_default_config(self):
+    def test_default_config_has_tools_key(self):
         config = load_config("/nonexistent/path.json")
-        assert config == DEFAULT_CONFIG
+        assert "tools" in config
+        assert "allowed_root" in config["tools"]
 
-    def test_custom_config(self):
+    def test_default_allowed_root_is_cwd(self):
+        """When no config file exists, allowed_root should be the CWD."""
+        config = load_config("/nonexistent/path.json")
+        root = get_allowed_root(config)
+        assert root is not None
+        assert root == os.getcwd()
+
+    def test_config_file_directory_becomes_allowed_root(self):
+        """When a config file exists, its directory becomes the allowed root."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = os.path.join(tmpdir, "thinkos.json")
+            with open(config_path, "w") as f:
+                json.dump({"gates": {"default": "always_allow"}}, f)
+            config = load_config(config_path)
+            root = get_allowed_root(config)
+            assert root == tmpdir
+
+    def test_explicit_null_disables_sandboxing(self):
+        """Explicit allowed_root: null means unsafe mode."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = os.path.join(tmpdir, "thinkos.json")
+            with open(config_path, "w") as f:
+                json.dump({"tools": {"allowed_root": None}}, f)
+            config = load_config(config_path)
+            root = get_allowed_root(config)
+            assert root is None
+
+    def test_custom_config_merges_with_defaults(self):
         data = {"gates": {"default": "always_allow", "overrides": {}}}
         with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
             json.dump(data, f)
@@ -21,6 +50,8 @@ class TestLoadConfig:
         try:
             config = load_config(fname)
             assert config["gates"]["default"] == "always_allow"
+            # tools key should still be present from defaults
+            assert "tools" in config
         finally:
             os.unlink(fname)
 
@@ -28,15 +59,17 @@ class TestLoadConfig:
 class TestResolveGate:
     def test_default_gate(self):
         gate_registry = {"confirm": ConfirmGate()}
-        gate = resolve_gate("write_file", DEFAULT_CONFIG, gate_registry)
+        config = load_config("/nonexistent/path.json")
+        gate = resolve_gate("write_file", config, gate_registry)
         assert gate.name == "confirm"
 
     def test_override_gate(self):
         gate_registry = {"always_allow": AlwaysAllowGate(), "confirm": ConfirmGate()}
-        gate = resolve_gate("read_file", DEFAULT_CONFIG, gate_registry)
+        config = load_config("/nonexistent/path.json")
+        gate = resolve_gate("read_file", config, gate_registry)
         assert gate.name == "always_allow"
 
     def test_missing_gate_raises(self):
-        import pytest
+        config = load_config("/nonexistent/path.json")
         with pytest.raises(ValueError):
-            resolve_gate("read_file", DEFAULT_CONFIG, {})
+            resolve_gate("read_file", config, {})
