@@ -4,7 +4,7 @@ import json
 import tempfile
 import os
 import pytest
-from thinkos.config import load_config, resolve_gate, get_allowed_root
+from thinkos.config import load_config, resolve_gate, get_allowed_root, validate_config
 from thinkos.gates.always_allow import AlwaysAllowGate
 from thinkos.gates.confirm import ConfirmGate
 
@@ -73,3 +73,66 @@ class TestResolveGate:
         config = load_config("/nonexistent/path.json")
         with pytest.raises(ValueError):
             resolve_gate("read_file", config, {})
+
+
+class TestValidateConfig:
+    """Tests for config load-time validation against registries."""
+
+    def test_valid_config_passes(self):
+        config = load_config("/nonexistent/path.json")
+        tool_registry = {"read_file": object(), "write_file": object()}
+        gate_registry = {"always_allow": object(), "confirm": object(), "deny_all": object()}
+        errors = validate_config(config, tool_registry, gate_registry)
+        assert errors == []
+
+    def test_invalid_default_gate_reported(self):
+        config = load_config("/nonexistent/path.json")
+        config["gates"]["default"] = "nonexistent_gate"
+        tool_registry = {"read_file": object()}
+        gate_registry = {"always_allow": object(), "confirm": object()}
+        errors = validate_config(config, tool_registry, gate_registry)
+        assert any("nonexistent_gate" in e for e in errors)
+        assert any("gates.default" in e for e in errors)
+
+    def test_unknown_tool_in_override_reported(self):
+        config = load_config("/nonexistent/path.json")
+        config["gates"]["overrides"]["unknown_tool"] = "confirm"
+        tool_registry = {"read_file": object()}
+        gate_registry = {"confirm": object()}
+        errors = validate_config(config, tool_registry, gate_registry)
+        assert any("unknown_tool" in e for e in errors)
+
+    def test_invalid_gate_in_override_reported(self):
+        config = load_config("/nonexistent/path.json")
+        config["gates"]["overrides"]["read_file"] = "nonexistent_gate"
+        tool_registry = {"read_file": object()}
+        gate_registry = {"confirm": object()}
+        errors = validate_config(config, tool_registry, gate_registry)
+        assert any("nonexistent_gate" in e for e in errors)
+        assert any("read_file" in e for e in errors)
+
+    def test_multiple_errors_reported(self):
+        config = load_config("/nonexistent/path.json")
+        config["gates"]["default"] = "bad_default"
+        config["gates"]["overrides"]["bad_tool"] = "bad_gate"
+        tool_registry = {"read_file": object()}
+        gate_registry = {"always_allow": object()}
+        errors = validate_config(config, tool_registry, gate_registry)
+        assert len(errors) >= 3  # bad_default + bad_tool ref + bad_gate ref
+
+    def test_gates_not_a_dict_reported(self):
+        """Structural check: 'gates' must be a dict."""
+        tool_registry = {"read_file": object()}
+        gate_registry = {"confirm": object()}
+        errors = validate_config({"gates": "not_a_dict"}, tool_registry, gate_registry)
+        assert any("gates" in e and "dict" in e for e in errors)
+
+    def test_overrides_not_a_dict_reported(self):
+        """Structural check: 'gates.overrides' must be a dict."""
+        tool_registry = {"read_file": object()}
+        gate_registry = {"confirm": object()}
+        errors = validate_config(
+            {"gates": {"default": "confirm", "overrides": "not_a_dict"}},
+            tool_registry, gate_registry
+        )
+        assert any("overrides" in e and "dict" in e for e in errors)

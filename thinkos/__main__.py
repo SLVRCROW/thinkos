@@ -2,7 +2,7 @@
 
 import sys
 from thinkos.engine import Engine
-from thinkos.config import load_config
+from thinkos.config import load_config, validate_config
 from thinkos.store.sqlite_store import SQLiteStore
 from thinkos.connector.stdin import StdinConnector
 from thinkos.tools import TOOL_REGISTRY, register_tool
@@ -24,6 +24,13 @@ def main():
     register_gate("always_allow", AlwaysAllowGate())
     register_gate("confirm", ConfirmGate())
     register_gate("deny_all", DenyAllGate())
+
+    # Validate config against populated registries before starting engine
+    errors = validate_config(config, TOOL_REGISTRY, GATE_REGISTRY)
+    if errors:
+        for err in errors:
+            print(f"[thinkos] ERROR: {err}", file=sys.stderr)
+        sys.exit(1)
 
     engine = Engine(store, connector, TOOL_REGISTRY, GATE_REGISTRY, config)
     engine.run()

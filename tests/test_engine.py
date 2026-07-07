@@ -15,6 +15,43 @@ from thinkos.gates.deny_all import DenyAllGate
 from thinkos.config import load_config
 
 
+# ── Helpers ─────────────────────────────────────────────────────────
+
+class _BogusGate:
+    """A gate that returns an unknown action — used to prove the engine
+    rejects it instead of silently executing the tool."""
+    name = "bogus"
+    def evaluate(self, tool_name, params):
+        return {"action": "bogus_action", "reason": "unknown test action"}
+
+
+class _TestConnector:
+    """Simulates a connector that yields a fixed list of messages then EOF.
+
+    Captures responses and errors for assertion.
+    """
+    def __init__(self, messages):
+        self.messages = list(messages)
+        self.responses = []
+        self.errors = []
+
+    def read_message(self):
+        if not self.messages:
+            return None
+        return self.messages.pop(0)
+
+    def write_response(self, response):
+        self.responses.append(response)
+
+    def write_error(self, msg):
+        self.errors.append(msg)
+
+    def close(self):
+        pass
+
+
+# ── Fixtures ───────────────────────────────────────────────────────
+
 @pytest.fixture
 def engine():
     store = SQLiteStore(":memory:")
@@ -29,6 +66,8 @@ def engine():
     eng = Engine(store, connector, TOOL_REGISTRY, GATE_REGISTRY, config)
     return eng, store
 
+
+# ── Tests ──────────────────────────────────────────────────────────
 
 class TestEngineDispatch:
     def test_unknown_tool_returns_error(self, engine):
@@ -61,3 +100,47 @@ class TestEngineDispatch:
         assert r2 is not None
         assert r2.result.status == "ok"
         assert r2.gate.decision == "allow"
+
+    def test_unknown_gate_action_raises_error(self):
+        """Proves the real Engine.run() raises ValueError when a gate
+        returns an unknown action — no tool is executed, no silent allow."""
+        store = SQLiteStore(":memory:")
+
+        # Use private registries to avoid polluting globals
+        tool_registry = {}
+        gate_registry = {}
+
+        tool_registry["read_file"] = ReadFileAdapter()
+        gate_registry["always_allow"] = AlwaysAllowGate()
+        gate_registry["confirm"] = ConfirmGate()
+        gate_registry["deny_all"] = DenyAllGate()
+        gate_registry["bogus"] = _BogusGate()
+
+        config = load_config("/nonexistent/path.json")
+        config["gates"]["overrides"]["read_file"] = "bogus"
+
+        msg = {
+            "type": "agent_message",
+            "message_id": "msg_002",
+            "session_id": "sess_test",
+            "timestamp": "2026-07-06T12:00:00Z",
+            "sender": "test",
+            "content": {
+                "text": "trigger bogus gate",
+                "tool_calls": [{"tool": "read_file", "params": {"path": "/tmp/test", "call_id": "call_002"}}],
+                "context_refs": [],
+            }
+        }
+
+        connector = _TestConnector([msg])
+        eng = Engine(store, connector, tool_registry, gate_registry, config)
+
+        with pytest.raises(ValueError, match="unknown action"):
+            eng.run()
+
+        # Verify no response was written (engine crashed before reaching write_response)
+        assert len(connector.responses) == 0
+
+        # Verify no receipts were stored (engine crashed before execution)
+        stored_receipts = store.list_receipts(session_id="sess_test")
+        assert len(stored_receipts) == 0

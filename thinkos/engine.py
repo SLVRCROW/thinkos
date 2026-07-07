@@ -91,6 +91,7 @@ class Engine:
 
                 # Evaluate gate
                 gate_decision = gate.evaluate(tool_name, params)
+
                 if gate_decision["action"] == "deny":
                     receipt = self._make_receipt(
                         session_id, "tool_call", tool_name, params, sender,
@@ -103,20 +104,14 @@ class Engine:
                     receipt_ids.append(receipt.receipt_id)
                     continue
 
-                if gate_decision["action"] == "ask":
-                    # Interactive prompt already handled by gate.evaluate
-                    # If user said no, gate returns deny
-                    if gate_decision.get("action") == "deny":
-                        receipt = self._make_receipt(
-                            session_id, "tool_call", tool_name, params, sender,
-                            "denied", gate_decision.get("reason", "Denied by user"), [],
-                            gate_decision.get("reason"), gate.name, "deny", gate_decision.get("reason")
-                        )
-                        self.store.write_receipt(receipt)
-                        tool_results.append({"tool": tool_name, "call_id": call_id,
-                                             "status": "denied", "output": "", "receipt_id": receipt.receipt_id})
-                        receipt_ids.append(receipt.receipt_id)
-                        continue
+                elif gate_decision["action"] == "allow":
+                    pass  # proceed to tool execution
+
+                else:
+                    raise ValueError(
+                        f"Gate '{gate.name}' returned unknown action "
+                        f"'{gate_decision['action']}'. Expected 'allow' or 'deny'."
+                    )
 
                 # Execute tool
                 context = {

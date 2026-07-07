@@ -87,3 +87,48 @@ def resolve_gate(tool_name: str, config: dict, gate_registry: dict):
     if gate is None:
         raise ValueError(f"Gate '{gate_name}' not found in registry")
     return gate
+
+
+def validate_config(config: dict, tool_registry: dict, gate_registry: dict) -> list[str]:
+    """Validate config references against registries.
+
+    Checks that gate names in gates.default and gates.overrides exist
+    in the gate registry, and that tool names in gates.overrides exist
+    in the tool registry.
+
+    Returns a list of error messages (empty list if config is valid).
+    """
+    errors: list[str] = []
+
+    gates_config = config.get("gates", {})
+    if not isinstance(gates_config, dict):
+        errors.append("Config error: 'gates' must be a dict")
+        return errors
+
+    # Validate default gate
+    default_gate = gates_config.get("default", "confirm")
+    if default_gate not in gate_registry:
+        errors.append(
+            f"Config error: gates.default='{default_gate}' not found in gate registry "
+            f"(available: {sorted(gate_registry.keys())})"
+        )
+
+    # Validate tool overrides
+    overrides = gates_config.get("overrides", {})
+    if not isinstance(overrides, dict):
+        errors.append("Config error: gates.overrides must be a dict")
+        return errors
+
+    for tool_name, gate_name in overrides.items():
+        if tool_name not in tool_registry:
+            errors.append(
+                f"Config error: gates.overrides references unknown tool '{tool_name}' "
+                f"(registered tools: {sorted(tool_registry.keys())})"
+            )
+        if gate_name not in gate_registry:
+            errors.append(
+                f"Config error: gate '{gate_name}' (override for tool '{tool_name}') "
+                f"not found in gate registry (available: {sorted(gate_registry.keys())})"
+            )
+
+    return errors
