@@ -1,6 +1,7 @@
 """WriteFileAdapter — write text content to files.
 
 Path sandboxing is enforced by default. See thinkos/tools/sandbox.py.
+Content size is limited by max_write_content_bytes from config.
 """
 
 import os
@@ -22,6 +23,15 @@ class WriteFileAdapter:
         if "content" not in params:
             return _error(call_id, "Missing required parameter: 'content'")
         content = params.get("content", "")
+
+        # Content size limit
+        limits = context.get("limits", {})
+        max_bytes = limits.get("max_write_content_bytes", 10485760)
+        if max_bytes and len(content.encode("utf-8")) > max_bytes:
+            return _error(
+                call_id,
+                f"Content exceeds maximum size of {max_bytes} bytes"
+            )
 
         allowed_root = context.get("allowed_root")
         try:

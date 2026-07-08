@@ -17,7 +17,9 @@ from thinkos.gates.deny_all import DenyAllGate
 def main():
     config = load_config()
     store = SQLiteStore(":memory:")
-    connector = StdinConnector()
+    connector = StdinConnector(
+        max_line_bytes=config.get("limits", {}).get("max_line_bytes", 1048576)
+    )
 
     register_tool("read_file", ReadFileAdapter())
     register_tool("write_file", WriteFileAdapter())

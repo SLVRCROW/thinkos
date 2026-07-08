@@ -55,6 +55,49 @@ class TestLoadConfig:
         finally:
             os.unlink(fname)
 
+    # -- Limits tests ---------------------------------------------------
+
+    def test_default_limits_exist(self):
+        """DEFAULT_CONFIG has a limits key with all three defaults."""
+        config = load_config("/nonexistent/path.json")
+        assert "limits" in config
+        assert config["limits"]["max_line_bytes"] == 1048576
+        assert config["limits"]["max_write_content_bytes"] == 10485760
+        assert config["limits"]["max_read_output_bytes"] == 1048576
+
+    def test_limits_override_from_config(self):
+        """Custom limits in thinkos.json override defaults."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = os.path.join(tmpdir, "thinkos.json")
+            with open(config_path, "w") as f:
+                json.dump({
+                    "limits": {
+                        "max_line_bytes": 999,
+                        "max_write_content_bytes": 888,
+                        "max_read_output_bytes": 777,
+                    }
+                }, f)
+            config = load_config(config_path)
+            assert config["limits"]["max_line_bytes"] == 999
+            assert config["limits"]["max_write_content_bytes"] == 888
+            assert config["limits"]["max_read_output_bytes"] == 777
+
+    def test_limits_partial_override(self):
+        """Setting one limit in config preserves defaults for others."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = os.path.join(tmpdir, "thinkos.json")
+            with open(config_path, "w") as f:
+                json.dump({
+                    "limits": {
+                        "max_line_bytes": 500,
+                    }
+                }, f)
+            config = load_config(config_path)
+            assert config["limits"]["max_line_bytes"] == 500
+            # Other limits should still have defaults
+            assert config["limits"]["max_write_content_bytes"] == 10485760
+            assert config["limits"]["max_read_output_bytes"] == 1048576
+
 
 class TestResolveGate:
     def test_default_gate(self):

@@ -14,6 +14,11 @@ DEFAULT_CONFIG = {
     },
     "tools": {
         "allowed_root": None  # Resolved at load time to workspace root
+    },
+    "limits": {
+        "max_line_bytes": 1048576,
+        "max_write_content_bytes": 10485760,
+        "max_read_output_bytes": 1048576,
     }
 }
 

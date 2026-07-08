@@ -1,6 +1,7 @@
 """ReadFileAdapter — read text files with optional offset/limit.
 
 Path sandboxing is enforced by default. See thinkos/tools/sandbox.py.
+File size is checked against max_read_output_bytes before reading.
 """
 
 import os
@@ -25,6 +26,17 @@ class ReadFileAdapter:
 
         if not os.path.isfile(safe_path):
             return _error(call_id, f"File not found: {path}")
+
+        # Check file size before reading into memory
+        limits = context.get("limits", {})
+        max_bytes = limits.get("max_read_output_bytes", 1048576)
+        file_size = os.path.getsize(safe_path)
+        if max_bytes and file_size > max_bytes:
+            return _error(
+                call_id,
+                f"File exceeds maximum readable size of {max_bytes} bytes "
+                f"(file is {file_size} bytes)"
+            )
 
         offset = params.get("offset")
         limit = params.get("limit")

@@ -119,6 +119,7 @@ class Engine:
                     "agent_id": sender,
                     "store": self.store,
                     "allowed_root": get_allowed_root(self.config),
+                    "limits": self.config.get("limits", {}),
                 }
                 result = tool_adapter.execute(params, context)
 
