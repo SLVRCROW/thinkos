@@ -6,6 +6,14 @@ File size is checked against max_read_output_bytes before reading.
 
 import os
 from thinkos.tools.sandbox import resolve_path, SandboxError
+from thinkos.tools.validate import validate_params
+
+SCHEMA = {
+    "path": {"required": True, "type": str},
+    "offset": {"required": False, "type": int},
+    "limit": {"required": False, "type": int},
+    "call_id": {"required": False, "type": str},
+}
 
 
 class ReadFileAdapter:
@@ -13,6 +21,12 @@ class ReadFileAdapter:
     description = "Read a text file. Returns content with line numbers."
 
     def execute(self, params: dict, context: dict) -> dict:
+        # Parameter validation
+        errors = validate_params(params, SCHEMA)
+        if errors:
+            call_id = params.get("call_id", "") if isinstance(params, dict) else ""
+            return _error(call_id, "; ".join(errors))
+
         path = params.get("path", "")
         call_id = params.get("call_id", "")
         if not path:

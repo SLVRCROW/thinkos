@@ -1,4 +1,4 @@
-"""Tests for WriteFileAdapter — content size limits."""
+"""Tests for WriteFileAdapter — content size limits and parameter validation."""
 
 import os
 import tempfile
@@ -102,4 +102,42 @@ class TestWriteFile:
         big = "x" * 200
         ctx = _context({"max_write_content_bytes": 0})
         result = adapter.execute({"path": path, "content": big, "call_id": "call_001"}, ctx)
+        assert result["status"] == "ok"
+
+    # -- Parameter validation -------------------------------------------
+
+    def test_rejects_non_dict_params(self, adapter):
+        """Non-dict params return a clean error without crashing."""
+        result = adapter.execute("not a dict", _context())
+        assert result["status"] == "error"
+        assert "Parameters must be an object" in result["error"]
+
+    def test_rejects_non_string_path(self, adapter):
+        """Non-string path returns a clean error."""
+        result = adapter.execute({"path": 123, "content": "hello", "call_id": "call_001"}, _context())
+        assert result["status"] == "error"
+        assert "must be of type str" in result["error"]
+
+    def test_rejects_non_string_content(self, adapter):
+        """Non-string content returns a clean error."""
+        result = adapter.execute({"path": "/tmp/test", "content": 42, "call_id": "call_001"}, _context())
+        assert result["status"] == "error"
+        assert "must be of type str" in result["error"]
+
+    def test_rejects_non_string_call_id(self, adapter):
+        """Non-string call_id returns a clean error."""
+        result = adapter.execute({"path": "/tmp/test", "content": "hello", "call_id": 999}, _context())
+        assert result["status"] == "error"
+        assert "must be of type str" in result["error"]
+
+    def test_rejects_unknown_param(self, adapter):
+        """Unknown param returns a clean error."""
+        result = adapter.execute({"path": "/tmp/test", "content": "hello", "mode": "append", "call_id": "call_001"}, _context())
+        assert result["status"] == "error"
+        assert "Unknown parameter" in result["error"]
+
+    def test_accepts_valid_params(self, adapter, temp_dir):
+        """Valid params still work."""
+        path = os.path.join(temp_dir, "valid.txt")
+        result = adapter.execute({"path": path, "content": "valid", "call_id": "call_001"}, _context())
         assert result["status"] == "ok"

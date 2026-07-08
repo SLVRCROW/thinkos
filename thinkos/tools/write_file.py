@@ -6,6 +6,13 @@ Content size is limited by max_write_content_bytes from config.
 
 import os
 from thinkos.tools.sandbox import resolve_path, SandboxError
+from thinkos.tools.validate import validate_params
+
+SCHEMA = {
+    "path": {"required": True, "type": str},
+    "content": {"required": True, "type": str},
+    "call_id": {"required": False, "type": str},
+}
 
 
 class WriteFileAdapter:
@@ -13,6 +20,12 @@ class WriteFileAdapter:
     description = "Write content to a file. Overwrites existing content."
 
     def execute(self, params: dict, context: dict) -> dict:
+        # Parameter validation
+        errors = validate_params(params, SCHEMA)
+        if errors:
+            call_id = params.get("call_id", "") if isinstance(params, dict) else ""
+            return _error(call_id, "; ".join(errors))
+
         path = params.get("path", "")
         call_id = params.get("call_id", "")
 

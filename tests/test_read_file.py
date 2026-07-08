@@ -1,4 +1,4 @@
-"""Tests for ReadFileAdapter — file size limits."""
+"""Tests for ReadFileAdapter — file size limits and parameter validation."""
 
 import os
 import tempfile
@@ -92,4 +92,59 @@ class TestReadFile:
         """Setting max_read_output_bytes to 0 disables the limit."""
         ctx = _context({"max_read_output_bytes": 0})
         result = adapter.execute({"path": big_file, "call_id": "call_001"}, ctx)
+        assert result["status"] == "ok"
+
+    # -- Parameter validation -------------------------------------------
+
+    def test_rejects_non_dict_params(self, adapter):
+        """Non-dict params return a clean error without crashing."""
+        result = adapter.execute("not a dict", _context())
+        assert result["status"] == "error"
+        assert "Parameters must be an object" in result["error"]
+
+    def test_rejects_non_string_path(self, adapter):
+        """Non-string path returns a clean error."""
+        result = adapter.execute({"path": 123, "call_id": "call_001"}, _context())
+        assert result["status"] == "error"
+        assert "must be of type str" in result["error"]
+
+    def test_rejects_non_int_offset(self, adapter):
+        """Non-int offset returns a clean error."""
+        result = adapter.execute({"path": "/tmp/test", "offset": "abc", "call_id": "call_001"}, _context())
+        assert result["status"] == "error"
+        assert "must be of type int" in result["error"]
+
+    def test_rejects_non_int_limit(self, adapter):
+        """Non-int limit returns a clean error."""
+        result = adapter.execute({"path": "/tmp/test", "limit": "abc", "call_id": "call_001"}, _context())
+        assert result["status"] == "error"
+        assert "must be of type int" in result["error"]
+
+    def test_rejects_bool_offset(self, adapter):
+        """Bool offset is rejected (bool is not exact int)."""
+        result = adapter.execute({"path": "/tmp/test", "offset": True, "call_id": "call_001"}, _context())
+        assert result["status"] == "error"
+        assert "must be of type int" in result["error"]
+
+    def test_rejects_bool_limit(self, adapter):
+        """Bool limit is rejected (bool is not exact int)."""
+        result = adapter.execute({"path": "/tmp/test", "limit": False, "call_id": "call_001"}, _context())
+        assert result["status"] == "error"
+        assert "must be of type int" in result["error"]
+
+    def test_rejects_non_string_call_id(self, adapter):
+        """Non-string call_id returns a clean error."""
+        result = adapter.execute({"path": "/tmp/test", "call_id": 999}, _context())
+        assert result["status"] == "error"
+        assert "must be of type str" in result["error"]
+
+    def test_rejects_unknown_param(self, adapter):
+        """Unknown param returns a clean error."""
+        result = adapter.execute({"path": "/tmp/test", "encoding": "base64", "call_id": "call_001"}, _context())
+        assert result["status"] == "error"
+        assert "Unknown parameter" in result["error"]
+
+    def test_accepts_valid_params(self, adapter, temp_file):
+        """Valid params still work."""
+        result = adapter.execute({"path": temp_file, "offset": 1, "limit": 2, "call_id": "call_001"}, _context())
         assert result["status"] == "ok"
