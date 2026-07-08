@@ -50,6 +50,50 @@ class _TestConnector:
         pass
 
 
+def _make_msg(tool_calls: list[dict], session: str = "sess_test",
+              msg_id: str = "msg_001", sender: str = "test") -> dict:
+    return {
+        "type": "agent_message",
+        "message_id": msg_id,
+        "session_id": session,
+        "timestamp": "2026-07-06T12:00:00Z",
+        "sender": sender,
+        "content": {
+            "text": "do something",
+            "tool_calls": tool_calls,
+            "context_refs": [],
+        }
+    }
+
+
+def _make_tc(tool: str = "read_file", call_id: str = "call_001",
+             params: dict | None = None) -> dict:
+    return {"tool": tool, "params": params or {}, "call_id": call_id}
+
+
+def _run_engine(config_overrides: dict | None = None,
+                messages: list[dict] | None = None):
+    """Create an engine with optional config overrides and run it against
+    *messages*, returning (store, connector)."""
+    store = SQLiteStore(":memory:")
+    connector = _TestConnector(messages or [])
+    tool_registry = {
+        "read_file": ReadFileAdapter(),
+        "write_file": WriteFileAdapter(),
+    }
+    gate_registry = {
+        "always_allow": AlwaysAllowGate(),
+        "confirm": ConfirmGate(),
+        "deny_all": DenyAllGate(),
+    }
+    config = load_config("/nonexistent/path.json")
+    if config_overrides:
+        config.update(config_overrides)
+    eng = Engine(store, connector, tool_registry, gate_registry, config)
+    eng.run()
+    return store, connector
+
+
 # ── Fixtures ───────────────────────────────────────────────────────
 
 @pytest.fixture
@@ -144,3 +188,131 @@ class TestEngineDispatch:
         # Verify no receipts were stored (engine crashed before execution)
         stored_receipts = store.list_receipts(session_id="sess_test")
         assert len(stored_receipts) == 0
+
+
+# ── Tool call limit tests ──────────────────────────────────────────
+
+class TestToolCallLimit:
+    """All-or-nothing max_tool_calls_per_message enforcement."""
+
+    def test_rejects_entire_message_when_exceeds_limit(self):
+        """Message with 11 calls, limit 10: zero tools execute."""
+        calls = [_make_tc(call_id=f"call_{i:03d}") for i in range(11)]
+        store, connector = _run_engine(
+            messages=[_make_msg(calls)],
+        )
+        assert len(connector.responses) == 1
+        resp = connector.responses[0]
+        # tool_results must be empty
+        assert resp["content"]["tool_results"] == []
+        # exactly one receipt
+        assert len(resp["content"]["receipts"]) == 1
+        # receipt status is denied
+        receipt = store.read_receipt(resp["content"]["receipts"][0])
+        assert receipt is not None
+        assert receipt.result.status == "denied"
+
+    def test_zero_tools_execute_when_over_limit(self):
+        """No tool receipts exist when the message is denied."""
+        calls = [_make_tc(call_id=f"call_{i:03d}") for i in range(11)]
+        store, connector = _run_engine(
+            messages=[_make_msg(calls)],
+        )
+        # Only the denial receipt should exist
+        all_receipts = store.list_receipts()
+        assert len(all_receipts) == 1
+        assert all_receipts[0].result.status == "denied"
+
+    def test_zero_gates_evaluated_when_over_limit(self):
+        """No gate evaluation occurs when the message is denied.
+
+        Use a bogus gate that would raise if called. If the limit check
+        happens before gate resolution, the bogus gate is never reached.
+        """
+        store = SQLiteStore(":memory:")
+        connector = _TestConnector([
+            _make_msg([_make_tc(tool="read_file", call_id="call_001") for _ in range(11)])
+        ])
+        tool_registry = {"read_file": ReadFileAdapter()}
+        gate_registry = {
+            "always_allow": AlwaysAllowGate(),
+            "bogus": _BogusGate(),
+        }
+        config = load_config("/nonexistent/path.json")
+        config["gates"]["overrides"]["read_file"] = "bogus"
+        eng = Engine(store, connector, tool_registry, gate_registry, config)
+        # Should NOT raise ValueError (bogus gate never called)
+        eng.run()
+        assert len(connector.responses) == 1
+        resp = connector.responses[0]
+        assert resp["content"]["tool_results"] == []
+
+    def test_only_one_denial_receipt_when_over_limit(self):
+        """Exactly one receipt is written when the message is denied."""
+        calls = [_make_tc(call_id=f"call_{i:03d}") for i in range(11)]
+        store, connector = _run_engine(
+            messages=[_make_msg(calls)],
+        )
+        all_receipts = store.list_receipts()
+        assert len(all_receipts) == 1
+
+    def test_response_has_empty_tool_results_when_over_limit(self):
+        """tool_results is empty when the message is denied."""
+        calls = [_make_tc(call_id=f"call_{i:03d}") for i in range(11)]
+        store, connector = _run_engine(
+            messages=[_make_msg(calls)],
+        )
+        resp = connector.responses[0]
+        assert resp["content"]["tool_results"] == []
+
+    def test_response_text_includes_limit_and_count(self):
+        """Response text mentions the limit, actual count, and zero-tools wording."""
+        calls = [_make_tc(call_id=f"call_{i:03d}") for i in range(11)]
+        store, connector = _run_engine(
+            messages=[_make_msg(calls)],
+        )
+        resp = connector.responses[0]
+        text = resp["content"]["text"]
+        assert "10" in text  # limit
+        assert "11" in text  # actual count
+        assert "Zero tools executed" in text
+
+    def test_allows_calls_at_limit(self):
+        """Message with exactly 10 calls executes normally."""
+        calls = [_make_tc(tool="read_file", params={"path": "/etc/hostname"},
+                          call_id=f"call_{i:03d}") for i in range(10)]
+        store, connector = _run_engine(
+            messages=[_make_msg(calls)],
+            config_overrides={"tools": {"allowed_root": None}},
+        )
+        assert len(connector.responses) == 1
+        resp = connector.responses[0]
+        # All 10 calls should have results
+        assert len(resp["content"]["tool_results"]) == 10
+        # None should be denied by the tool-call limit
+        for tr in resp["content"]["tool_results"]:
+            assert tr["status"] != "denied"
+
+    def test_allows_calls_under_limit(self):
+        """Message with 5 calls executes normally."""
+        calls = [_make_tc(tool="read_file", params={"path": "/tmp/test"},
+                          call_id=f"call_{i:03d}") for i in range(5)]
+        store, connector = _run_engine(
+            messages=[_make_msg(calls)],
+        )
+        assert len(connector.responses) == 1
+        resp = connector.responses[0]
+        assert len(resp["content"]["tool_results"]) == 5
+
+    def test_limit_disabled_when_null(self):
+        """Setting max_tool_calls_per_message to 0 allows a large message."""
+        calls = [_make_tc(tool="read_file", params={"path": "/tmp/test"},
+                          call_id=f"call_{i:03d}") for i in range(50)]
+        store, connector = _run_engine(
+            messages=[_make_msg(calls)],
+            config_overrides={"limits": {"max_tool_calls_per_message": 0}},
+        )
+        assert len(connector.responses) == 1
+        resp = connector.responses[0]
+        # All 50 calls should have results
+        assert len(resp["content"]["tool_results"]) == 50

@@ -19,6 +19,7 @@ DEFAULT_CONFIG = {
         "max_line_bytes": 1048576,
         "max_write_content_bytes": 10485760,
         "max_read_output_bytes": 1048576,
+        "max_tool_calls_per_message": 10,
     }
 }
 
