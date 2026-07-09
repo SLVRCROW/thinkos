@@ -4,6 +4,7 @@ import json
 import sqlite3
 from typing import Optional
 from thinkos.schema.context_packet import ContextPacket, check_dag_depth
+from thinkos.schema.experiment_record import ExperimentRecord, normalize as normalize_experiment
 from thinkos.schema.receipt import Receipt, Action, Result, GateInfo
 
 
@@ -66,6 +67,28 @@ class SQLiteStore:
                 ON receipts(session_id, sequence);
             CREATE INDEX IF NOT EXISTS idx_packets_session
                 ON packets(session_id, kind);
+            CREATE TABLE IF NOT EXISTS experiments (
+                experiment_id TEXT PRIMARY KEY,
+                schema_version INTEGER NOT NULL,
+                session_id TEXT NOT NULL,
+                timestamp TEXT NOT NULL,
+                tool_name TEXT NOT NULL,
+                params_summary TEXT,
+                metric_name TEXT NOT NULL,
+                metric_value REAL NOT NULL,
+                baseline_value REAL,
+                baseline_experiment_id TEXT,
+                decision TEXT NOT NULL,
+                decision_reason TEXT,
+                receipt_id TEXT,
+                packet_ids TEXT,
+                tags TEXT,
+                metadata TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_experiments_session
+                ON experiments(session_id, timestamp);
+            CREATE INDEX IF NOT EXISTS idx_experiments_metric
+                ON experiments(metric_name, session_id);
         """)
         self._conn.commit()
 
@@ -251,6 +274,85 @@ class SQLiteStore:
             result=Result(status=row[9], summary=row[10], packet_ids=packet_ids, error=row[12]),
             gate=gate,
             supersedes=row[16],
+        )
+
+    def write_experiment(self, record: ExperimentRecord):
+        if self._conn.execute(
+            "SELECT 1 FROM experiments WHERE experiment_id = ?", (record.experiment_id,)
+        ).fetchone():
+            raise DuplicateError(f"experiment_id '{record.experiment_id}' already exists")
+
+        normalize_experiment(record)
+
+        params_summary = record.params_summary
+        baseline_value = record.baseline_value
+        packet_ids = json.dumps(record.packet_ids) if record.packet_ids else None
+        tags = json.dumps(record.tags) if record.tags else None
+        metadata = json.dumps(record.metadata) if record.metadata else None
+
+        self._conn.execute(
+            """INSERT INTO experiments
+               (experiment_id, schema_version, session_id, timestamp, tool_name,
+                params_summary, metric_name, metric_value, baseline_value,
+                baseline_experiment_id, decision, decision_reason, receipt_id,
+                packet_ids, tags, metadata)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (record.experiment_id, record.schema_version, record.session_id,
+             record.timestamp, record.tool_name,
+             params_summary, record.metric_name, record.metric_value,
+             baseline_value, record.baseline_experiment_id,
+             record.decision, record.decision_reason, record.receipt_id,
+             packet_ids, tags, metadata)
+        )
+        self._conn.commit()
+
+    def read_experiment(self, experiment_id: str) -> ExperimentRecord | None:
+        row = self._conn.execute(
+            "SELECT * FROM experiments WHERE experiment_id = ?", (experiment_id,)
+        ).fetchone()
+        if row is None:
+            return None
+        return self._row_to_experiment(row)
+
+    def list_experiments(self, session_id: str, limit: int = 100) -> list[ExperimentRecord]:
+        rows = self._conn.execute(
+            "SELECT * FROM experiments WHERE session_id = ? ORDER BY timestamp ASC LIMIT ?",
+            (session_id, limit)
+        ).fetchall()
+        return [self._row_to_experiment(r) for r in rows]
+
+    def list_experiments_by_metric(self, metric_name: str, session_id: str | None = None,
+                                   limit: int = 100) -> list[ExperimentRecord]:
+        if session_id:
+            rows = self._conn.execute(
+                "SELECT * FROM experiments WHERE metric_name = ? AND session_id = ? ORDER BY timestamp ASC LIMIT ?",
+                (metric_name, session_id, limit)
+            ).fetchall()
+        else:
+            rows = self._conn.execute(
+                "SELECT * FROM experiments WHERE metric_name = ? ORDER BY timestamp ASC LIMIT ?",
+                (metric_name, limit)
+            ).fetchall()
+        return [self._row_to_experiment(r) for r in rows]
+
+    def _row_to_experiment(self, row) -> ExperimentRecord:
+        return ExperimentRecord(
+            experiment_id=row[0],
+            schema_version=row[1],
+            session_id=row[2],
+            timestamp=row[3],
+            tool_name=row[4],
+            params_summary=row[5],
+            metric_name=row[6],
+            metric_value=row[7],
+            baseline_value=row[8],
+            baseline_experiment_id=row[9],
+            decision=row[10],
+            decision_reason=row[11],
+            receipt_id=row[12],
+            packet_ids=json.loads(row[13]) if row[13] else [],
+            tags=json.loads(row[14]) if row[14] else [],
+            metadata=json.loads(row[15]) if row[15] else {},
         )
 
     def close(self):
