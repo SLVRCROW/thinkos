@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 from thinkos.schema.context_packet import ContextPacket, validate as validate_packet, serialize as serialize_packet
 from thinkos.schema.receipt import Receipt, Action, Result, GateInfo, validate as validate_receipt, serialize as serialize_receipt
 from thinkos.config import resolve_gate, get_allowed_root
+from thinkos.store.sqlite_store import DepthError
 
 
 class Engine:
@@ -17,6 +18,7 @@ class Engine:
         self.gate_registry = gate_registry
         self.config = config
         self._sequence = 0
+        self._last_packet_id: dict[str, str | None] = {}
 
     def _next_sequence(self) -> int:
         self._sequence += 1
@@ -153,9 +155,11 @@ class Engine:
 
                     # Create a context packet for every successful tool result
                     if result.get("status") == "ok":
+                        last_pid = self._last_packet_id.get(session_id)
                         packet = ContextPacket(
                             packet_id=f"ctx_{uuid.uuid4()}",
                             session_id=session_id,
+                            parent_id=last_pid,
                             timestamp=datetime.now(timezone.utc).isoformat(),
                             kind="tool_result",
                             source="thinkos",
@@ -170,7 +174,13 @@ class Engine:
                             tags=[tool_name],
                             refs=[receipt.receipt_id],
                         )
-                        self.store.write_packet(packet)
+                        try:
+                            self.store.write_packet(packet)
+                        except DepthError:
+                            # Depth limit reached — retry without parent link
+                            packet.parent_id = None
+                            self.store.write_packet(packet)
+                        self._last_packet_id[session_id] = packet.packet_id
                         context_packets.append(packet.packet_id)
 
                     tool_results.append({

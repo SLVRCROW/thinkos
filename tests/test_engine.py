@@ -254,6 +254,189 @@ class TestContextPacketWiring:
             assert p.kind == "tool_result"
 
 
+class TestContextPacketParentId:
+    """Context packets are linked via parent_id within the same session."""
+
+    def test_first_packet_has_no_parent(self):
+        """The first successful tool call in a session produces a packet with parent_id=None."""
+        store, connector = _run_engine(
+            messages=[_make_msg([_make_tc("write_file", params={"path": "/tmp/a.txt", "content": "a"})])],
+            config_overrides={"gates": {"default": "always_allow"}, "tools": {"allowed_root": None}},
+        )
+        pid = connector.responses[0]["content"]["context_packets"][0]
+        p = store.read_packet(pid)
+        assert p is not None
+        assert p.parent_id is None
+
+    def test_second_packet_links_to_first(self):
+        """The second successful tool call in the same session links to the first packet."""
+        store, connector = _run_engine(
+            messages=[_make_msg([
+                _make_tc("write_file", call_id="c1", params={"path": "/tmp/a.txt", "content": "a"}),
+                _make_tc("write_file", call_id="c2", params={"path": "/tmp/b.txt", "content": "b"}),
+            ])],
+            config_overrides={"gates": {"default": "always_allow"}, "tools": {"allowed_root": None}},
+        )
+        pids = connector.responses[0]["content"]["context_packets"]
+        p1 = store.read_packet(pids[0])
+        p2 = store.read_packet(pids[1])
+        assert p1 is not None
+        assert p2 is not None
+        assert p1.parent_id is None
+        assert p2.parent_id == p1.packet_id
+
+    def test_parent_id_scoped_to_session(self):
+        """Packets in different sessions do not cross-link."""
+        msg_a = _make_msg(
+            [_make_tc("write_file", params={"path": "/tmp/a.txt", "content": "a"})],
+            session="sess_a", msg_id="msg_a"
+        )
+        msg_b = _make_msg(
+            [_make_tc("write_file", params={"path": "/tmp/b.txt", "content": "b"})],
+            session="sess_b", msg_id="msg_b"
+        )
+        store, connector = _run_engine(
+            messages=[msg_a, msg_b],
+            config_overrides={"gates": {"default": "always_allow"}, "tools": {"allowed_root": None}},
+        )
+        assert len(connector.responses) == 2
+        pid_a = connector.responses[0]["content"]["context_packets"][0]
+        pid_b = connector.responses[1]["content"]["context_packets"][0]
+        p_a = store.read_packet(pid_a)
+        p_b = store.read_packet(pid_b)
+        assert p_a is not None
+        assert p_b is not None
+        assert p_a.parent_id is None
+        assert p_b.parent_id is None  # different session, no link
+
+    def test_denied_call_does_not_break_chain(self):
+        """A denied call does not update last_packet_id, so the next success still links correctly."""
+        store, connector = _run_engine(
+            messages=[_make_msg([
+                _make_tc("write_file", call_id="c1", params={"path": "/tmp/a.txt", "content": "a"}),
+                _make_tc("write_file", call_id="c2", params={"path": "/tmp/b.txt", "content": "b"}),
+                _make_tc("write_file", call_id="c3", params={"path": "/tmp/c.txt", "content": "c"}),
+            ])],
+            config_overrides={"gates": {"default": "deny_all"}, "tools": {"allowed_root": None}},
+        )
+        # All denied — no packets at all
+        assert connector.responses[0]["content"]["context_packets"] == []
+
+    def test_depth_limit_fallback_writes_packet_without_parent(self):
+        """When depth limit is reached, the packet is written with parent_id=None instead of crashing."""
+        calls = [
+            _make_tc("write_file", call_id=f"c{i}", params={"path": f"/tmp/{i}.txt", "content": str(i)})
+            for i in range(6)
+        ]
+        store, connector = _run_engine(
+            messages=[_make_msg(calls)],
+            config_overrides={"gates": {"default": "always_allow"}, "tools": {"allowed_root": None}},
+        )
+        pids = connector.responses[0]["content"]["context_packets"]
+        assert len(pids) == 6  # all 6 packets were written
+        # First 5 should be chained
+        for i in range(5):
+            p = store.read_packet(pids[i])
+            assert p is not None, f"Packet {i} should exist"
+            if i == 0:
+                assert p.parent_id is None, f"Packet {i} should have no parent"
+            else:
+                assert p.parent_id == pids[i - 1], f"Packet {i} should link to packet {i-1}"
+        # 6th packet should have no parent (depth fallback)
+        p6 = store.read_packet(pids[5])
+        assert p6 is not None
+        assert p6.parent_id is None, "6th packet should have no parent due to depth limit"
+
+    def test_denied_then_allowed_links_to_last_successful(self):
+        """A denied call does not update _last_packet_id; the next allowed call links to the last successful packet."""
+        store, connector = _run_engine(
+            messages=[_make_msg([
+                _make_tc("read_file", call_id="c1", params={"path": "/etc/hostname"}),
+                _make_tc("write_file", call_id="c2", params={"path": "/tmp/x.txt", "content": "x"}),
+                _make_tc("read_file", call_id="c3", params={"path": "/etc/hostname"}),
+            ])],
+            config_overrides={
+                "gates": {"default": "always_allow", "overrides": {"write_file": "deny_all"}},
+                "tools": {"allowed_root": None},
+            },
+        )
+        pids = connector.responses[0]["content"]["context_packets"]
+        assert len(pids) == 2  # only the two read_file calls succeeded
+        p1 = store.read_packet(pids[0])
+        p2 = store.read_packet(pids[1])
+        assert p1 is not None
+        assert p2 is not None
+        assert p1.parent_id is None
+        assert p2.parent_id == p1.packet_id  # links to p1, skipping the denied write
+
+    def test_first_call_denied_second_allowed_has_no_parent(self):
+        """When the first call is denied, the first allowed call has parent_id=None."""
+        store, connector = _run_engine(
+            messages=[_make_msg([
+                _make_tc("write_file", call_id="c1", params={"path": "/tmp/x.txt", "content": "x"}),
+                _make_tc("read_file", call_id="c2", params={"path": "/etc/hostname"}),
+            ])],
+            config_overrides={
+                "gates": {"default": "always_allow", "overrides": {"write_file": "deny_all"}},
+                "tools": {"allowed_root": None},
+            },
+        )
+        pids = connector.responses[0]["content"]["context_packets"]
+        assert len(pids) == 1  # only the read_file call succeeded
+        p = store.read_packet(pids[0])
+        assert p is not None
+        assert p.parent_id is None  # no successful packet preceded it
+
+    def test_exactly_five_calls_chain_correctly(self):
+        """Exactly 5 successful calls in a session all chain correctly with no fallback."""
+        calls = [
+            _make_tc("read_file", call_id=f"c{i}", params={"path": "/etc/hostname"})
+            for i in range(5)
+        ]
+        store, connector = _run_engine(
+            messages=[_make_msg(calls)],
+            config_overrides={"gates": {"default": "always_allow"}, "tools": {"allowed_root": None}},
+        )
+        pids = connector.responses[0]["content"]["context_packets"]
+        assert len(pids) == 5
+        for i in range(5):
+            p = store.read_packet(pids[i])
+            assert p is not None, f"Packet {i} should exist"
+            if i == 0:
+                assert p.parent_id is None, f"Packet {i} should have no parent"
+            else:
+                assert p.parent_id == pids[i - 1], f"Packet {i} should link to packet {i-1}"
+
+    def test_seven_calls_depth_fallback_then_restart(self):
+        """7 calls: first 5 chain, 6th falls back to parent_id=None, 7th links to 6th."""
+        calls = [
+            _make_tc("read_file", call_id=f"c{i}", params={"path": "/etc/hostname"})
+            for i in range(7)
+        ]
+        store, connector = _run_engine(
+            messages=[_make_msg(calls)],
+            config_overrides={"gates": {"default": "always_allow"}, "tools": {"allowed_root": None}},
+        )
+        pids = connector.responses[0]["content"]["context_packets"]
+        assert len(pids) == 7
+        # First 5 chained
+        for i in range(5):
+            p = store.read_packet(pids[i])
+            assert p is not None, f"Packet {i} should exist"
+            if i == 0:
+                assert p.parent_id is None, f"Packet {i} should have no parent"
+            else:
+                assert p.parent_id == pids[i - 1], f"Packet {i} should link to packet {i-1}"
+        # 6th: depth fallback, no parent
+        p6 = store.read_packet(pids[5])
+        assert p6 is not None
+        assert p6.parent_id is None, "6th packet should have no parent (depth fallback)"
+        # 7th: links to 6th (which was written successfully)
+        p7 = store.read_packet(pids[6])
+        assert p7 is not None
+        assert p7.parent_id == pids[5], "7th packet should link to 6th"
+
+
 # ── Tool call limit tests ──────────────────────────────────────────
 
 class TestToolCallLimit:
