@@ -148,3 +148,71 @@ class TestIntegration:
         adapter = ReadFileAdapter()
         result = adapter.execute({"path": "../../etc/passwd", "call_id": "call_001"}, {"allowed_root": None})
         assert result["status"] == "error"
+
+
+class TestIntegrationContextPackets:
+    """End-to-end: engine pipeline produces context_packets in the response."""
+
+    def test_response_includes_context_packets(self):
+        """A full engine run with a successful tool call returns context_packets."""
+        from thinkos.engine import Engine
+        from thinkos.config import load_config
+        from thinkos.store.sqlite_store import SQLiteStore
+        from thinkos.tools.read_file import ReadFileAdapter
+        from thinkos.tools.write_file import WriteFileAdapter
+        from thinkos.gates.always_allow import AlwaysAllowGate
+        from thinkos.gates.confirm import ConfirmGate
+        from thinkos.gates.deny_all import DenyAllGate
+
+        class _CaptureConnector:
+            def __init__(self, msg):
+                self.msg = msg
+                self.responses = []
+            def read_message(self):
+                if self.msg is None:
+                    return None
+                m = self.msg
+                self.msg = None
+                return m
+            def write_response(self, resp):
+                self.responses.append(resp)
+            def write_error(self, msg):
+                pass
+            def close(self):
+                pass
+
+        msg = {
+            "type": "agent_message",
+            "message_id": "msg_int_ctx",
+            "session_id": "sess_int_ctx",
+            "timestamp": "2026-07-09T22:00:00Z",
+            "sender": "test",
+            "content": {
+                "text": "write a file",
+                "tool_calls": [{"tool": "write_file", "params": {"path": "/tmp/ctx_test.txt", "content": "hello"}, "call_id": "c1"}],
+                "context_refs": [],
+            }
+        }
+
+        store = SQLiteStore(":memory:")
+        connector = _CaptureConnector(msg)
+        tool_registry = {"read_file": ReadFileAdapter(), "write_file": WriteFileAdapter()}
+        gate_registry = {"always_allow": AlwaysAllowGate(), "confirm": ConfirmGate(), "deny_all": DenyAllGate()}
+        config = load_config("/nonexistent/path.json")
+        config["gates"]["default"] = "always_allow"
+        config["gates"]["overrides"]["write_file"] = "always_allow"
+        config["tools"]["allowed_root"] = None
+
+        eng = Engine(store, connector, tool_registry, gate_registry, config)
+        eng.run()
+
+        assert len(connector.responses) == 1
+        resp = connector.responses[0]
+        assert "context_packets" in resp["content"]
+        assert len(resp["content"]["context_packets"]) == 1
+        pid = resp["content"]["context_packets"][0]
+        assert pid.startswith("ctx_")
+        p = store.read_packet(pid)
+        assert p is not None
+        assert p.kind == "tool_result"
+        assert p.source == "thinkos"

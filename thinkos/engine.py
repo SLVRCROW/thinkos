@@ -151,6 +151,28 @@ class Engine:
                     )
                     self.store.write_receipt(receipt)
 
+                    # Create a context packet for every successful tool result
+                    if result.get("status") == "ok":
+                        packet = ContextPacket(
+                            packet_id=f"ctx_{uuid.uuid4()}",
+                            session_id=session_id,
+                            timestamp=datetime.now(timezone.utc).isoformat(),
+                            kind="tool_result",
+                            source="thinkos",
+                            content={
+                                "text": f"Tool '{tool_name}' completed: {result.get('output', '')[:200]}",
+                                "structured": {
+                                    "tool": tool_name,
+                                    "params": params,
+                                    "status": "ok",
+                                },
+                            },
+                            tags=[tool_name],
+                            refs=[receipt.receipt_id],
+                        )
+                        self.store.write_packet(packet)
+                        context_packets.append(packet.packet_id)
+
                     tool_results.append({
                         "tool": tool_name,
                         "call_id": call_id,

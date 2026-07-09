@@ -190,6 +190,70 @@ class TestEngineDispatch:
         assert len(stored_receipts) == 0
 
 
+class TestContextPacketWiring:
+    """Context packets are created for successful tool calls and exposed in responses."""
+
+    def test_packet_created_on_successful_tool_call(self):
+        """A successful write_file produces a context_packet in the response."""
+        store, connector = _run_engine(
+            messages=[_make_msg([_make_tc("write_file", params={"path": "/tmp/test.txt", "content": "hello"})])],
+            config_overrides={"gates": {"default": "always_allow"}, "tools": {"allowed_root": None}},
+        )
+        assert len(connector.responses) == 1
+        resp = connector.responses[0]
+        packets = resp["content"]["context_packets"]
+        assert len(packets) == 1
+        pid = packets[0]
+        assert pid.startswith("ctx_")
+        # Verify the packet is actually in the store
+        p = store.read_packet(pid)
+        assert p is not None
+        assert p.kind == "tool_result"
+        assert p.source == "thinkos"
+        assert "write_file" in p.content["text"]
+
+    def test_no_packet_on_denied_tool_call(self):
+        """A denied tool call produces no context packet."""
+        store, connector = _run_engine(
+            messages=[_make_msg([_make_tc("write_file", params={"path": "/tmp/test.txt", "content": "hello"})])],
+            config_overrides={"gates": {"default": "deny_all"}},
+        )
+        assert len(connector.responses) == 1
+        resp = connector.responses[0]
+        assert resp["content"]["context_packets"] == []
+        # Verify no packets were stored
+        all_packets = store.list_packets()
+        assert len(all_packets) == 0
+
+    def test_packet_refs_receipt_id(self):
+        """The context packet's refs list contains the matching receipt_id."""
+        store, connector = _run_engine(
+            messages=[_make_msg([_make_tc("write_file", params={"path": "/tmp/test.txt", "content": "hello"})])],
+            config_overrides={"gates": {"default": "always_allow"}, "tools": {"allowed_root": None}},
+        )
+        resp = connector.responses[0]
+        pid = resp["content"]["context_packets"][0]
+        rid = resp["content"]["receipts"][0]
+        p = store.read_packet(pid)
+        assert rid in p.refs
+
+    def test_multiple_tool_calls_produce_multiple_packets(self):
+        """Two successful tool calls produce two context packets."""
+        store, connector = _run_engine(
+            messages=[_make_msg([
+                _make_tc("write_file", call_id="c1", params={"path": "/tmp/a.txt", "content": "a"}),
+                _make_tc("write_file", call_id="c2", params={"path": "/tmp/b.txt", "content": "b"}),
+            ])],
+            config_overrides={"gates": {"default": "always_allow"}, "tools": {"allowed_root": None}},
+        )
+        resp = connector.responses[0]
+        assert len(resp["content"]["context_packets"]) == 2
+        for pid in resp["content"]["context_packets"]:
+            p = store.read_packet(pid)
+            assert p is not None
+            assert p.kind == "tool_result"
+
+
 # ── Tool call limit tests ──────────────────────────────────────────
 
 class TestToolCallLimit:
