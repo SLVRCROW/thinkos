@@ -179,3 +179,162 @@ class TestValidateConfig:
             tool_registry, gate_registry
         )
         assert any("overrides" in e and "dict" in e for e in errors)
+
+
+class TestStoreConfig:
+    """Tests for store.path config handling."""
+
+    def test_default_store_path_is_none(self):
+        """Default config has store.path=None, meaning :memory:."""
+        config = load_config("/nonexistent/path.json")
+        from thinkos.config import get_store_path
+        assert get_store_path(config) is None
+
+    def test_relative_store_path_resolves_to_workspace(self):
+        """A relative store.path resolves against the workspace root."""
+        import tempfile, os, json
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = os.path.join(tmpdir, "thinkos.json")
+            with open(config_path, "w") as f:
+                json.dump({"store": {"path": "thinkos.db"}}, f)
+            config = load_config(config_path)
+            from thinkos.config import get_store_path
+            result = get_store_path(config)
+            assert result == os.path.join(tmpdir, "thinkos.db")
+
+    def test_absolute_store_path_used_as_is(self):
+        """An absolute store.path is used as-is."""
+        import tempfile, os, json
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = os.path.join(tmpdir, "thinkos.json")
+            with open(config_path, "w") as f:
+                json.dump({"store": {"path": "/tmp/thinkos.db"}}, f)
+            config = load_config(config_path)
+            from thinkos.config import get_store_path
+            result = get_store_path(config)
+            assert result == "/tmp/thinkos.db"
+
+    def test_data_survives_reopen(self):
+        """Writing a packet, closing the store, and reopening with the same path preserves data."""
+        import tempfile, os
+        from thinkos.store.sqlite_store import SQLiteStore
+        from thinkos.schema.context_packet import ContextPacket
+        import uuid
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = os.path.join(tmpdir, "thinkos.db")
+            store = SQLiteStore(db_path)
+            pid = f"ctx_{uuid.uuid4()}"
+            p = ContextPacket(
+                packet_id=pid,
+                session_id="sess_survive",
+                timestamp="2026-07-09T23:00:00Z",
+                kind="tool_result",
+                source="test",
+                content={"text": "survived", "structured": None},
+            )
+            store.write_packet(p)
+            store.close()
+            # Reopen
+            store2 = SQLiteStore(db_path)
+            p2 = store2.read_packet(pid)
+            assert p2 is not None
+            assert p2.content["text"] == "survived"
+            store2.close()
+
+    def test_invalid_store_path_type_rejected(self):
+        """store.path must be a string or None — bool/int/list/dict are rejected."""
+        from thinkos.config import validate_config
+        tool_registry = {"read_file": object()}
+        gate_registry = {"always_allow": object(), "confirm": object()}
+        for bad_val in [True, 42, ["a"], {"nested": "dict"}]:
+            errors = validate_config(
+                {"gates": {"default": "confirm"}, "store": {"path": bad_val}},
+                tool_registry, gate_registry
+            )
+            assert any("store.path" in e for e in errors), f"Expected error for {type(bad_val).__name__}"
+
+    def test_store_not_a_dict_rejected(self):
+        """store must be a dict if present."""
+        from thinkos.config import validate_config
+        tool_registry = {"read_file": object()}
+        gate_registry = {"always_allow": object(), "confirm": object()}
+        errors = validate_config(
+            {"gates": {"default": "confirm"}, "store": "not_a_dict"},
+            tool_registry, gate_registry
+        )
+        assert any("store" in e and "dict" in e for e in errors)
+
+
+class TestMainStoreWiring:
+    """Tests that main() passes the configured store path into SQLiteStore."""
+
+    def test_main_uses_configured_store_path(self):
+        """When store.path is set in config, main() creates SQLiteStore with that path."""
+        import tempfile, os, json, sys
+        from unittest.mock import patch
+        from thinkos.__main__ import main
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = os.path.join(tmpdir, "thinkos.json")
+            db_path = os.path.join(tmpdir, "thinkos.db")
+            with open(config_path, "w") as f:
+                json.dump({"store": {"path": "thinkos.db"}}, f)
+
+            original_cwd = os.getcwd()
+            original_argv = sys.argv
+            try:
+                os.chdir(tmpdir)
+                sys.argv = ["thinkos"]
+                # Patch stdin to return EOF immediately so main() exits
+                with patch("sys.stdin") as mock_stdin:
+                    mock_stdin.buffer.readline.return_value = b""
+                    # Patch SQLiteStore to capture the path
+                    original_init = __import__("thinkos.store.sqlite_store", fromlist=["SQLiteStore"]).SQLiteStore.__init__
+                    captured_paths = []
+
+                    def patched_init(self, db_path=":memory:"):
+                        captured_paths.append(db_path)
+                        original_init(self, db_path)
+
+                    with patch("thinkos.store.sqlite_store.SQLiteStore.__init__", patched_init):
+                        main()
+
+                assert len(captured_paths) == 1
+                assert captured_paths[0] == db_path
+            finally:
+                os.chdir(original_cwd)
+                sys.argv = original_argv
+
+    def test_main_uses_memory_when_no_store_path(self):
+        """When store.path is not set, main() creates SQLiteStore with ':memory:'."""
+        import tempfile, os, json, sys
+        from unittest.mock import patch
+        from thinkos.__main__ import main
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = os.path.join(tmpdir, "thinkos.json")
+            with open(config_path, "w") as f:
+                json.dump({"gates": {"default": "always_allow"}}, f)
+
+            original_cwd = os.getcwd()
+            original_argv = sys.argv
+            try:
+                os.chdir(tmpdir)
+                sys.argv = ["thinkos"]
+                with patch("sys.stdin") as mock_stdin:
+                    mock_stdin.buffer.readline.return_value = b""
+                    captured_paths = []
+                    original_init = __import__("thinkos.store.sqlite_store", fromlist=["SQLiteStore"]).SQLiteStore.__init__
+
+                    def patched_init(self, db_path=":memory:"):
+                        captured_paths.append(db_path)
+                        original_init(self, db_path)
+
+                    with patch("thinkos.store.sqlite_store.SQLiteStore.__init__", patched_init):
+                        main()
+
+                assert len(captured_paths) == 1
+                assert captured_paths[0] == ":memory:"
+            finally:
+                os.chdir(original_cwd)
+                sys.argv = original_argv

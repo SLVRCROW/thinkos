@@ -2,7 +2,7 @@
 
 import sys
 from thinkos.engine import Engine
-from thinkos.config import load_config, validate_config
+from thinkos.config import load_config, validate_config, get_store_path
 from thinkos.store.sqlite_store import SQLiteStore
 from thinkos.connector.stdin import StdinConnector
 from thinkos.tools import TOOL_REGISTRY, register_tool
@@ -16,7 +16,8 @@ from thinkos.gates.deny_all import DenyAllGate
 
 def main():
     config = load_config()
-    store = SQLiteStore(":memory:")
+    store_path = get_store_path(config)
+    store = SQLiteStore(store_path if store_path else ":memory:")
     connector = StdinConnector(
         max_line_bytes=config.get("limits", {}).get("max_line_bytes", 1048576)
     )

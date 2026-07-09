@@ -5,6 +5,9 @@ import json
 import os
 
 DEFAULT_CONFIG = {
+    "store": {
+        "path": None,  # None = :memory: (default)
+    },
     "gates": {
         "default": "confirm",
         "overrides": {
@@ -82,6 +85,25 @@ def get_allowed_root(config: dict) -> str | None:
     return config.get("tools", {}).get("allowed_root")
 
 
+def get_store_path(config: dict) -> str | None:
+    """Return the configured store path, or None for :memory:.
+
+    If the path is relative, it is resolved against the workspace root
+    (the directory containing the config file, or the CWD if no config
+    file was found).
+    """
+    path = config.get("store", {}).get("path")
+    if path is None:
+        return None
+    if os.path.isabs(path):
+        return path
+    # Relative path: resolve against workspace root
+    workspace_root = config.get("tools", {}).get("allowed_root")
+    if workspace_root:
+        return os.path.join(workspace_root, path)
+    return os.path.abspath(path)
+
+
 def resolve_gate(tool_name: str, config: dict, gate_registry: dict):
     """Return the gate instance for a given tool name."""
     gates_config = config.get("gates", {})
@@ -136,5 +158,18 @@ def validate_config(config: dict, tool_registry: dict, gate_registry: dict) -> l
                 f"Config error: gate '{gate_name}' (override for tool '{tool_name}') "
                 f"not found in gate registry (available: {sorted(gate_registry.keys())})"
             )
+
+    # Validate store config
+    store_config = config.get("store")
+    if store_config is not None:
+        if not isinstance(store_config, dict):
+            errors.append("Config error: 'store' must be a dict")
+        else:
+            path = store_config.get("path")
+            if path is not None and not isinstance(path, str):
+                errors.append(
+                    f"Config error: store.path must be a string or None, "
+                    f"got {type(path).__name__}"
+                )
 
     return errors
