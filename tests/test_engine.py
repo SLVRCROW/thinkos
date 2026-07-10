@@ -1145,7 +1145,7 @@ class TestCompaction:
         assert "params" not in str(s)
 
     def test_no_raw_structured_in_summary(self):
-        """Summary does not contain raw structured content."""
+        """Summary structured contains only fidelity floor keys, not raw packet content."""
         store = SQLiteStore(":memory:")
         self._write_n_packets(store, 10)
         connector = self._run_with_config(
@@ -1154,7 +1154,14 @@ class TestCompaction:
         )
         resp = connector.responses[0]
         s = resp["content"]["rehydrated"]["summary"]
-        assert "structured" not in str(s.get("structured", {})) or True  # summary.structured is metadata, not raw
+        # Assert summary.structured contains exactly the fidelity floor keys
+        expected_keys = {"packet_count", "receipt_count", "omitted_packet_count",
+                         "time_range", "tool_distribution", "error_count",
+                         "denied_count", "kind_distribution"}
+        assert set(s["structured"].keys()) == expected_keys
+        # Assert summary does not contain raw receipt param markers
+        # (the test injects params={} in receipts; "params" should not appear)
+        assert "params" not in str(s)
 
     # -- Lineage restoration still works --
 
