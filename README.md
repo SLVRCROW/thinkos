@@ -31,6 +31,10 @@ Expected output (formatted):
       "status": "ok",
       "output": "Wrote 15 bytes to hello.txt",
       "receipt_id": "rct_..."
+    }],
+    "context_packets": [{
+      "packet_id": "pkt_...",
+      "receipt_id": "rct_..."
     }]
   }
 }
@@ -67,6 +71,7 @@ ThinkOS reads `thinkos.json` or `.thinkos.json` from the current directory.
 | `gates.default` | `"confirm"` | Default gate for all tools |
 | `gates.overrides.<tool>` | — | Per-tool gate override |
 | `tools.allowed_root` | CWD | Sandbox root directory. `null` disables sandboxing. |
+| `store.path` | `null` | Optional SQLite database path. `null` uses in-memory storage; relative paths resolve against the config/workspace root. |
 
 ### Gate types
 
@@ -86,6 +91,9 @@ ThinkOS reads `thinkos.json` or `.thinkos.json` from the current directory.
       "read_file": "always_allow",
       "write_file": "confirm"
     }
+  },
+  "store": {
+    "path": "thinkos.sqlite"
   }
 }
 ```
@@ -107,6 +115,32 @@ Response: `{"status": "ok", "output": "Wrote 13 bytes to notes.txt", "receipt_id
 ```
 
 Response: `{"status": "ok", "output": "1|project state\n", "receipt_id": "rct_..."}`
+
+### Opt-in session rehydration
+
+ThinkOS can return filtered prior session context when the caller explicitly requests it with `content.rehydrate: true`.
+
+```json
+{
+  "type": "agent_message",
+  "message_id": "msg_2",
+  "session_id": "demo",
+  "timestamp": "2026-07-06T12:05:00Z",
+  "sender": "demo",
+  "content": {
+    "text": "resume",
+    "rehydrate": true,
+    "tool_calls": [],
+    "context_refs": []
+  }
+}
+```
+
+The response includes a filtered `content.rehydrated` object with safe summary fields only. Raw tool parameters, raw structured packet content, and raw error blobs are not exposed. During opt-in rehydration, ThinkOS also restores the session's latest packet lineage so subsequent successful tool-result packets can link to the stored chain.
+
+### Read-only parent-chain traversal
+
+The SQLite store exposes `get_packet_chain(packet_id, max_packets=5)` for read-only traversal of a packet's parent chain. It returns packets ordered `[root, ..., packet]`, stops cleanly on missing parents or cycles, enforces session consistency, and never returns more than `max_packets` packets.
 
 ### Gate behavior
 
@@ -138,10 +172,10 @@ stdin (JSON-Lines) → Connector → Engine → Gate → Tool → Store → stdo
 ```
 
 - **Connector:** Reads agent messages (JSON-Lines) from stdin, writes responses to stdout.
-- **Engine:** Core dispatch loop — resolves tools, evaluates gates, executes actions, records receipts.
+- **Engine:** Core dispatch loop — resolves tools, evaluates gates, executes actions, records receipts, creates ContextPackets for successful tool results, supports opt-in filtered session rehydration, and restores packet lineage during opt-in rehydration.
 - **Gates:** Pluggable authorization layer. Currently: `always_allow`, `confirm`, `deny_all`.
 - **Tools:** Pluggable action adapters. Currently: `read_file`, `write_file`.
-- **Store:** Append-only SQLite store for receipts and context packets.
+- **Store:** Append-only SQLite store for receipts, context packets, experiment records, configurable persistence, latest-packet lookup, and read-only parent-chain traversal.
 
 ## Development
 
@@ -172,10 +206,19 @@ python -m compileall -q thinkos/
 - File read/write tools with safe-by-default path sandboxing
 - SQLite append-only receipt store
 - Receipt-based audit trail for every action
+- ContextPackets for successful tool results
+- `parent_id` linking for ContextPackets within a running session
+- ExperimentRecord schema and SQLiteStore methods
+- Configurable `store.path` for file-backed SQLite persistence
+- Opt-in filtered session rehydration via `content.rehydrate: true`
+- Opt-in lineage restoration after restart during rehydration
+- Read-only ContextPacket parent-chain traversal with `get_packet_chain()`
 
 **Planned:**
-- Context packet schema and DAG store
+- Agent-side consumption policy for rehydrated context
+- Summarization and compaction policy
 - Multi-agent handoff protocol
+- Broader DAG/query API beyond `get_packet_chain()`
 - Additional tool types
 - Additional gate types
 - PyPI publication
@@ -185,6 +228,9 @@ python -m compileall -q thinkos/
 - The `confirm` gate's interactive prompt is incompatible with pipe/JSON-Lines mode. Use `always_allow` override for automated workflows.
 - Only `read_file` and `write_file` tools are currently implemented.
 - Only three gate types exist. Custom gate authoring is not yet documented.
+- Rehydration and lineage restoration are opt-in only via `content.rehydrate: true`.
+- ThinkOS does not yet define an agent-side policy for consuming rehydrated context.
+- ThinkOS does not yet summarize or compact long session history.
 
 ## Contributing / Feedback
 
