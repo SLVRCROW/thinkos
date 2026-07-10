@@ -695,13 +695,23 @@ class TestSessionRehydration:
         for r in resp["content"]["rehydrated"]["receipts"]:
             assert "error" not in r
 
-    def test_existing_parent_id_unchanged(self):
-        """After rehydration, first new packet still has parent_id=None (lineage not restored)."""
+    def test_existing_parent_id_unchanged_without_opt_in(self):
+        """Without rehydrate flag, first new packet still has parent_id=None (lineage not restored)."""
         store = SQLiteStore(":memory:")
         self._write_prior_data(store)
-        msg = self._make_rehydrate_msg(tool_calls=[
-            {"tool": "read_file", "params": {"path": "/etc/hostname"}, "call_id": "c1"}
-        ])
+        msg = {
+            "type": "agent_message",
+            "message_id": "msg_001",
+            "session_id": "sess_test",
+            "timestamp": "2026-07-10T12:00:00Z",
+            "sender": "test",
+            "content": {
+                "text": "do something",
+                "tool_calls": [
+                    {"tool": "read_file", "params": {"path": "/etc/hostname"}, "call_id": "c1"}
+                ],
+            }
+        }
         connector = _TestConnector([msg])
         eng = Engine(store, connector, {"read_file": ReadFileAdapter(), "write_file": WriteFileAdapter()},
                      {"always_allow": AlwaysAllowGate(), "confirm": ConfirmGate(), "deny_all": DenyAllGate()},
@@ -714,7 +724,7 @@ class TestSessionRehydration:
         assert len(pids) == 1
         p = store.read_packet(pids[0])
         assert p is not None
-        assert p.parent_id is None  # lineage not restored
+        assert p.parent_id is None  # lineage not restored without opt-in
 
     def test_rehydrate_failure_returns_error_status(self):
         """Store failure during rehydration returns status=error without raw exception details."""
@@ -748,3 +758,173 @@ class TestSessionRehydration:
         text = str(rehydrated)
         assert "disk full" not in text
         assert "RuntimeError" not in text
+
+
+class TestLineageRestoration:
+    """_last_packet_id restoration during opt-in rehydration."""
+
+    def _make_rehydrate_msg(self, session="sess_test", tool_calls=None):
+        msg = {
+            "type": "agent_message",
+            "message_id": "msg_001",
+            "session_id": session,
+            "timestamp": "2026-07-10T12:00:00Z",
+            "sender": "test",
+            "content": {
+                "text": "do something",
+                "tool_calls": tool_calls or [],
+                "rehydrate": True,
+            }
+        }
+        return msg
+
+    def _write_prior_data(self, store, session="sess_test"):
+        """Write a chain of packets + a receipt into the store."""
+        from thinkos.schema.context_packet import ContextPacket
+        from thinkos.schema.receipt import Receipt, Action, Result
+        pids = []
+        prev = None
+        for i in range(3):
+            pid = f"ctx_{uuid.uuid4()}"
+            p = ContextPacket(
+                packet_id=pid, session_id=session,
+                parent_id=prev,
+                timestamp=f"2026-07-10T{11+i:02d}:00:00Z",
+                kind="tool_result", source="thinkos",
+                content={"text": f"prior result {i}", "structured": None},
+                tags=[], refs=[],
+            )
+            store.write_packet(p)
+            pids.append(pid)
+            prev = pid
+        # Write a receipt referencing the last packet
+        r = Receipt(
+            receipt_id=f"rct_{uuid.uuid4()}",
+            session_id=session, sequence=1,
+            timestamp="2026-07-10T13:00:00Z",
+            action=Action(type="tool_call", tool="read_file", params={}, agent="test"),
+            result=Result(status="ok", summary="done", packet_ids=[pids[-1]], error=None),
+        )
+        store.write_receipt(r)
+        return pids
+
+    def test_lineage_restored_after_opt_in_rehydration(self):
+        """With rehydrate flag, _last_packet_id is set to latest stored packet."""
+        store = SQLiteStore(":memory:")
+        pids = self._write_prior_data(store)
+        msg = self._make_rehydrate_msg(tool_calls=[
+            {"tool": "read_file", "params": {"path": "/etc/hostname"}, "call_id": "c1"}
+        ])
+        connector = _TestConnector([msg])
+        eng = Engine(store, connector,
+                     {"read_file": ReadFileAdapter(), "write_file": WriteFileAdapter()},
+                     {"always_allow": AlwaysAllowGate(), "confirm": ConfirmGate(), "deny_all": DenyAllGate()},
+                     load_config("/nonexistent/path.json"))
+        eng.config["gates"] = {"default": "always_allow"}
+        eng.config["tools"] = {"allowed_root": None}
+        eng.run()
+        resp = connector.responses[0]
+        new_pids = resp["content"]["context_packets"]
+        assert len(new_pids) == 1
+        p = store.read_packet(new_pids[0])
+        assert p is not None
+        # The new packet should link to the last stored packet
+        assert p.parent_id == pids[-1], f"Expected parent_id={pids[-1]}, got {p.parent_id}"
+
+    def test_no_lineage_restoration_without_opt_in(self):
+        """Without rehydrate flag, _last_packet_id is not restored."""
+        store = SQLiteStore(":memory:")
+        self._write_prior_data(store)
+        msg = {
+            "type": "agent_message",
+            "message_id": "msg_001",
+            "session_id": "sess_test",
+            "timestamp": "2026-07-10T12:00:00Z",
+            "sender": "test",
+            "content": {
+                "text": "do something",
+                "tool_calls": [
+                    {"tool": "read_file", "params": {"path": "/etc/hostname"}, "call_id": "c1"}
+                ],
+            }
+        }
+        connector = _TestConnector([msg])
+        eng = Engine(store, connector,
+                     {"read_file": ReadFileAdapter(), "write_file": WriteFileAdapter()},
+                     {"always_allow": AlwaysAllowGate(), "confirm": ConfirmGate(), "deny_all": DenyAllGate()},
+                     load_config("/nonexistent/path.json"))
+        eng.config["gates"] = {"default": "always_allow"}
+        eng.config["tools"] = {"allowed_root": None}
+        eng.run()
+        resp = connector.responses[0]
+        new_pids = resp["content"]["context_packets"]
+        assert len(new_pids) == 1
+        p = store.read_packet(new_pids[0])
+        assert p is not None
+        # Without rehydrate, lineage is not restored — parent_id should be None
+        assert p.parent_id is None, f"Expected parent_id=None, got {p.parent_id}"
+
+    def test_cross_session_lineage_isolation(self):
+        """Two sessions each restore their own lineage independently."""
+        store = SQLiteStore(":memory:")
+        pids_a = self._write_prior_data(store, session="sess_a")
+        pids_b = self._write_prior_data(store, session="sess_b")
+        msg_a = self._make_rehydrate_msg(session="sess_a", tool_calls=[
+            {"tool": "read_file", "params": {"path": "/etc/hostname"}, "call_id": "c1"}
+        ])
+        msg_b = self._make_rehydrate_msg(session="sess_b", tool_calls=[
+            {"tool": "read_file", "params": {"path": "/etc/hostname"}, "call_id": "c1"}
+        ])
+        connector = _TestConnector([msg_a, msg_b])
+        eng = Engine(store, connector,
+                     {"read_file": ReadFileAdapter(), "write_file": WriteFileAdapter()},
+                     {"always_allow": AlwaysAllowGate(), "confirm": ConfirmGate(), "deny_all": DenyAllGate()},
+                     load_config("/nonexistent/path.json"))
+        eng.config["gates"] = {"default": "always_allow"}
+        eng.config["tools"] = {"allowed_root": None}
+        eng.run()
+        # Session A
+        p_a = store.read_packet(connector.responses[0]["content"]["context_packets"][0])
+        assert p_a is not None
+        assert p_a.parent_id == pids_a[-1], f"Session A: expected {pids_a[-1]}, got {p_a.parent_id}"
+        # Session B
+        p_b = store.read_packet(connector.responses[1]["content"]["context_packets"][0])
+        assert p_b is not None
+        assert p_b.parent_id == pids_b[-1], f"Session B: expected {pids_b[-1]}, got {p_b.parent_id}"
+
+    def test_depth_fallback_still_works_after_lineage_restore(self):
+        """When restored parent would exceed depth limit, fallback sets parent_id=None."""
+        store = SQLiteStore(":memory:")
+        from thinkos.schema.context_packet import ContextPacket
+        # Build a chain of 5 packets (depth 5 = at limit)
+        prev = None
+        for i in range(5):
+            p = ContextPacket(
+                packet_id=f"ctx_{uuid.uuid4()}", session_id="sess_depth",
+                parent_id=prev,
+                timestamp=f"2026-07-10T{10+i:02d}:00:00Z",
+                kind="tool_result", source="thinkos",
+                content={"text": f"chain {i}", "structured": None},
+                tags=[], refs=[],
+            )
+            store.write_packet(p)
+            prev = p.packet_id
+        # Now rehydrate + make a new tool call — the 6th packet should hit depth limit
+        msg = self._make_rehydrate_msg(session="sess_depth", tool_calls=[
+            {"tool": "read_file", "params": {"path": "/etc/hostname"}, "call_id": "c1"}
+        ])
+        connector = _TestConnector([msg])
+        eng = Engine(store, connector,
+                     {"read_file": ReadFileAdapter(), "write_file": WriteFileAdapter()},
+                     {"always_allow": AlwaysAllowGate(), "confirm": ConfirmGate(), "deny_all": DenyAllGate()},
+                     load_config("/nonexistent/path.json"))
+        eng.config["gates"] = {"default": "always_allow"}
+        eng.config["tools"] = {"allowed_root": None}
+        eng.run()
+        resp = connector.responses[0]
+        new_pids = resp["content"]["context_packets"]
+        assert len(new_pids) == 1
+        p = store.read_packet(new_pids[0])
+        assert p is not None
+        # Depth fallback should have set parent_id=None
+        assert p.parent_id is None, f"Expected parent_id=None (depth fallback), got {p.parent_id}"

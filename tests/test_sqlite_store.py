@@ -152,3 +152,48 @@ class TestCycleAndDepth:
         p6 = _make_packet(parent_id=prev)
         with pytest.raises(DepthError):
             store.write_packet(p6)
+
+
+class TestGetLatestPacketId:
+    """SQLiteStore.get_latest_packet_id — deterministic latest-packet lookup."""
+
+    def test_returns_none_for_empty_session(self, store):
+        assert store.get_latest_packet_id("empty_session") is None
+
+    def test_returns_latest_packet_id(self, store):
+        p1 = _make_packet(session="sess_latest")
+        p2 = _make_packet(session="sess_latest")
+        p3 = _make_packet(session="sess_latest")
+        store.write_packet(p1)
+        store.write_packet(p2)
+        store.write_packet(p3)
+        latest = store.get_latest_packet_id("sess_latest")
+        assert latest == p3.packet_id
+
+    def test_scoped_to_session(self, store):
+        p_a = _make_packet(session="sess_a")
+        p_b = _make_packet(session="sess_b")
+        store.write_packet(p_a)
+        store.write_packet(p_b)
+        assert store.get_latest_packet_id("sess_a") == p_a.packet_id
+        assert store.get_latest_packet_id("sess_b") == p_b.packet_id
+
+    def test_deterministic_with_timestamp_ties(self, store):
+        """When two packets share the same timestamp, rowid breaks the tie."""
+        from thinkos.schema.context_packet import ContextPacket
+        ts = "2026-07-10T12:00:00Z"
+        p1 = ContextPacket(
+            packet_id="ctx_tie_001", session_id="sess_tie",
+            timestamp=ts, kind="observation", source="test",
+            content={"text": "first", "structured": None},
+        )
+        p2 = ContextPacket(
+            packet_id="ctx_tie_002", session_id="sess_tie",
+            timestamp=ts, kind="observation", source="test",
+            content={"text": "second", "structured": None},
+        )
+        store.write_packet(p1)
+        store.write_packet(p2)
+        latest = store.get_latest_packet_id("sess_tie")
+        # p2 was written second, so rowid is higher
+        assert latest == p2.packet_id

@@ -355,5 +355,18 @@ class SQLiteStore:
             metadata=json.loads(row[15]) if row[15] else {},
         )
 
+    def get_latest_packet_id(self, session_id: str) -> str | None:
+        """Return the packet_id of the most recent packet for a session.
+
+        Uses timestamp DESC, rowid DESC for deterministic ordering when
+        timestamps are identical. Returns None if the session has no packets.
+        """
+        row = self._conn.execute(
+            "SELECT packet_id FROM packets WHERE session_id = ? "
+            "ORDER BY timestamp DESC, rowid DESC LIMIT 1",
+            (session_id,)
+        ).fetchone()
+        return row[0] if row else None
+
     def close(self):
         self._conn.close()

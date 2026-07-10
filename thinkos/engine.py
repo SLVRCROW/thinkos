@@ -63,6 +63,10 @@ class Engine:
             if msg.get("content", {}).get("rehydrate", False):
                 try:
                     packets, receipts = self.store.rehydrate(session_id)
+                    # Restore lineage: set _last_packet_id to the latest stored packet
+                    latest = self.store.get_latest_packet_id(session_id)
+                    if latest is not None:
+                        self._last_packet_id[session_id] = latest
                     rehydrated_data = {
                         "session_id": session_id,
                         "status": "ok",
