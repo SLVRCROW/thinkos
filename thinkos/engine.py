@@ -58,6 +58,48 @@ class Engine:
             context_packets = []
             receipt_ids = []
 
+            # Opt-in session rehydration
+            rehydrated_data = None
+            if msg.get("content", {}).get("rehydrate", False):
+                try:
+                    packets, receipts = self.store.rehydrate(session_id)
+                    rehydrated_data = {
+                        "session_id": session_id,
+                        "status": "ok",
+                        "packet_count": len(packets),
+                        "receipt_count": len(receipts),
+                        "packets": [
+                            {
+                                "id": p.packet_id,
+                                "kind": p.kind,
+                                "source": p.source,
+                                "parent_id": p.parent_id,
+                                "refs": p.refs,
+                                "tags": p.tags,
+                                "summary": (p.content.get("text") or "")[:500],
+                            }
+                            for p in packets
+                        ],
+                        "receipts": [
+                            {
+                                "id": r.receipt_id,
+                                "status": r.result.status,
+                                "tool": r.action.tool,
+                                "created_at": r.timestamp,
+                            }
+                            for r in receipts
+                        ],
+                    }
+                except Exception:
+                    rehydrated_data = {
+                        "session_id": session_id,
+                        "status": "error",
+                        "packet_count": 0,
+                        "receipt_count": 0,
+                        "packets": [],
+                        "receipts": [],
+                    }
+
             # All-or-nothing tool call limit check
             max_calls = self.config.get("limits", {}).get("max_tool_calls_per_message", 10)
             if max_calls and len(tool_calls) > max_calls:
@@ -205,4 +247,6 @@ class Engine:
                     "receipts": receipt_ids,
                 }
             }
+            if rehydrated_data is not None:
+                response["content"]["rehydrated"] = rehydrated_data
             self.connector.write_response(response)

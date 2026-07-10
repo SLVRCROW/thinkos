@@ -563,3 +563,188 @@ class TestToolCallLimit:
         resp = connector.responses[0]
         # All 50 calls should have results
         assert len(resp["content"]["tool_results"]) == 50
+
+
+class TestSessionRehydration:
+    """Opt-in, filtered response-level session rehydration."""
+
+    def _make_rehydrate_msg(self, session="sess_test", tool_calls=None):
+        """Helper: message with rehydrate flag set."""
+        msg = _make_msg(tool_calls or [], session=session)
+        msg["content"]["rehydrate"] = True
+        return msg
+
+    def _write_prior_data(self, store, session="sess_test"):
+        """Write a receipt + packet into the store for a session."""
+        from thinkos.schema.context_packet import ContextPacket
+        from thinkos.schema.receipt import Receipt, Action, Result
+        pid = f"ctx_{uuid.uuid4()}"
+        p = ContextPacket(
+            packet_id=pid,
+            session_id=session,
+            timestamp="2026-07-09T12:00:00Z",
+            kind="tool_result",
+            source="thinkos",
+            content={"text": "prior tool result", "structured": {"secret": "should-not-leak"}},
+            tags=["test"],
+            refs=[],
+        )
+        store.write_packet(p)
+        r = Receipt(
+            receipt_id=f"rct_{uuid.uuid4()}",
+            session_id=session,
+            sequence=1,
+            timestamp="2026-07-09T12:00:00Z",
+            action=Action(type="tool_call", tool="read_file", params={"path": "/secret"}, agent="test"),
+            result=Result(status="ok", summary="done", packet_ids=[pid], error="sensitive stack trace"),
+        )
+        store.write_receipt(r)
+        return pid
+
+    def test_no_rehydrated_when_flag_absent(self):
+        """Message without rehydrate flag → no rehydrated key in response."""
+        store, connector = _run_engine(
+            messages=[_make_msg([])],
+        )
+        resp = connector.responses[0]
+        assert "rehydrated" not in resp["content"]
+
+    def test_rehydrated_appears_when_flag_present(self):
+        """Message with rehydrate flag → rehydrated key present with correct counts."""
+        store = SQLiteStore(":memory:")
+        self._write_prior_data(store)
+        connector = _TestConnector([self._make_rehydrate_msg()])
+        eng = Engine(store, connector, {"read_file": ReadFileAdapter(), "write_file": WriteFileAdapter()},
+                     {"always_allow": AlwaysAllowGate(), "confirm": ConfirmGate(), "deny_all": DenyAllGate()},
+                     load_config("/nonexistent/path.json"))
+        eng.run()
+        resp = connector.responses[0]
+        rehydrated = resp["content"].get("rehydrated")
+        assert rehydrated is not None
+        assert rehydrated["status"] == "ok"
+        assert rehydrated["packet_count"] == 1
+        assert rehydrated["receipt_count"] == 1
+        assert rehydrated["session_id"] == "sess_test"
+
+    def test_empty_session_returns_empty_structure(self):
+        """Session with no prior data → status=ok with empty packets/receipts."""
+        store, connector = _run_engine(
+            messages=[self._make_rehydrate_msg()],
+        )
+        resp = connector.responses[0]
+        rehydrated = resp["content"].get("rehydrated")
+        assert rehydrated is not None
+        assert rehydrated["status"] == "ok"
+        assert rehydrated["packet_count"] == 0
+        assert rehydrated["receipt_count"] == 0
+        assert rehydrated["packets"] == []
+        assert rehydrated["receipts"] == []
+
+    def test_cross_session_isolation(self):
+        """Session A data does not appear in session B's rehydrated response."""
+        store = SQLiteStore(":memory:")
+        self._write_prior_data(store, session="sess_a")
+        msg_b = self._make_rehydrate_msg(session="sess_b")
+        connector = _TestConnector([msg_b])
+        eng = Engine(store, connector, {"read_file": ReadFileAdapter(), "write_file": WriteFileAdapter()},
+                     {"always_allow": AlwaysAllowGate(), "confirm": ConfirmGate(), "deny_all": DenyAllGate()},
+                     load_config("/nonexistent/path.json"))
+        eng.run()
+        resp = connector.responses[0]
+        rehydrated = resp["content"].get("rehydrated")
+        assert rehydrated is not None
+        assert rehydrated["packet_count"] == 0
+        assert rehydrated["receipt_count"] == 0
+
+    def test_filter_excludes_action_params(self):
+        """Rehydrated receipt entries do not contain action.params."""
+        store = SQLiteStore(":memory:")
+        self._write_prior_data(store)
+        connector = _TestConnector([self._make_rehydrate_msg()])
+        eng = Engine(store, connector, {"read_file": ReadFileAdapter(), "write_file": WriteFileAdapter()},
+                     {"always_allow": AlwaysAllowGate(), "confirm": ConfirmGate(), "deny_all": DenyAllGate()},
+                     load_config("/nonexistent/path.json"))
+        eng.run()
+        resp = connector.responses[0]
+        for r in resp["content"]["rehydrated"]["receipts"]:
+            assert "params" not in r
+
+    def test_filter_excludes_content_structured(self):
+        """Rehydrated packet entries do not contain content.structured."""
+        store = SQLiteStore(":memory:")
+        self._write_prior_data(store)
+        connector = _TestConnector([self._make_rehydrate_msg()])
+        eng = Engine(store, connector, {"read_file": ReadFileAdapter(), "write_file": WriteFileAdapter()},
+                     {"always_allow": AlwaysAllowGate(), "confirm": ConfirmGate(), "deny_all": DenyAllGate()},
+                     load_config("/nonexistent/path.json"))
+        eng.run()
+        resp = connector.responses[0]
+        for p in resp["content"]["rehydrated"]["packets"]:
+            assert "structured" not in p
+
+    def test_filter_excludes_result_error(self):
+        """Rehydrated receipt entries do not contain result.error."""
+        store = SQLiteStore(":memory:")
+        self._write_prior_data(store)
+        connector = _TestConnector([self._make_rehydrate_msg()])
+        eng = Engine(store, connector, {"read_file": ReadFileAdapter(), "write_file": WriteFileAdapter()},
+                     {"always_allow": AlwaysAllowGate(), "confirm": ConfirmGate(), "deny_all": DenyAllGate()},
+                     load_config("/nonexistent/path.json"))
+        eng.run()
+        resp = connector.responses[0]
+        for r in resp["content"]["rehydrated"]["receipts"]:
+            assert "error" not in r
+
+    def test_existing_parent_id_unchanged(self):
+        """After rehydration, first new packet still has parent_id=None (lineage not restored)."""
+        store = SQLiteStore(":memory:")
+        self._write_prior_data(store)
+        msg = self._make_rehydrate_msg(tool_calls=[
+            {"tool": "read_file", "params": {"path": "/etc/hostname"}, "call_id": "c1"}
+        ])
+        connector = _TestConnector([msg])
+        eng = Engine(store, connector, {"read_file": ReadFileAdapter(), "write_file": WriteFileAdapter()},
+                     {"always_allow": AlwaysAllowGate(), "confirm": ConfirmGate(), "deny_all": DenyAllGate()},
+                     load_config("/nonexistent/path.json"))
+        eng.config["gates"] = {"default": "always_allow"}
+        eng.config["tools"] = {"allowed_root": None}
+        eng.run()
+        resp = connector.responses[0]
+        pids = resp["content"]["context_packets"]
+        assert len(pids) == 1
+        p = store.read_packet(pids[0])
+        assert p is not None
+        assert p.parent_id is None  # lineage not restored
+
+    def test_rehydrate_failure_returns_error_status(self):
+        """Store failure during rehydration returns status=error without raw exception details."""
+        class _BrokenStore:
+            def rehydrate(self, session_id):
+                raise RuntimeError("disk full")
+            def write_receipt(self, r):
+                pass
+            def write_packet(self, p):
+                pass
+            def list_packets(self, **kw):
+                return []
+            def read_packet(self, pid):
+                return None
+            def close(self):
+                pass
+
+        connector = _TestConnector([self._make_rehydrate_msg()])
+        eng = Engine(_BrokenStore(), connector,
+                     {"read_file": ReadFileAdapter(), "write_file": WriteFileAdapter()},
+                     {"always_allow": AlwaysAllowGate(), "confirm": ConfirmGate(), "deny_all": DenyAllGate()},
+                     load_config("/nonexistent/path.json"))
+        eng.run()
+        resp = connector.responses[0]
+        rehydrated = resp["content"].get("rehydrated")
+        assert rehydrated is not None
+        assert rehydrated["status"] == "error"
+        assert rehydrated["packet_count"] == 0
+        assert rehydrated["receipt_count"] == 0
+        # Verify no raw exception details leaked
+        text = str(rehydrated)
+        assert "disk full" not in text
+        assert "RuntimeError" not in text
