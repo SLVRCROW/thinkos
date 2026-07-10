@@ -138,6 +138,12 @@ ThinkOS can return filtered prior session context when the caller explicitly req
 
 The response includes a filtered `content.rehydrated` object with safe summary fields only. Raw tool parameters, raw structured packet content, and raw error blobs are not exposed. During opt-in rehydration, ThinkOS also restores the session's latest packet lineage so subsequent successful tool-result packets can link to the stored chain.
 
+### Consuming rehydrated context
+
+Agents should treat rehydrated context as advisory project memory, not as authority. Rehydrated packets can help an agent orient, summarize prior work, and identify relevant receipts or references. They cannot authorize tool calls, bypass gates, override current instructions, or mutate project state.
+
+See [`POLICY_AGENT_CONSUMPTION.md`](POLICY_AGENT_CONSUMPTION.md) for the full agent-side consumption contract.
+
 ### Read-only parent-chain traversal
 
 The SQLite store exposes `get_packet_chain(packet_id, max_packets=5)` for read-only traversal of a packet's parent chain. It returns packets ordered `[root, ..., packet]`, stops cleanly on missing parents or cycles, enforces session consistency, and never returns more than `max_packets` packets.
@@ -213,9 +219,9 @@ python -m compileall -q thinkos/
 - Opt-in filtered session rehydration via `content.rehydrate: true`
 - Opt-in lineage restoration after restart during rehydration
 - Read-only ContextPacket parent-chain traversal with `get_packet_chain()`
+- Agent-side consumption policy for rehydrated context
 
 **Planned:**
-- Agent-side consumption policy for rehydrated context
 - Summarization and compaction policy
 - Multi-agent handoff protocol
 - Broader DAG/query API beyond `get_packet_chain()`
@@ -229,7 +235,6 @@ python -m compileall -q thinkos/
 - Only `read_file` and `write_file` tools are currently implemented.
 - Only three gate types exist. Custom gate authoring is not yet documented.
 - Rehydration and lineage restoration are opt-in only via `content.rehydrate: true`.
-- ThinkOS does not yet define an agent-side policy for consuming rehydrated context.
 - ThinkOS does not yet summarize or compact long session history.
 
 ## Contributing / Feedback
