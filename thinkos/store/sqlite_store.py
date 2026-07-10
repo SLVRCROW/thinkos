@@ -2,9 +2,15 @@
 
 import json
 import sqlite3
+from datetime import datetime, timezone
 from typing import Optional
 from thinkos.schema.context_packet import ContextPacket, check_dag_depth
 from thinkos.schema.experiment_record import ExperimentRecord, normalize as normalize_experiment
+from thinkos.schema.handoff_record import (
+    HandoffRecord,
+    parse_timestamp as parse_handoff_timestamp,
+    validate as validate_handoff,
+)
 from thinkos.schema.receipt import Receipt, Action, Result, GateInfo
 
 
@@ -17,6 +23,10 @@ class DepthError(Exception):
 
 
 class DuplicateError(Exception):
+    pass
+
+
+class HandoffReferenceError(Exception):
     pass
 
 
@@ -92,6 +102,27 @@ class SQLiteStore:
                 ON experiments(session_id, timestamp);
             CREATE INDEX IF NOT EXISTS idx_experiments_metric
                 ON experiments(metric_name, session_id);
+            CREATE TABLE IF NOT EXISTS handoffs (
+                handoff_id TEXT PRIMARY KEY,
+                schema_version INTEGER NOT NULL,
+                source_session_id TEXT NOT NULL,
+                target_session_id TEXT NOT NULL,
+                source_agent TEXT NOT NULL,
+                target_agent TEXT NOT NULL,
+                timestamp TEXT NOT NULL,
+                expires_at TEXT,
+                purpose_summary TEXT NOT NULL,
+                packet_ids TEXT NOT NULL,
+                receipt_ids TEXT NOT NULL,
+                omitted_packet_count INTEGER NOT NULL DEFAULT 0,
+                omissions_summary TEXT,
+                evidence_policy TEXT NOT NULL,
+                authority_transfer TEXT NOT NULL,
+                requires_fresh_approval INTEGER NOT NULL,
+                tags TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_handoffs_target
+                ON handoffs(target_session_id, timestamp, handoff_id);
         """)
         self._conn.commit()
 
@@ -461,6 +492,159 @@ class SQLiteStore:
             (packet_id, parent.session_id, limit)
         ).fetchall()
         return [self._row_to_packet(r) for r in rows]
+
+    def write_handoff(self, record: HandoffRecord):
+        """Append a validated, evidence-only cross-session handoff record."""
+        errors = validate_handoff(record)
+        if errors:
+            raise ValueError("invalid handoff record: " + "; ".join(errors))
+
+        if self._conn.execute(
+            "SELECT 1 FROM handoffs WHERE handoff_id = ?", (record.handoff_id,)
+        ).fetchone():
+            raise DuplicateError(f"handoff_id '{record.handoff_id}' already exists")
+
+        self._verify_handoff_references(record)
+
+        self._conn.execute(
+            """INSERT INTO handoffs
+               (handoff_id, schema_version, source_session_id, target_session_id,
+                source_agent, target_agent, timestamp, expires_at, purpose_summary,
+                packet_ids, receipt_ids, omitted_packet_count, omissions_summary,
+                evidence_policy, authority_transfer, requires_fresh_approval, tags)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                record.handoff_id,
+                record.schema_version,
+                record.source_session_id,
+                record.target_session_id,
+                record.source_agent,
+                record.target_agent,
+                record.timestamp,
+                record.expires_at,
+                record.purpose_summary,
+                json.dumps(record.packet_ids),
+                json.dumps(record.receipt_ids),
+                record.omitted_packet_count,
+                record.omissions_summary,
+                record.evidence_policy,
+                record.authority_transfer,
+                int(record.requires_fresh_approval),
+                json.dumps(record.tags),
+            ),
+        )
+        self._conn.commit()
+
+    def _verify_handoff_references(self, record: HandoffRecord):
+        for packet_id in record.packet_ids:
+            row = self._conn.execute(
+                "SELECT session_id FROM packets WHERE packet_id = ?", (packet_id,)
+            ).fetchone()
+            if row is None:
+                raise HandoffReferenceError(
+                    f"referenced packet_id '{packet_id}' does not exist"
+                )
+            if row[0] != record.source_session_id:
+                raise HandoffReferenceError(
+                    f"referenced packet_id '{packet_id}' does not belong to source session"
+                )
+
+        for receipt_id in record.receipt_ids:
+            row = self._conn.execute(
+                "SELECT session_id FROM receipts WHERE receipt_id = ?", (receipt_id,)
+            ).fetchone()
+            if row is None:
+                raise HandoffReferenceError(
+                    f"referenced receipt_id '{receipt_id}' does not exist"
+                )
+            if row[0] != record.source_session_id:
+                raise HandoffReferenceError(
+                    f"referenced receipt_id '{receipt_id}' does not belong to source session"
+                )
+
+    def read_handoff(self, handoff_id: str) -> HandoffRecord | None:
+        row = self._conn.execute(
+            "SELECT * FROM handoffs WHERE handoff_id = ?", (handoff_id,)
+        ).fetchone()
+        return self._row_to_handoff(row) if row else None
+
+    def list_handoffs_for_target(
+        self,
+        target_session_id: str,
+        target_agent: str | None = None,
+        limit: int = 100,
+    ) -> list[HandoffRecord]:
+        if not isinstance(target_session_id, str) or not target_session_id:
+            raise ValueError("target_session_id is required")
+        if target_agent is not None and (
+            not isinstance(target_agent, str) or not target_agent
+        ):
+            raise ValueError("target_agent must be a non-empty string or None")
+        if isinstance(limit, bool) or not isinstance(limit, int):
+            raise ValueError("limit must be an integer")
+        if limit <= 0:
+            return []
+
+        query = "SELECT * FROM handoffs WHERE target_session_id = ?"
+        params: list = [target_session_id]
+        if target_agent is not None:
+            query += " AND target_agent = ?"
+            params.append(target_agent)
+        query += " ORDER BY timestamp DESC, handoff_id DESC LIMIT ?"
+        params.append(limit)
+        rows = self._conn.execute(query, params).fetchall()
+        return [self._row_to_handoff(row) for row in rows]
+
+    def resolve_handoff(self, handoff_id: str) -> dict:
+        """Resolve exactly the referenced evidence without expanding either DAG."""
+        record = self.read_handoff(handoff_id)
+        if record is None:
+            raise HandoffReferenceError(f"handoff_id '{handoff_id}' does not exist")
+
+        errors = validate_handoff(record)
+        if errors:
+            raise HandoffReferenceError(
+                "stored handoff record is invalid: " + "; ".join(errors)
+            )
+        self._verify_handoff_references(record)
+
+        packets = [self.read_packet(packet_id) for packet_id in record.packet_ids]
+        receipts = [self.read_receipt(receipt_id) for receipt_id in record.receipt_ids]
+
+        expired = False
+        if record.expires_at is not None:
+            expires_at = parse_handoff_timestamp(record.expires_at)
+            if expires_at is None:
+                raise HandoffReferenceError("stored handoff expires_at is invalid")
+            expired = expires_at <= datetime.now(timezone.utc)
+
+        return {
+            "record": record,
+            "packets": packets,
+            "receipts": receipts,
+            "expired": expired,
+        }
+
+    def _row_to_handoff(self, row) -> HandoffRecord:
+        return HandoffRecord(
+            handoff_id=row[0],
+            schema_version=row[1],
+            source_session_id=row[2],
+            target_session_id=row[3],
+            source_agent=row[4],
+            target_agent=row[5],
+            timestamp=row[6],
+            expires_at=row[7],
+            purpose_summary=row[8],
+            packet_ids=json.loads(row[9]),
+            receipt_ids=json.loads(row[10]),
+            omitted_packet_count=row[11],
+            omissions_summary=row[12],
+            evidence_policy=row[13],
+            authority_transfer=row[14],
+            requires_fresh_approval=bool(row[15]),
+            tags=json.loads(row[16]),
+        )
 
     def close(self):
         self._conn.close()
