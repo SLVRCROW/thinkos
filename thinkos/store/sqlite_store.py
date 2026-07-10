@@ -368,5 +368,47 @@ class SQLiteStore:
         ).fetchone()
         return row[0] if row else None
 
+    def get_packet_chain(self, packet_id: str, max_packets: int = 5) -> list[ContextPacket]:
+        """Walk parent_id links from *packet_id* toward root.
+
+        Returns an ordered list ``[root, ..., packet]`` (root first, the
+        requested packet last), bounded by *max_packets*.
+
+        Safety guarantees:
+        - Returns ``[]`` if *packet_id* is missing.
+        - Stops cleanly if a parent packet is missing.
+        - Stops cleanly if a parent packet belongs to a different session.
+        - Stops cleanly if a cycle is detected (visited set).
+        - Never returns more than *max_packets* packets.
+        - Read-only — does not mutate store state.
+        """
+        if max_packets <= 0:
+            return []
+
+        start = self.read_packet(packet_id)
+        if start is None:
+            return []
+
+        session_id = start.session_id
+        chain: list[ContextPacket] = [start]
+        visited: set[str] = {start.packet_id}
+        current = start.parent_id
+
+        while current is not None and len(chain) < max_packets:
+            if current in visited:
+                break  # cycle detected
+            visited.add(current)
+
+            parent = self.read_packet(current)
+            if parent is None:
+                break  # missing parent
+            if parent.session_id != session_id:
+                break  # cross-session boundary
+
+            chain.insert(0, parent)
+            current = parent.parent_id
+
+        return chain
+
     def close(self):
         self._conn.close()

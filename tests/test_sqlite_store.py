@@ -197,3 +197,106 @@ class TestGetLatestPacketId:
         latest = store.get_latest_packet_id("sess_tie")
         # p2 was written second, so rowid is higher
         assert latest == p2.packet_id
+
+
+class TestGetPacketChain:
+    """SQLiteStore.get_packet_chain — read-only parent-chain traversal."""
+
+    def test_missing_packet_id_returns_empty(self, store):
+        assert store.get_packet_chain("ctx_nonexistent") == []
+
+    def test_single_packet_returns_one_packet_chain(self, store):
+        p = _make_packet(pid="ctx_root")
+        store.write_packet(p)
+        chain = store.get_packet_chain("ctx_root")
+        assert len(chain) == 1
+        assert chain[0].packet_id == "ctx_root"
+
+    def test_multi_packet_chain_root_to_leaf(self, store):
+        p1 = _make_packet(pid="ctx_001", parent_id=None)
+        p2 = _make_packet(pid="ctx_002", parent_id="ctx_001")
+        p3 = _make_packet(pid="ctx_003", parent_id="ctx_002")
+        store.write_packet(p1)
+        store.write_packet(p2)
+        store.write_packet(p3)
+        chain = store.get_packet_chain("ctx_003")
+        assert len(chain) == 3
+        assert chain[0].packet_id == "ctx_001"  # root first
+        assert chain[1].packet_id == "ctx_002"
+        assert chain[2].packet_id == "ctx_003"  # leaf last
+
+    def test_max_packets_bounds_chain(self, store):
+        p1 = _make_packet(pid="ctx_a", parent_id=None)
+        p2 = _make_packet(pid="ctx_b", parent_id="ctx_a")
+        p3 = _make_packet(pid="ctx_c", parent_id="ctx_b")
+        store.write_packet(p1)
+        store.write_packet(p2)
+        store.write_packet(p3)
+        chain = store.get_packet_chain("ctx_c", max_packets=2)
+        assert len(chain) == 2
+        assert chain[0].packet_id == "ctx_b"  # truncated: [ctx_b, ctx_c]
+        assert chain[1].packet_id == "ctx_c"
+
+    def test_missing_parent_stops_cleanly(self, store):
+        p = _make_packet(pid="ctx_orphan", parent_id="ctx_missing")
+        store.write_packet(p)
+        chain = store.get_packet_chain("ctx_orphan")
+        assert len(chain) == 1
+        assert chain[0].packet_id == "ctx_orphan"
+
+    def test_cycle_guard_stops_cleanly(self, store):
+        """Cycle via raw SQL (bypassing write_packet's cycle check) to test the defensive guard.
+
+        The method returns the valid reachable chain [ctx_cycle_b, ctx_cycle_a]
+        and stops before re-visiting ctx_cycle_a.
+        """
+        p1 = _make_packet(pid="ctx_cycle_a", parent_id="ctx_cycle_b")
+        p2 = _make_packet(pid="ctx_cycle_b", parent_id="ctx_cycle_a")
+        # Write both packets via raw SQL to bypass write_packet's cycle detection
+        store._conn.execute(
+            "INSERT INTO packets (packet_id, schema_version, session_id, parent_id, timestamp, kind, source, content_text) "
+            "VALUES (?, 1, ?, ?, ?, 'observation', 'test', 'test content')",
+            (p1.packet_id, p1.session_id, p1.parent_id, p1.timestamp)
+        )
+        store._conn.execute(
+            "INSERT INTO packets (packet_id, schema_version, session_id, parent_id, timestamp, kind, source, content_text) "
+            "VALUES (?, 1, ?, ?, ?, 'observation', 'test', 'test content')",
+            (p2.packet_id, p2.session_id, p2.parent_id, p2.timestamp)
+        )
+        store._conn.commit()
+        chain = store.get_packet_chain("ctx_cycle_a")
+        # Returns [ctx_cycle_b, ctx_cycle_a] — both are valid reachable packets.
+        # The cycle is detected when trying to walk from ctx_cycle_b back to ctx_cycle_a.
+        assert len(chain) == 2
+        assert chain[0].packet_id == "ctx_cycle_b"
+        assert chain[1].packet_id == "ctx_cycle_a"
+
+    def test_cross_session_parent_does_not_leak(self, store):
+        p_a = _make_packet(pid="ctx_sess_a", session="sess_a", parent_id="ctx_sess_b")
+        p_b = _make_packet(pid="ctx_sess_b", session="sess_b", parent_id=None)
+        store.write_packet(p_a)
+        store.write_packet(p_b)
+        chain = store.get_packet_chain("ctx_sess_a")
+        # Should stop at ctx_sess_a — parent is in a different session
+        assert len(chain) == 1
+        assert chain[0].packet_id == "ctx_sess_a"
+
+    def test_read_only_no_mutation(self, store):
+        """Prove the method does not write to the store."""
+        p = _make_packet(pid="ctx_ro")
+        store.write_packet(p)
+        before = store.list_packets()
+        store.get_packet_chain("ctx_ro")
+        after = store.list_packets()
+        assert len(before) == len(after)
+        assert before[0].packet_id == after[0].packet_id
+
+    def test_max_packets_zero_returns_empty(self, store):
+        p = _make_packet(pid="ctx_zero")
+        store.write_packet(p)
+        assert store.get_packet_chain("ctx_zero", max_packets=0) == []
+
+    def test_max_packets_negative_returns_empty(self, store):
+        p = _make_packet(pid="ctx_neg")
+        store.write_packet(p)
+        assert store.get_packet_chain("ctx_neg", max_packets=-1) == []
