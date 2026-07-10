@@ -72,6 +72,7 @@ ThinkOS reads `thinkos.json` or `.thinkos.json` from the current directory.
 | `gates.overrides.<tool>` | — | Per-tool gate override |
 | `tools.allowed_root` | CWD | Sandbox root directory. `null` disables sandboxing. |
 | `store.path` | `null` | Optional SQLite database path. `null` uses in-memory storage; relative paths resolve against the config/workspace root. |
+| `rehydration.max_packets` | `null` | Maximum packets returned in a single rehydration. `null` disables truncation. When set and the session exceeds this threshold, packets are truncated to the most recent N and a response-level summary object is included with fidelity floor fields (packet count, receipt count, time range, tool distribution, error count, denied count, kind distribution). |
 
 ### Gate types
 
@@ -146,9 +147,11 @@ See [`POLICY_AGENT_CONSUMPTION.md`](POLICY_AGENT_CONSUMPTION.md) for the full ag
 
 ### Summarization and compaction
 
-ThinkOS now defines a policy for future summarization and compaction of long rehydrated session history. Compaction is lossy but honest: it may reduce detail, but it must not fabricate, hide critical risk, or authorize action.
+ThinkOS can compact long rehydrated session history when `rehydration.max_packets` is configured. When the session exceeds the threshold, packets are truncated to the most recent N and a response-level summary object is included with fidelity floor fields (packet count, receipt count, time range, tool distribution, error count, denied count, kind distribution).
 
-See [`POLICY_SUMMARIZATION_AND_COMPACTION.md`](POLICY_SUMMARIZATION_AND_COMPACTION.md) for the policy contract. Runtime summarization and compaction are not implemented yet.
+Compaction is lossy but honest: it may reduce detail, but it must not fabricate, hide critical risk, or authorize action.
+
+See [`POLICY_SUMMARIZATION_AND_COMPACTION.md`](POLICY_SUMMARIZATION_AND_COMPACTION.md) for the full policy contract.
 
 ### Read-only parent-chain traversal
 
@@ -227,9 +230,9 @@ python -m compileall -q thinkos/
 - Read-only ContextPacket parent-chain traversal with `get_packet_chain()`
 - Agent-side consumption policy for rehydrated context
 - Summarization and compaction policy
+- Configurable rehydration packet window with response-level summary object
 
 **Planned:**
-- Runtime summarization and compaction for long session history
 - Multi-agent handoff protocol
 - Broader DAG/query API beyond `get_packet_chain()`
 - Additional tool types
@@ -242,7 +245,6 @@ python -m compileall -q thinkos/
 - Only `read_file` and `write_file` tools are currently implemented.
 - Only three gate types exist. Custom gate authoring is not yet documented.
 - Rehydration and lineage restoration are opt-in only via `content.rehydrate: true`.
-- ThinkOS has a summarization and compaction policy, but runtime summarization and compaction are not implemented yet.
 
 ## Contributing / Feedback
 

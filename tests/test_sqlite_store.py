@@ -110,6 +110,33 @@ class TestRehydrate:
         assert len(packets) == 1
         assert len(receipts) == 1
 
+    def test_rehydrate_deterministic_ordering(self, store):
+        """rehydrate() returns packets sorted by timestamp DESC, packet_id DESC."""
+        p1 = _make_packet(pid=f"ctx_{uuid.uuid4()}", session="sess_order")
+        p1.timestamp = "2026-07-10T12:00:00Z"
+        p2 = _make_packet(pid=f"ctx_{uuid.uuid4()}", session="sess_order")
+        p2.timestamp = "2026-07-10T13:00:00Z"
+        p3 = _make_packet(pid=f"ctx_{uuid.uuid4()}", session="sess_order")
+        p3.timestamp = "2026-07-10T11:00:00Z"
+        store.write_packet(p1)
+        store.write_packet(p2)
+        store.write_packet(p3)
+        r1 = _make_receipt(session="sess_order", seq=1)
+        r1.result.packet_ids = [p1.packet_id]
+        r2 = _make_receipt(session="sess_order", seq=2)
+        r2.result.packet_ids = [p2.packet_id]
+        r3 = _make_receipt(session="sess_order", seq=3)
+        r3.result.packet_ids = [p3.packet_id]
+        store.write_receipt(r1)
+        store.write_receipt(r2)
+        store.write_receipt(r3)
+        packets, _ = store.rehydrate("sess_order")
+        assert len(packets) == 3
+        # Most recent first: p2 (13:00), p1 (12:00), p3 (11:00)
+        assert packets[0].packet_id == p2.packet_id
+        assert packets[1].packet_id == p1.packet_id
+        assert packets[2].packet_id == p3.packet_id
+
 
 class TestCycleAndDepth:
     def test_cycle_detection(self, store):

@@ -8,6 +8,64 @@ from thinkos.config import resolve_gate, get_allowed_root
 from thinkos.store.sqlite_store import DepthError
 
 
+def _build_summary(packets: list[ContextPacket], receipts: list[Receipt],
+                   max_packets: int) -> dict:
+    """Build a response-level summary object for compacted rehydration.
+
+    The summary is a dict, NOT a ContextPacket. It is NOT stored in the
+    database. It is a sibling of ``packets`` inside the rehydrated response.
+
+    Fidelity floor (TM007a): packet_count, receipt_count, time_range,
+    tool_distribution, error_count, denied_count, kind_distribution.
+    """
+    total_packets = len(packets)
+    total_receipts = len(receipts)
+    omitted = max(0, total_packets - max_packets)
+
+    # Time range
+    timestamps = [p.timestamp for p in packets if p.timestamp]
+    time_range = {}
+    if timestamps:
+        time_range = {"start": min(timestamps), "end": max(timestamps)}
+
+    # Tool distribution from receipt action_tool
+    tool_dist: dict[str, int] = {}
+    for r in receipts:
+        t = r.action.tool or "unknown"
+        tool_dist[t] = tool_dist.get(t, 0) + 1
+
+    # Error and denied counts from receipt result_status
+    error_count = sum(1 for r in receipts if r.result.status == "error")
+    denied_count = sum(1 for r in receipts if r.result.status == "denied")
+
+    # Kind distribution from packet kind
+    kind_dist: dict[str, int] = {}
+    for p in packets:
+        kind_dist[p.kind] = kind_dist.get(p.kind, 0) + 1
+
+    return {
+        "kind": "summary",
+        "source": "thinkos",
+        "text": (
+            f"Session: {total_packets} packet(s), {total_receipts} receipt(s) "
+            f"over {time_range.get('start', '?')} to {time_range.get('end', '?')}. "
+            f"Tools: {', '.join(f'{k}({v})' for k, v in sorted(tool_dist.items()))}. "
+            f"Errors: {error_count}. Denied: {denied_count}. "
+            f"Showing last {max_packets} of {total_packets} packets."
+        ),
+        "structured": {
+            "packet_count": total_packets,
+            "receipt_count": total_receipts,
+            "omitted_packet_count": omitted,
+            "time_range": time_range,
+            "tool_distribution": tool_dist,
+            "error_count": error_count,
+            "denied_count": denied_count,
+            "kind_distribution": kind_dist,
+        },
+    }
+
+
 class Engine:
     """Core dispatch loop: parse message → resolve tool → evaluate gate → execute → record receipt."""
 
@@ -67,6 +125,17 @@ class Engine:
                     latest = self.store.get_latest_packet_id(session_id)
                     if latest is not None:
                         self._last_packet_id[session_id] = latest
+
+                    # Compaction: truncate packets/receipts if max_packets is set
+                    max_packets = self.config.get("rehydration", {}).get("max_packets")
+                    compacted = False
+                    summary = None
+                    if max_packets is not None and len(packets) > max_packets:
+                        compacted = True
+                        summary = _build_summary(packets, receipts, max_packets)
+                        packets = packets[:max_packets]
+                        receipts = receipts[:max_packets]
+
                     rehydrated_data = {
                         "session_id": session_id,
                         "status": "ok",
@@ -94,6 +163,10 @@ class Engine:
                             for r in receipts
                         ],
                     }
+                    if compacted:
+                        rehydrated_data["compacted"] = True
+                        rehydrated_data["omitted_packet_count"] = summary["structured"]["omitted_packet_count"]
+                        rehydrated_data["summary"] = summary
                 except Exception:
                     rehydrated_data = {
                         "session_id": session_id,

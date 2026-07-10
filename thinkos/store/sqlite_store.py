@@ -245,8 +245,8 @@ class SQLiteStore:
         rows = self._conn.execute(query, params).fetchall()
         return [self._row_to_receipt(r) for r in rows]
 
-    def rehydrate(self, session_id: str) -> tuple[list[ContextPacket], list[Receipt]]:
-        receipts = self.list_receipts(session_id=session_id)
+    def rehydrate(self, session_id: str, receipt_limit: int = 10000) -> tuple[list[ContextPacket], list[Receipt]]:
+        receipts = self.list_receipts(session_id=session_id, limit=receipt_limit)
         packet_ids = set()
         for r in receipts:
             if r.result.packet_ids:
@@ -256,6 +256,8 @@ class SQLiteStore:
             p = self.read_packet(pid)
             if p:
                 packets.append(p)
+        # Deterministic ordering: timestamp DESC, packet_id DESC
+        packets.sort(key=lambda p: (p.timestamp, p.packet_id), reverse=True)
         return packets, receipts
 
     def _row_to_receipt(self, row) -> Receipt:

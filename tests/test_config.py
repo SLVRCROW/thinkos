@@ -338,3 +338,83 @@ class TestMainStoreWiring:
             finally:
                 os.chdir(original_cwd)
                 sys.argv = original_argv
+
+
+class TestRehydrationConfig:
+    """Tests for rehydration config validation."""
+
+    def test_default_max_packets_is_none(self):
+        """Default config has rehydration.max_packets=None (no truncation)."""
+        config = load_config("/nonexistent/path.json")
+        assert config.get("rehydration", {}).get("max_packets") is None
+
+    def test_valid_max_packets_passes_validation(self):
+        """Positive integer max_packets passes validation."""
+        from thinkos.config import validate_config
+        config = load_config("/nonexistent/path.json")
+        config["rehydration"] = {"max_packets": 50}
+        tool_registry = {"read_file": object(), "write_file": object()}
+        gate_registry = {"always_allow": object(), "confirm": object(), "deny_all": object()}
+        errors = validate_config(config, tool_registry, gate_registry)
+        assert errors == []
+
+    def test_max_packets_none_passes_validation(self):
+        """None max_packets passes validation."""
+        from thinkos.config import validate_config
+        config = load_config("/nonexistent/path.json")
+        config["rehydration"] = {"max_packets": None}
+        tool_registry = {"read_file": object(), "write_file": object()}
+        gate_registry = {"always_allow": object(), "confirm": object(), "deny_all": object()}
+        errors = validate_config(config, tool_registry, gate_registry)
+        assert errors == []
+
+    def test_max_packets_zero_rejected(self):
+        """max_packets=0 is rejected."""
+        from thinkos.config import validate_config
+        config = load_config("/nonexistent/path.json")
+        config["rehydration"] = {"max_packets": 0}
+        tool_registry = {"read_file": object(), "write_file": object()}
+        gate_registry = {"always_allow": object(), "confirm": object(), "deny_all": object()}
+        errors = validate_config(config, tool_registry, gate_registry)
+        assert any("max_packets" in e for e in errors)
+
+    def test_max_packets_negative_rejected(self):
+        """Negative max_packets is rejected."""
+        from thinkos.config import validate_config
+        config = load_config("/nonexistent/path.json")
+        config["rehydration"] = {"max_packets": -5}
+        tool_registry = {"read_file": object(), "write_file": object()}
+        gate_registry = {"always_allow": object(), "confirm": object(), "deny_all": object()}
+        errors = validate_config(config, tool_registry, gate_registry)
+        assert any("max_packets" in e for e in errors)
+
+    def test_max_packets_string_rejected(self):
+        """Non-integer max_packets is rejected."""
+        from thinkos.config import validate_config
+        config = load_config("/nonexistent/path.json")
+        config["rehydration"] = {"max_packets": "fifty"}
+        tool_registry = {"read_file": object(), "write_file": object()}
+        gate_registry = {"always_allow": object(), "confirm": object(), "deny_all": object()}
+        errors = validate_config(config, tool_registry, gate_registry)
+        assert any("max_packets" in e for e in errors)
+
+    def test_max_packets_float_rejected(self):
+        """Float max_packets is rejected (must be int or None)."""
+        from thinkos.config import validate_config
+        config = load_config("/nonexistent/path.json")
+        config["rehydration"] = {"max_packets": 5.5}
+        tool_registry = {"read_file": object(), "write_file": object()}
+        gate_registry = {"always_allow": object(), "confirm": object(), "deny_all": object()}
+        errors = validate_config(config, tool_registry, gate_registry)
+        assert any("max_packets" in e for e in errors)
+
+    def test_rehydration_not_a_dict_rejected(self):
+        """rehydration must be a dict if present."""
+        from thinkos.config import validate_config
+        tool_registry = {"read_file": object()}
+        gate_registry = {"confirm": object()}
+        errors = validate_config(
+            {"gates": {"default": "confirm"}, "rehydration": "not_a_dict"},
+            tool_registry, gate_registry
+        )
+        assert any("rehydration" in e and "dict" in e for e in errors)

@@ -23,6 +23,9 @@ DEFAULT_CONFIG = {
         "max_write_content_bytes": 10485760,
         "max_read_output_bytes": 1048576,
         "max_tool_calls_per_message": 10,
+    },
+    "rehydration": {
+        "max_packets": None,  # None = no truncation (backward compatible)
     }
 }
 
@@ -171,5 +174,23 @@ def validate_config(config: dict, tool_registry: dict, gate_registry: dict) -> l
                     f"Config error: store.path must be a string or None, "
                     f"got {type(path).__name__}"
                 )
+
+    # Validate rehydration config
+    rehydration_config = config.get("rehydration")
+    if rehydration_config is not None:
+        if not isinstance(rehydration_config, dict):
+            errors.append("Config error: 'rehydration' must be a dict")
+        else:
+            max_packets = rehydration_config.get("max_packets")
+            if max_packets is not None:
+                if not isinstance(max_packets, int) or isinstance(max_packets, bool):
+                    errors.append(
+                        f"Config error: rehydration.max_packets must be a positive integer or None, "
+                        f"got {type(max_packets).__name__}"
+                    )
+                elif max_packets < 1:
+                    errors.append(
+                        f"Config error: rehydration.max_packets must be >= 1, got {max_packets}"
+                    )
 
     return errors
