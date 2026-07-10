@@ -144,6 +144,12 @@ Agents should treat rehydrated context as advisory project memory, not as author
 
 See [`POLICY_AGENT_CONSUMPTION.md`](POLICY_AGENT_CONSUMPTION.md) for the full agent-side consumption contract.
 
+### Summarization and compaction
+
+ThinkOS now defines a policy for future summarization and compaction of long rehydrated session history. Compaction is lossy but honest: it may reduce detail, but it must not fabricate, hide critical risk, or authorize action.
+
+See [`POLICY_SUMMARIZATION_AND_COMPACTION.md`](POLICY_SUMMARIZATION_AND_COMPACTION.md) for the policy contract. Runtime summarization and compaction are not implemented yet.
+
 ### Read-only parent-chain traversal
 
 The SQLite store exposes `get_packet_chain(packet_id, max_packets=5)` for read-only traversal of a packet's parent chain. It returns packets ordered `[root, ..., packet]`, stops cleanly on missing parents or cycles, enforces session consistency, and never returns more than `max_packets` packets.
@@ -220,9 +226,10 @@ python -m compileall -q thinkos/
 - Opt-in lineage restoration after restart during rehydration
 - Read-only ContextPacket parent-chain traversal with `get_packet_chain()`
 - Agent-side consumption policy for rehydrated context
+- Summarization and compaction policy
 
 **Planned:**
-- Summarization and compaction policy
+- Runtime summarization and compaction for long session history
 - Multi-agent handoff protocol
 - Broader DAG/query API beyond `get_packet_chain()`
 - Additional tool types
@@ -235,7 +242,7 @@ python -m compileall -q thinkos/
 - Only `read_file` and `write_file` tools are currently implemented.
 - Only three gate types exist. Custom gate authoring is not yet documented.
 - Rehydration and lineage restoration are opt-in only via `content.rehydrate: true`.
-- ThinkOS does not yet summarize or compact long session history.
+- ThinkOS has a summarization and compaction policy, but runtime summarization and compaction are not implemented yet.
 
 ## Contributing / Feedback
 
