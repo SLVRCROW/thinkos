@@ -20,6 +20,9 @@ class DuplicateError(Exception):
     pass
 
 
+_UNSET = object()  # sentinel to distinguish "not provided" from "explicitly None"
+
+
 class SQLiteStore:
     """Append-only store using SQLite. No update or delete methods exposed."""
 
@@ -170,7 +173,11 @@ class SQLiteStore:
         return self._row_to_packet(row)
 
     def list_packets(self, session_id: str | None = None, kind: str | None = None,
-                     tags: list[str] | None = None, limit: int = 100) -> list[ContextPacket]:
+                     tags: list[str] | None = None,
+                     parent_id: str | None | object = _UNSET,
+                     source: str | None = None,
+                     time_range: tuple[str, str] | None = None,
+                     order: str = "asc", limit: int = 100) -> list[ContextPacket]:
         query = "SELECT * FROM packets WHERE 1=1"
         params = []
         if session_id:
@@ -179,7 +186,30 @@ class SQLiteStore:
         if kind:
             query += " AND kind = ?"
             params.append(kind)
-        query += " ORDER BY timestamp ASC LIMIT ?"
+        if tags:
+            for tag in tags:
+                query += " AND tags LIKE ?"
+                params.append(f'%"{tag}"%')
+        if parent_id is not _UNSET:
+            if parent_id is not None:
+                query += " AND parent_id = ?"
+                params.append(parent_id)
+            else:
+                query += " AND parent_id IS NULL"
+        if source:
+            query += " AND source = ?"
+            params.append(source)
+        if time_range:
+            start, end = time_range
+            query += " AND timestamp >= ? AND timestamp <= ?"
+            params.extend([start, end])
+        if order == "asc":
+            query += " ORDER BY timestamp ASC, packet_id ASC"
+        elif order == "desc":
+            query += " ORDER BY timestamp DESC, packet_id DESC"
+        else:
+            raise ValueError(f"order must be 'asc' or 'desc', got '{order}'")
+        query += " LIMIT ?"
         params.append(limit)
         rows = self._conn.execute(query, params).fetchall()
         return [self._row_to_packet(r) for r in rows]
@@ -411,6 +441,26 @@ class SQLiteStore:
             current = parent.parent_id
 
         return chain
+
+    def get_packet_children(self, packet_id: str, limit: int = 100) -> list[ContextPacket]:
+        """Return direct children of *packet_id*.
+
+        Children are packets whose ``parent_id`` equals *packet_id* and whose
+        ``session_id`` matches the parent's session.
+
+        Returns packets ordered by ``timestamp DESC, packet_id DESC``.
+        Returns ``[]`` if *packet_id* is missing or has no children.
+        Read-only — does not mutate store state.
+        """
+        parent = self.read_packet(packet_id)
+        if parent is None:
+            return []
+        rows = self._conn.execute(
+            "SELECT * FROM packets WHERE parent_id = ? AND session_id = ? "
+            "ORDER BY timestamp DESC, packet_id DESC LIMIT ?",
+            (packet_id, parent.session_id, limit)
+        ).fetchall()
+        return [self._row_to_packet(r) for r in rows]
 
     def close(self):
         self._conn.close()

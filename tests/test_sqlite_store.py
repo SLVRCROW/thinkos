@@ -327,3 +327,196 @@ class TestGetPacketChain:
         p = _make_packet(pid="ctx_neg")
         store.write_packet(p)
         assert store.get_packet_chain("ctx_neg", max_packets=-1) == []
+
+
+class TestListPacketsFilters:
+    """TM008: list_packets filter improvements."""
+
+    def _setup(self, store):
+        """Create packets with varied attributes for filter testing."""
+        p1 = _make_packet(pid="ctx_f1", session="sess_f", kind="observation",
+                          parent_id=None)
+        p1.timestamp = "2026-07-10T12:00:00Z"
+        p1.source = "alpha"
+        p1.tags = ["tag_a", "tag_b"]
+        p2 = _make_packet(pid="ctx_f2", session="sess_f", kind="decision",
+                          parent_id="ctx_f1")
+        p2.timestamp = "2026-07-10T13:00:00Z"
+        p2.source = "beta"
+        p2.tags = ["tag_a"]
+        p3 = _make_packet(pid="ctx_f3", session="sess_f", kind="observation",
+                          parent_id="ctx_f1")
+        p3.timestamp = "2026-07-10T11:00:00Z"
+        p3.source = "alpha"
+        p3.tags = ["tag_b", "tag_c"]
+        p4 = _make_packet(pid="ctx_f4", session="sess_other", kind="observation",
+                          parent_id=None)
+        p4.timestamp = "2026-07-10T14:00:00Z"
+        p4.source = "alpha"
+        p4.tags = ["tag_a"]
+        store.write_packet(p1)
+        store.write_packet(p2)
+        store.write_packet(p3)
+        store.write_packet(p4)
+
+    def test_default_order_asc(self, store):
+        """Default order is timestamp ASC (backward compatible)."""
+        self._setup(store)
+        packets = store.list_packets(session_id="sess_f")
+        assert packets[0].packet_id == "ctx_f3"  # 11:00
+        assert packets[1].packet_id == "ctx_f1"  # 12:00
+        assert packets[2].packet_id == "ctx_f2"  # 13:00
+
+    def test_order_desc(self, store):
+        """order='desc' returns packets in reverse chronological."""
+        self._setup(store)
+        packets = store.list_packets(session_id="sess_f", order="desc")
+        assert packets[0].packet_id == "ctx_f2"  # 13:00
+        assert packets[1].packet_id == "ctx_f1"  # 12:00
+        assert packets[2].packet_id == "ctx_f3"  # 11:00
+
+    def test_invalid_order_raises(self, store):
+        """Invalid order string raises ValueError."""
+        import pytest
+        with pytest.raises(ValueError, match="order must be 'asc' or 'desc'"):
+            store.list_packets(order="invalid")
+
+    def test_tag_filter_single(self, store):
+        """Single tag filter returns only packets with that tag."""
+        self._setup(store)
+        packets = store.list_packets(tags=["tag_c"])
+        assert len(packets) == 1
+        assert packets[0].packet_id == "ctx_f3"
+
+    def test_tag_filter_and_semantics(self, store):
+        """Multiple tags use AND: returned packets must have all tags."""
+        self._setup(store)
+        packets = store.list_packets(tags=["tag_a", "tag_b"])
+        assert len(packets) == 1
+        assert packets[0].packet_id == "ctx_f1"
+
+    def test_tag_filter_no_match(self, store):
+        """Tag filter with no matches returns empty list."""
+        self._setup(store)
+        packets = store.list_packets(tags=["nonexistent"])
+        assert packets == []
+
+    def test_tag_filter_exact_not_substring(self, store):
+        """Tag filter uses exact matching, not loose substring."""
+        self._setup(store)
+        # "tag" should not match "tag_a" or "tag_b"
+        packets = store.list_packets(tags=["tag"])
+        assert packets == []
+
+    def test_parent_id_filter(self, store):
+        """parent_id filter returns only direct children."""
+        self._setup(store)
+        packets = store.list_packets(parent_id="ctx_f1")
+        assert len(packets) == 2
+        assert {p.packet_id for p in packets} == {"ctx_f2", "ctx_f3"}
+
+    def test_parent_id_none_filter(self, store):
+        """parent_id=None returns root packets."""
+        self._setup(store)
+        packets = store.list_packets(parent_id=None)
+        assert len(packets) == 2
+        assert {p.packet_id for p in packets} == {"ctx_f1", "ctx_f4"}
+
+    def test_source_filter(self, store):
+        """source filter returns only packets from that source."""
+        self._setup(store)
+        packets = store.list_packets(source="beta")
+        assert len(packets) == 1
+        assert packets[0].packet_id == "ctx_f2"
+
+    def test_time_range_filter(self, store):
+        """time_range filter returns only packets within the window (inclusive)."""
+        self._setup(store)
+        packets = store.list_packets(
+            time_range=("2026-07-10T12:00:00Z", "2026-07-10T13:00:00Z")
+        )
+        assert len(packets) == 2
+        assert {p.packet_id for p in packets} == {"ctx_f1", "ctx_f2"}
+
+    def test_combined_filters(self, store):
+        """Multiple filters work together."""
+        self._setup(store)
+        packets = store.list_packets(
+            session_id="sess_f",
+            kind="observation",
+            parent_id="ctx_f1",
+        )
+        assert len(packets) == 1
+        assert packets[0].packet_id == "ctx_f3"
+
+    def test_limit_respected(self, store):
+        """Limit is respected."""
+        self._setup(store)
+        packets = store.list_packets(session_id="sess_f", limit=2)
+        assert len(packets) == 2
+
+
+class TestGetPacketChildren:
+    """TM008: get_packet_children — read-only downward DAG traversal."""
+
+    def _setup(self, store):
+        p1 = _make_packet(pid="ctx_root", session="sess_c", parent_id=None)
+        p1.timestamp = "2026-07-10T12:00:00Z"
+        p2 = _make_packet(pid="ctx_child1", session="sess_c", parent_id="ctx_root")
+        p2.timestamp = "2026-07-10T13:00:00Z"
+        p3 = _make_packet(pid="ctx_child2", session="sess_c", parent_id="ctx_root")
+        p3.timestamp = "2026-07-10T11:00:00Z"
+        p4 = _make_packet(pid="ctx_grandchild", session="sess_c", parent_id="ctx_child1")
+        p4.timestamp = "2026-07-10T14:00:00Z"
+        p5 = _make_packet(pid="ctx_other", session="sess_other", parent_id="ctx_root")
+        p5.timestamp = "2026-07-10T15:00:00Z"
+        store.write_packet(p1)
+        store.write_packet(p2)
+        store.write_packet(p3)
+        store.write_packet(p4)
+        store.write_packet(p5)
+
+    def test_returns_direct_children(self, store):
+        """Returns packets with matching parent_id."""
+        self._setup(store)
+        children = store.get_packet_children("ctx_root")
+        assert len(children) == 2
+        assert {c.packet_id for c in children} == {"ctx_child1", "ctx_child2"}
+
+    def test_empty_when_no_children(self, store):
+        """Leaf packet returns empty list."""
+        self._setup(store)
+        # ctx_child2 has no children
+        assert store.get_packet_children("ctx_child2") == []
+
+    def test_empty_when_missing_parent(self, store):
+        """Nonexistent packet_id returns empty list."""
+        self._setup(store)
+        assert store.get_packet_children("ctx_nonexistent") == []
+
+    def test_deterministic_ordering(self, store):
+        """Children ordered by timestamp DESC, packet_id DESC."""
+        self._setup(store)
+        children = store.get_packet_children("ctx_root")
+        assert children[0].packet_id == "ctx_child1"  # 13:00
+        assert children[1].packet_id == "ctx_child2"  # 11:00
+
+    def test_cross_session_isolation(self, store):
+        """Children from a different session are not returned."""
+        self._setup(store)
+        children = store.get_packet_children("ctx_root")
+        assert "ctx_other" not in {c.packet_id for c in children}
+
+    def test_limit_respected(self, store):
+        """Limit is respected."""
+        self._setup(store)
+        children = store.get_packet_children("ctx_root", limit=1)
+        assert len(children) == 1
+
+    def test_read_only_no_mutation(self, store):
+        """Prove the method does not write to the store."""
+        self._setup(store)
+        before = store.list_packets()
+        store.get_packet_children("ctx_root")
+        after = store.list_packets()
+        assert len(before) == len(after)

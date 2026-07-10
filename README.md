@@ -153,9 +153,28 @@ Compaction is lossy but honest: it may reduce detail, but it must not fabricate,
 
 See [`POLICY_SUMMARIZATION_AND_COMPACTION.md`](POLICY_SUMMARIZATION_AND_COMPACTION.md) for the full policy contract.
 
-### Read-only parent-chain traversal
+### Read-only DAG traversal
 
-The SQLite store exposes `get_packet_chain(packet_id, max_packets=5)` for read-only traversal of a packet's parent chain. It returns packets ordered `[root, ..., packet]`, stops cleanly on missing parents or cycles, enforces session consistency, and never returns more than `max_packets` packets.
+The SQLite store exposes two methods for read-only DAG traversal:
+
+- **`get_packet_chain(packet_id, max_packets=5)`** — walks `parent_id` links from a packet toward root. Returns packets ordered `[root, ..., packet]`, stops cleanly on missing parents or cycles, enforces session consistency, and never returns more than `max_packets` packets.
+
+- **`get_packet_children(packet_id, limit=100)`** — returns direct children of a packet (packets whose `parent_id` equals the given packet). Returns packets ordered by `timestamp DESC, packet_id DESC`. Returns an empty list if the packet is missing or has no children. Enforces cross-session isolation.
+
+### Querying packets
+
+The SQLite store exposes `list_packets()` with configurable filters:
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `session_id` | `str` or `None` | `None` | Filter by session |
+| `kind` | `str` or `None` | `None` | Filter by packet kind |
+| `tags` | `list[str]` or `None` | `None` | Filter by tags (AND semantics, exact match) |
+| `parent_id` | `str` or `None` | not set | Filter by parent ID. `None` returns root packets (parent_id IS NULL). |
+| `source` | `str` or `None` | `None` | Filter by source |
+| `time_range` | `tuple[str, str]` or `None` | `None` | Filter by timestamp range (inclusive) |
+| `order` | `"asc"` or `"desc"` | `"asc"` | Sort order by timestamp |
+| `limit` | `int` | `100` | Maximum packets to return |
 
 ### Gate behavior
 
@@ -231,10 +250,11 @@ python -m compileall -q thinkos/
 - Agent-side consumption policy for rehydrated context
 - Summarization and compaction policy
 - Configurable rehydration packet window with response-level summary object
+- Read-only DAG traversal with `get_packet_chain()` and `get_packet_children()`
+- Configurable `list_packets()` filters (tags, parent_id, source, time_range, order)
 
 **Planned:**
 - Multi-agent handoff protocol
-- Broader DAG/query API beyond `get_packet_chain()`
 - Additional tool types
 - Additional gate types
 - PyPI publication
