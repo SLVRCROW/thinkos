@@ -2,6 +2,7 @@
 
 import os
 import io
+import sys
 import pytest
 from thinkos.gates.always_allow import AlwaysAllowGate
 from thinkos.gates.confirm import ConfirmGate
@@ -32,6 +33,13 @@ def _clear_env(monkeypatch):
     monkeypatch.delenv("THINKOS_NONINTERACTIVE", raising=False)
 
 
+class _InteractiveInput(io.StringIO):
+    """String input that models stdin attached to a controlling terminal."""
+
+    def isatty(self):
+        return True
+
+
 class _MockTTY:
     """Context manager that replaces open("/dev/tty") with a StringIO.
 
@@ -50,6 +58,8 @@ class _MockTTY:
         import builtins
         self._real_open = builtins.open
         self._tty_path = "/dev/tty"
+        self._old_stdin = sys.stdin
+        sys.stdin = _InteractiveInput(self._buf.getvalue())
 
         def _fake_open(path, *args, **kwargs):
             if path == self._tty_path:
@@ -62,6 +72,7 @@ class _MockTTY:
     def __exit__(self, *exc):
         import builtins
         builtins.open = self._real_open
+        sys.stdin = self._old_stdin
 
 
 class _NoTTY:
@@ -128,6 +139,22 @@ class TestConfirmGate:
             gate = ConfirmGate()
             result = gate.evaluate("write_file", {"path": "/tmp/test"})
             assert result["action"] == "deny"
+
+    def test_write_tools_denied_without_interactive_stdin_even_if_tty_exists(self, monkeypatch):
+        """A present /dev/tty must not block a noninteractive process."""
+        import builtins
+
+        monkeypatch.setattr(sys, "stdin", io.StringIO("\n"))
+
+        def _unexpected_tty_open(path, *args, **kwargs):
+            if path == "/dev/tty":
+                raise AssertionError("noninteractive execution must not open /dev/tty")
+            return builtins.open(path, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "open", _unexpected_tty_open)
+        result = ConfirmGate().evaluate("write_file", {"path": "/tmp/test"})
+        assert result["action"] == "deny"
+        assert result["reason"] == "Non-interactive mode: write approval unavailable"
 
     # -- THINKOS_NONINTERACTIVE env var ----------------------------------
 

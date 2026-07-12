@@ -40,6 +40,14 @@ class ConfirmGate:
         val = os.environ.get("THINKOS_NONINTERACTIVE", "").strip().lower()
         return val in _NONINTERACTIVE_TRUTHY
 
+    @staticmethod
+    def _has_interactive_stdin() -> bool:
+        """Return whether approval input is attached to an interactive terminal."""
+        try:
+            return bool(sys.stdin.isatty())
+        except (AttributeError, OSError, ValueError):
+            return False
+
     # ------------------------------------------------------------------
     # public interface
     # ------------------------------------------------------------------
@@ -50,6 +58,16 @@ class ConfirmGate:
 
         # Write tool -- determine mode
         if self._is_noninteractive_forced():
+            return {
+                "action": "deny",
+                "reason": "Non-interactive mode: write approval unavailable",
+                "ask_prompt": None,
+            }
+
+        # Never open /dev/tty from a piped, captured, or StringIO-driven
+        # process: there is no interactive approval channel and waiting would
+        # block indefinitely. Fail closed before touching the terminal.
+        if not self._has_interactive_stdin():
             return {
                 "action": "deny",
                 "reason": "Non-interactive mode: write approval unavailable",
