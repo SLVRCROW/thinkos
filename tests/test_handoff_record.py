@@ -1,6 +1,12 @@
-"""TM009 v0 tests for bounded, evidence-only handoff records."""
+"""TM009 v0 tests for bounded, evidence-only handoff records.
+
+Migrated for TAA-v0: all handoff store operations require a valid
+VerifiedExecutionContext. Tests that create handoffs use
+write_handoff_with_envelope for atomic record+envelope creation.
+"""
 
 import uuid
+from datetime import datetime, timezone, timedelta
 
 import pytest
 
@@ -12,6 +18,8 @@ from thinkos.schema.handoff_record import (
     validate,
 )
 from thinkos.schema.receipt import Action, Receipt, Result
+from thinkos.schema.verified_context import VerifiedExecutionContext
+from thinkos.schema.security_envelope import HandoffSecurityEnvelope
 from thinkos.store.sqlite_store import (
     DuplicateError,
     HandoffReferenceError,
@@ -59,12 +67,71 @@ def _receipt(session_id: str = "session-source", sequence: int = 1) -> Receipt:
     )
 
 
+def _envelope(handoff_id: str, **changes) -> HandoffSecurityEnvelope:
+    values = {
+        "envelope_id": _id("env_"),
+        "handoff_id": handoff_id,
+        "source_principal": "agent-a",
+        "source_session_id": "session-source",
+        "target_session_intent": "session-target",
+        "store_namespace": "test-ns",
+        "provider": "process-bound",
+        "issuer": "test-harness",
+        "policy_version": "1",
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    values.update(changes)
+    return HandoffSecurityEnvelope(**values)
+
+
 @pytest.fixture
 def store():
     value = SQLiteStore(":memory:")
     yield value
     value.close()
 
+
+@pytest.fixture
+def ctx():
+    return VerifiedExecutionContext(
+        principal="agent-a",
+        session_id="session-source",
+        store_namespace="test-ns",
+        provider="process-bound",
+        issuer="test-harness",
+        issued_at=datetime.now(timezone.utc).isoformat(),
+        expires_at=(datetime.now(timezone.utc) + timedelta(hours=1)).isoformat(),
+    )
+
+
+@pytest.fixture
+def target_ctx():
+    return VerifiedExecutionContext(
+        principal="agent-b",
+        session_id="session-target",
+        store_namespace="test-ns",
+        provider="process-bound",
+        issuer="test-harness",
+        issued_at=datetime.now(timezone.utc).isoformat(),
+        expires_at=(datetime.now(timezone.utc) + timedelta(hours=1)).isoformat(),
+    )
+
+
+def _write_with_envelope(store, record, ctx):
+    """Helper: write a handoff record with an atomic envelope using test context."""
+    envelope = _envelope(
+        record.handoff_id,
+        source_principal=ctx.principal,
+        source_session_id=ctx.session_id,
+        target_session_intent=record.target_session_id,
+        store_namespace=ctx.store_namespace,
+        provider=ctx.provider,
+        issuer=ctx.issuer,
+    )
+    store.write_handoff_with_envelope(record, envelope, ctx)
+
+
+# --- Schema validation tests (no store needed) ---
 
 def test_valid_record_passes_validation():
     assert validate(_record()) == []
@@ -150,55 +217,56 @@ def test_serialization_round_trip_preserves_record():
     assert deserialize(serialize(record)) == record
 
 
-def test_write_and_read_handoff_round_trip(store):
+# --- Store-level handoff tests (require ctx) ---
+
+def test_write_and_read_handoff_round_trip(store, ctx):
     packet = _packet()
     receipt = _receipt()
     store.write_packet(packet)
     store.write_receipt(receipt)
     record = _record(packet_ids=[packet.packet_id], receipt_ids=[receipt.receipt_id])
+    _write_with_envelope(store, record, ctx)
 
-    store.write_handoff(record)
-
-    assert store.read_handoff(record.handoff_id) == record
+    assert store.read_handoff(record.handoff_id, ctx) == record
 
 
-def test_write_handoff_rejects_invalid_schema(store):
+def test_write_handoff_rejects_invalid_schema(store, ctx):
     with pytest.raises(ValueError, match="evidence_policy"):
-        store.write_handoff(_record(evidence_policy="trusted"))
+        _write_with_envelope(store, _record(evidence_policy="trusted"), ctx)
 
 
-def test_duplicate_handoff_is_rejected(store):
+def test_duplicate_handoff_is_rejected(store, ctx):
     record = _record()
-    store.write_handoff(record)
+    _write_with_envelope(store, record, ctx)
     with pytest.raises(DuplicateError):
-        store.write_handoff(record)
+        _write_with_envelope(store, record, ctx)
 
 
-def test_missing_packet_reference_fails_closed(store):
+def test_missing_packet_reference_fails_closed(store, ctx):
     with pytest.raises(HandoffReferenceError, match="does not exist"):
-        store.write_handoff(_record(packet_ids=[_id("ctx_")]))
+        _write_with_envelope(store, _record(packet_ids=[_id("ctx_")]), ctx)
 
 
-def test_missing_receipt_reference_fails_closed(store):
+def test_missing_receipt_reference_fails_closed(store, ctx):
     with pytest.raises(HandoffReferenceError, match="does not exist"):
-        store.write_handoff(_record(receipt_ids=[_id("rct_")]))
+        _write_with_envelope(store, _record(receipt_ids=[_id("rct_")]), ctx)
 
 
-def test_packet_from_wrong_session_fails_closed(store):
+def test_packet_from_wrong_session_fails_closed(store, ctx):
     packet = _packet("another-session")
     store.write_packet(packet)
     with pytest.raises(HandoffReferenceError, match="source session"):
-        store.write_handoff(_record(packet_ids=[packet.packet_id]))
+        _write_with_envelope(store, _record(packet_ids=[packet.packet_id]), ctx)
 
 
-def test_receipt_from_wrong_session_fails_closed(store):
+def test_receipt_from_wrong_session_fails_closed(store, ctx):
     receipt = _receipt("another-session")
     store.write_receipt(receipt)
     with pytest.raises(HandoffReferenceError, match="source session"):
-        store.write_handoff(_record(receipt_ids=[receipt.receipt_id]))
+        _write_with_envelope(store, _record(receipt_ids=[receipt.receipt_id]), ctx)
 
 
-def test_write_handoff_does_not_modify_referenced_evidence(store):
+def test_write_handoff_does_not_modify_referenced_evidence(store, ctx):
     packet = _packet()
     receipt = _receipt()
     store.write_packet(packet)
@@ -206,15 +274,15 @@ def test_write_handoff_does_not_modify_referenced_evidence(store):
     before_packet = store.read_packet(packet.packet_id)
     before_receipt = store.read_receipt(receipt.receipt_id)
 
-    store.write_handoff(_record(
+    _write_with_envelope(store, _record(
         packet_ids=[packet.packet_id], receipt_ids=[receipt.receipt_id]
-    ))
+    ), ctx)
 
     assert store.read_packet(packet.packet_id) == before_packet
     assert store.read_receipt(receipt.receipt_id) == before_receipt
 
 
-def test_list_handoffs_filters_orders_and_limits(store):
+def test_list_handoffs_filters_orders_and_limits(store, ctx, target_ctx):
     first = _record(
         target_agent="agent-b", timestamp="2026-07-10T01:00:00Z"
     )
@@ -228,24 +296,24 @@ def test_list_handoffs_filters_orders_and_limits(store):
         target_session_id="different-target", timestamp="2026-07-10T04:00:00Z"
     )
     for record in [first, second, other_agent, other_session]:
-        store.write_handoff(record)
+        _write_with_envelope(store, record, ctx)
 
-    records = store.list_handoffs_for_target("session-target")
+    records = store.list_handoffs_for_target("session-target", target_ctx)
     assert [r.handoff_id for r in records] == [
         other_agent.handoff_id, second.handoff_id, first.handoff_id
     ]
     assert store.list_handoffs_for_target(
-        "session-target", target_agent="agent-b", limit=1
+        "session-target", target_ctx, target_agent="agent-b", limit=1
     ) == [second]
 
 
 @pytest.mark.parametrize("limit", [0, -1])
-def test_list_handoffs_non_positive_limit_returns_empty(store, limit):
-    store.write_handoff(_record())
-    assert store.list_handoffs_for_target("session-target", limit=limit) == []
+def test_list_handoffs_non_positive_limit_returns_empty(store, ctx, target_ctx, limit):
+    _write_with_envelope(store, _record(), ctx)
+    assert store.list_handoffs_for_target("session-target", target_ctx, limit=limit) == []
 
 
-def test_resolve_handoff_returns_exact_references_without_dag_expansion(store):
+def test_resolve_handoff_returns_exact_references_without_dag_expansion(store, ctx, target_ctx):
     parent = _packet()
     child = _packet(parent_id=parent.packet_id)
     unreferenced = _packet()
@@ -254,32 +322,32 @@ def test_resolve_handoff_returns_exact_references_without_dag_expansion(store):
         store.write_packet(packet)
     store.write_receipt(receipt)
     record = _record(packet_ids=[child.packet_id], receipt_ids=[receipt.receipt_id])
-    store.write_handoff(record)
+    _write_with_envelope(store, record, ctx)
 
-    resolved = store.resolve_handoff(record.handoff_id)
+    resolved = store.resolve_handoff(record.handoff_id, target_ctx)
 
     assert resolved["record"] == record
     assert [p.packet_id for p in resolved["packets"]] == [child.packet_id]
     assert [r.receipt_id for r in resolved["receipts"]] == [receipt.receipt_id]
 
 
-def test_resolve_handoff_rechecks_missing_references(store):
+def test_resolve_handoff_rechecks_missing_references(store, ctx, target_ctx):
     packet = _packet()
     store.write_packet(packet)
     record = _record(packet_ids=[packet.packet_id])
-    store.write_handoff(record)
+    _write_with_envelope(store, record, ctx)
     store._conn.execute("DELETE FROM packets WHERE packet_id = ?", (packet.packet_id,))
     store._conn.commit()
 
     with pytest.raises(HandoffReferenceError, match="does not exist"):
-        store.resolve_handoff(record.handoff_id)
+        store.resolve_handoff(record.handoff_id, target_ctx)
 
 
-def test_resolve_handoff_rechecks_session_membership(store):
+def test_resolve_handoff_rechecks_session_membership(store, ctx, target_ctx):
     packet = _packet()
     store.write_packet(packet)
     record = _record(packet_ids=[packet.packet_id])
-    store.write_handoff(record)
+    _write_with_envelope(store, record, ctx)
     store._conn.execute(
         "UPDATE packets SET session_id = ? WHERE packet_id = ?",
         ("another-session", packet.packet_id),
@@ -287,20 +355,70 @@ def test_resolve_handoff_rechecks_session_membership(store):
     store._conn.commit()
 
     with pytest.raises(HandoffReferenceError, match="source session"):
-        store.resolve_handoff(record.handoff_id)
+        store.resolve_handoff(record.handoff_id, target_ctx)
 
 
 @pytest.mark.parametrize(
     ("expires_at", "expected"),
     [("2000-01-01T00:00:00Z", True), ("2999-01-01T00:00:00Z", False)],
 )
-def test_resolve_handoff_reports_advisory_expiry(store, expires_at, expected):
+def test_resolve_handoff_reports_advisory_expiry(store, ctx, target_ctx, expires_at, expected):
     record = _record(expires_at=expires_at)
-    store.write_handoff(record)
-    assert store.resolve_handoff(record.handoff_id)["expired"] is expected
-    assert store.read_handoff(record.handoff_id) == record
+    _write_with_envelope(store, record, ctx)
+    assert store.resolve_handoff(record.handoff_id, target_ctx)["expired"] is expected
+    assert store.read_handoff(record.handoff_id, ctx) == record
 
 
 def test_store_exposes_no_handoff_update_or_delete_methods(store):
     assert not hasattr(store, "update_handoff")
     assert not hasattr(store, "delete_handoff")
+
+
+# --- TAA-v0: ctx-required enforcement tests ---
+
+def test_write_handoff_without_ctx_raises_type_error(store):
+    with pytest.raises(TypeError):
+        store.write_handoff(_record())
+
+
+def test_read_handoff_without_ctx_raises_type_error(store):
+    with pytest.raises(TypeError):
+        store.read_handoff("hof_test")
+
+
+def test_list_handoffs_without_ctx_raises_type_error(store):
+    with pytest.raises(TypeError):
+        store.list_handoffs_for_target("session-target")
+
+
+def test_resolve_handoff_without_ctx_raises_type_error(store):
+    with pytest.raises(TypeError):
+        store.resolve_handoff("hof_test")
+
+
+def test_write_handoff_with_unverified_ctx_denied(store):
+    bad_ctx = VerifiedExecutionContext(
+        principal="unknown", session_id="unknown",
+        store_namespace="test-ns", provider="none",
+        issuer="unknown",
+        issued_at=datetime.now(timezone.utc).isoformat(),
+        expires_at=None,
+    )
+    record = _record()
+    envelope = _envelope(record.handoff_id)
+    with pytest.raises(PermissionError, match="unverified"):
+        store.write_handoff_with_envelope(record, envelope, bad_ctx)
+
+
+def test_write_handoff_with_expired_ctx_denied(store):
+    bad_ctx = VerifiedExecutionContext(
+        principal="agent-a", session_id="session-source",
+        store_namespace="test-ns", provider="process-bound",
+        issuer="test-harness",
+        issued_at=(datetime.now(timezone.utc) - timedelta(hours=3)).isoformat(),
+        expires_at=(datetime.now(timezone.utc) - timedelta(hours=2)).isoformat(),
+    )
+    record = _record()
+    envelope = _envelope(record.handoff_id)
+    with pytest.raises(PermissionError, match="expired"):
+        store.write_handoff_with_envelope(record, envelope, bad_ctx)

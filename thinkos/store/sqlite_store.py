@@ -123,6 +123,36 @@ class SQLiteStore:
             );
             CREATE INDEX IF NOT EXISTS idx_handoffs_target
                 ON handoffs(target_session_id, timestamp, handoff_id);
+            CREATE TABLE IF NOT EXISTS envelopes (
+                envelope_id TEXT PRIMARY KEY,
+                schema_version INTEGER NOT NULL,
+                handoff_id TEXT NOT NULL,
+                source_principal TEXT NOT NULL,
+                source_session_id TEXT NOT NULL,
+                target_session_intent TEXT NOT NULL,
+                store_namespace TEXT NOT NULL,
+                provider TEXT NOT NULL,
+                issuer TEXT NOT NULL,
+                policy_version TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_envelopes_handoff
+                ON envelopes(handoff_id);
+            CREATE TABLE IF NOT EXISTS adapter_audits (
+                audit_id TEXT PRIMARY KEY,
+                schema_version INTEGER NOT NULL,
+                operation TEXT NOT NULL,
+                handoff_id TEXT,
+                principal TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                store_namespace TEXT NOT NULL,
+                provider TEXT NOT NULL,
+                issuer TEXT NOT NULL,
+                policy_version TEXT NOT NULL,
+                result_status TEXT NOT NULL,
+                result_reason TEXT,
+                timestamp TEXT NOT NULL
+            );
         """)
         self._conn.commit()
 
@@ -493,47 +523,24 @@ class SQLiteStore:
         ).fetchall()
         return [self._row_to_packet(r) for r in rows]
 
-    def write_handoff(self, record: HandoffRecord):
-        """Append a validated, evidence-only cross-session handoff record."""
-        errors = validate_handoff(record)
-        if errors:
-            raise ValueError("invalid handoff record: " + "; ".join(errors))
+    def write_handoff(self, record: HandoffRecord, ctx):
+        """DEPRECATED — use write_handoff_with_envelope for all handoff creation.
 
-        if self._conn.execute(
-            "SELECT 1 FROM handoffs WHERE handoff_id = ?", (record.handoff_id,)
-        ).fetchone():
-            raise DuplicateError(f"handoff_id '{record.handoff_id}' already exists")
-
-        self._verify_handoff_references(record)
-
-        self._conn.execute(
-            """INSERT INTO handoffs
-               (handoff_id, schema_version, source_session_id, target_session_id,
-                source_agent, target_agent, timestamp, expires_at, purpose_summary,
-                packet_ids, receipt_ids, omitted_packet_count, omissions_summary,
-                evidence_policy, authority_transfer, requires_fresh_approval, tags)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (
-                record.handoff_id,
-                record.schema_version,
-                record.source_session_id,
-                record.target_session_id,
-                record.source_agent,
-                record.target_agent,
-                record.timestamp,
-                record.expires_at,
-                record.purpose_summary,
-                json.dumps(record.packet_ids),
-                json.dumps(record.receipt_ids),
-                record.omitted_packet_count,
-                record.omissions_summary,
-                record.evidence_policy,
-                record.authority_transfer,
-                int(record.requires_fresh_approval),
-                json.dumps(record.tags),
-            ),
+        This method is retained only for internal test compatibility.
+        It requires a valid VerifiedExecutionContext but does NOT create
+        a security envelope. Callers must use write_handoff_with_envelope.
+        """
+        from thinkos.schema.verified_context import VerifiedExecutionContext
+        if not isinstance(ctx, VerifiedExecutionContext):
+            raise TypeError("ctx must be a VerifiedExecutionContext")
+        if not ctx.is_verified:
+            raise PermissionError("unverified context")
+        if ctx.is_expired():
+            raise PermissionError("expired context")
+        raise PermissionError(
+            "write_handoff is deprecated; use write_handoff_with_envelope "
+            "which atomically creates a security envelope"
         )
-        self._conn.commit()
 
     def _verify_handoff_references(self, record: HandoffRecord):
         for packet_id in record.packet_ids:
@@ -562,7 +569,234 @@ class SQLiteStore:
                     f"referenced receipt_id '{receipt_id}' does not belong to source session"
                 )
 
-    def read_handoff(self, handoff_id: str) -> HandoffRecord | None:
+    def _row_to_handoff(self, row) -> HandoffRecord:
+        return HandoffRecord(
+            handoff_id=row[0],
+            schema_version=row[1],
+            source_session_id=row[2],
+            target_session_id=row[3],
+            source_agent=row[4],
+            target_agent=row[5],
+            timestamp=row[6],
+            expires_at=row[7],
+            purpose_summary=row[8],
+            packet_ids=json.loads(row[9]),
+            receipt_ids=json.loads(row[10]),
+            omitted_packet_count=row[11],
+            omissions_summary=row[12],
+            evidence_policy=row[13],
+            authority_transfer=row[14],
+            requires_fresh_approval=bool(row[15]),
+            tags=json.loads(row[16]),
+        )
+
+    def close(self):
+        self._conn.close()
+
+    # ------------------------------------------------------------------
+    # TAA v0: Security envelope and audit support
+    # ------------------------------------------------------------------
+
+    def write_handoff_with_envelope(self, record: HandoffRecord, envelope, ctx):
+        """Atomically write a HandoffRecord and its security envelope.
+
+        ctx is required. Enforces before writing:
+        - ctx is a VerifiedExecutionContext, verified, and unexpired
+        - ctx.store_namespace == envelope.store_namespace
+        - ctx.principal == envelope.source_principal
+        - ctx.session_id == envelope.source_session_id
+        - record.handoff_id == envelope.handoff_id
+        - record.target_session_id == envelope.target_session_intent
+
+        If any check fails, no partial write remains.
+        """
+        from thinkos.schema.verified_context import VerifiedExecutionContext
+        if not isinstance(ctx, VerifiedExecutionContext):
+            raise TypeError("ctx must be a VerifiedExecutionContext")
+        if not ctx.is_verified:
+            raise PermissionError("unverified context")
+        if ctx.is_expired():
+            raise PermissionError("expired context")
+        if ctx.store_namespace != envelope.store_namespace:
+            raise PermissionError("namespace mismatch between context and envelope")
+        if ctx.principal != envelope.source_principal:
+            raise PermissionError("principal mismatch between context and envelope")
+        if ctx.session_id != envelope.source_session_id:
+            raise PermissionError("session mismatch between context and envelope")
+        if record.handoff_id != envelope.handoff_id:
+            raise ValueError("handoff_id mismatch between record and envelope")
+        if record.target_session_id != envelope.target_session_intent:
+            raise ValueError("target_session mismatch between record and envelope")
+
+        errors = validate_handoff(record)
+        if errors:
+            raise ValueError("invalid handoff record: " + "; ".join(errors))
+
+        if self._conn.execute(
+            "SELECT 1 FROM handoffs WHERE handoff_id = ?", (record.handoff_id,)
+        ).fetchone():
+            raise DuplicateError(f"handoff_id '{record.handoff_id}' already exists")
+
+        # Override record source fields with verified envelope values BEFORE
+        # reference verification, so evidence membership uses the envelope's
+        # source session, not an independently supplied HandoffRecord field.
+        record = HandoffRecord(
+            handoff_id=record.handoff_id,
+            schema_version=record.schema_version,
+            source_session_id=envelope.source_session_id,
+            target_session_id=record.target_session_id,
+            source_agent=envelope.source_principal,
+            target_agent=record.target_agent,
+            timestamp=record.timestamp,
+            expires_at=record.expires_at,
+            purpose_summary=record.purpose_summary,
+            packet_ids=record.packet_ids,
+            receipt_ids=record.receipt_ids,
+            omitted_packet_count=record.omitted_packet_count,
+            omissions_summary=record.omissions_summary,
+            evidence_policy=record.evidence_policy,
+            authority_transfer=record.authority_transfer,
+            requires_fresh_approval=record.requires_fresh_approval,
+            tags=record.tags,
+        )
+
+        self._verify_handoff_references(record)
+
+        try:
+            self._conn.execute("BEGIN IMMEDIATE")
+            # Write handoff record
+            self._conn.execute(
+                """INSERT INTO handoffs
+                   (handoff_id, schema_version, source_session_id, target_session_id,
+                    source_agent, target_agent, timestamp, expires_at, purpose_summary,
+                    packet_ids, receipt_ids, omitted_packet_count, omissions_summary,
+                    evidence_policy, authority_transfer, requires_fresh_approval, tags)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    record.handoff_id,
+                    record.schema_version,
+                    record.source_session_id,
+                    record.target_session_id,
+                    record.source_agent,
+                    record.target_agent,
+                    record.timestamp,
+                    record.expires_at,
+                    record.purpose_summary,
+                    json.dumps(record.packet_ids),
+                    json.dumps(record.receipt_ids),
+                    record.omitted_packet_count,
+                    record.omissions_summary,
+                    record.evidence_policy,
+                    record.authority_transfer,
+                    int(record.requires_fresh_approval),
+                    json.dumps(record.tags),
+                ),
+            )
+            # Write security envelope
+            self._conn.execute(
+                """INSERT INTO envelopes
+                   (envelope_id, schema_version, handoff_id,
+                    source_principal, source_session_id, target_session_intent,
+                    store_namespace, provider, issuer, policy_version, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    envelope.envelope_id,
+                    envelope.schema_version,
+                    envelope.handoff_id,
+                    envelope.source_principal,
+                    envelope.source_session_id,
+                    envelope.target_session_intent,
+                    envelope.store_namespace,
+                    envelope.provider,
+                    envelope.issuer,
+                    envelope.policy_version,
+                    envelope.created_at,
+                ),
+            )
+            self._conn.commit()
+        except Exception:
+            self._conn.rollback()
+            raise
+
+    def read_envelope(self, handoff_id: str):
+        """Read the security envelope for a handoff record.
+
+        Returns None if no envelope exists (UNVERIFIED_LEGACY).
+        """
+        from thinkos.schema.security_envelope import HandoffSecurityEnvelope
+        row = self._conn.execute(
+            "SELECT * FROM envelopes WHERE handoff_id = ?", (handoff_id,)
+        ).fetchone()
+        if row is None:
+            return None
+        return HandoffSecurityEnvelope(
+            envelope_id=row[0],
+            schema_version=row[1],
+            handoff_id=row[2],
+            source_principal=row[3],
+            source_session_id=row[4],
+            target_session_intent=row[5],
+            store_namespace=row[6],
+            provider=row[7],
+            issuer=row[8],
+            policy_version=row[9],
+            created_at=row[10],
+        )
+
+    def write_adapter_audit(self, audit):
+        """Persist an adapter audit record. Best-effort."""
+        self._conn.execute(
+            """INSERT INTO adapter_audits
+               (audit_id, schema_version, operation, handoff_id,
+                principal, session_id, store_namespace,
+                provider, issuer, policy_version,
+                result_status, result_reason, timestamp)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                audit.audit_id,
+                audit.schema_version if hasattr(audit, 'schema_version') else 1,
+                audit.operation,
+                audit.handoff_id,
+                audit.principal,
+                audit.session_id,
+                audit.store_namespace,
+                audit.provider,
+                audit.issuer,
+                audit.policy_version,
+                audit.result_status,
+                audit.result_reason,
+                audit.timestamp,
+            ),
+        )
+        self._conn.commit()
+
+    # ------------------------------------------------------------------
+    # TAA v0: Context-enforcing handoff methods (defense in depth)
+    # ------------------------------------------------------------------
+
+    def read_handoff(self, handoff_id: str, ctx) -> HandoffRecord | None:
+        """Read a handoff record.
+
+        ctx is required. Enforces context validity, envelope presence,
+        and namespace match. Legacy records (no envelope) are denied.
+        """
+        from thinkos.schema.verified_context import VerifiedExecutionContext
+        if not isinstance(ctx, VerifiedExecutionContext):
+            raise TypeError("ctx must be a VerifiedExecutionContext")
+        if not ctx.is_verified:
+            raise PermissionError("unverified context")
+        if ctx.is_expired():
+            raise PermissionError("expired context")
+        # Envelope must exist (legacy denial)
+        envelope = self.read_envelope(handoff_id)
+        if envelope is None:
+            raise HandoffReferenceError("handoff has no security envelope (UNVERIFIED_LEGACY)")
+        if ctx.store_namespace != envelope.store_namespace:
+            raise PermissionError("namespace mismatch")
+        # Session binding: source or target session may read
+        if ctx.session_id != envelope.source_session_id and ctx.session_id != envelope.target_session_intent:
+            raise PermissionError("session not authorized for this handoff")
+
         row = self._conn.execute(
             "SELECT * FROM handoffs WHERE handoff_id = ?", (handoff_id,)
         ).fetchone()
@@ -571,9 +805,15 @@ class SQLiteStore:
     def list_handoffs_for_target(
         self,
         target_session_id: str,
+        ctx,
         target_agent: str | None = None,
         limit: int = 100,
     ) -> list[HandoffRecord]:
+        """List handoffs for a target session.
+
+        ctx is required. Filters to only envelope-backed records
+        and enforces namespace match.
+        """
         if not isinstance(target_session_id, str) or not target_session_id:
             raise ValueError("target_session_id is required")
         if target_agent is not None and (
@@ -585,19 +825,62 @@ class SQLiteStore:
         if limit <= 0:
             return []
 
-        query = "SELECT * FROM handoffs WHERE target_session_id = ?"
-        params: list = [target_session_id]
+        from thinkos.schema.verified_context import VerifiedExecutionContext
+        if not isinstance(ctx, VerifiedExecutionContext):
+            raise TypeError("ctx must be a VerifiedExecutionContext")
+        if not ctx.is_verified:
+            raise PermissionError("unverified context")
+        if ctx.is_expired():
+            raise PermissionError("expired context")
+
+        # Session binding: caller may only list for their own session
+        if ctx.session_id != target_session_id:
+            raise PermissionError("session mismatch: may only list for own session")
+
+        query = "SELECT h.* FROM handoffs h"
+        params: list = []
+
+        # Only return records that have a valid envelope with matching namespace
+        query += " INNER JOIN envelopes e ON e.handoff_id = h.handoff_id"
+        query += " WHERE e.store_namespace = ?"
+        params.append(ctx.store_namespace)
+        query += " AND h.target_session_id = ?"
+        params.append(target_session_id)
+
         if target_agent is not None:
-            query += " AND target_agent = ?"
+            query += " AND h.target_agent = ?"
             params.append(target_agent)
-        query += " ORDER BY timestamp DESC, handoff_id DESC LIMIT ?"
+
+        query += " ORDER BY h.timestamp DESC, h.handoff_id DESC LIMIT ?"
         params.append(limit)
+
         rows = self._conn.execute(query, params).fetchall()
         return [self._row_to_handoff(row) for row in rows]
 
-    def resolve_handoff(self, handoff_id: str) -> dict:
-        """Resolve exactly the referenced evidence without expanding either DAG."""
-        record = self.read_handoff(handoff_id)
+    def resolve_handoff(self, handoff_id: str, ctx) -> dict:
+        """Resolve exactly the referenced evidence without expanding either DAG.
+
+        ctx is required. Enforces context validity, envelope presence,
+        and namespace match.
+        """
+        from thinkos.schema.verified_context import VerifiedExecutionContext
+        if not isinstance(ctx, VerifiedExecutionContext):
+            raise TypeError("ctx must be a VerifiedExecutionContext")
+        if not ctx.is_verified:
+            raise PermissionError("unverified context")
+        if ctx.is_expired():
+            raise PermissionError("expired context")
+        # Envelope must exist
+        envelope = self.read_envelope(handoff_id)
+        if envelope is None:
+            raise HandoffReferenceError("handoff has no security envelope (UNVERIFIED_LEGACY)")
+        if ctx.store_namespace != envelope.store_namespace:
+            raise PermissionError("namespace mismatch")
+        # Session binding: only the target session may resolve
+        if ctx.session_id != envelope.target_session_intent:
+            raise PermissionError("session not authorized: only target session may resolve")
+
+        record = self._read_handoff_raw(handoff_id)
         if record is None:
             raise HandoffReferenceError(f"handoff_id '{handoff_id}' does not exist")
 
@@ -625,26 +908,9 @@ class SQLiteStore:
             "expired": expired,
         }
 
-    def _row_to_handoff(self, row) -> HandoffRecord:
-        return HandoffRecord(
-            handoff_id=row[0],
-            schema_version=row[1],
-            source_session_id=row[2],
-            target_session_id=row[3],
-            source_agent=row[4],
-            target_agent=row[5],
-            timestamp=row[6],
-            expires_at=row[7],
-            purpose_summary=row[8],
-            packet_ids=json.loads(row[9]),
-            receipt_ids=json.loads(row[10]),
-            omitted_packet_count=row[11],
-            omissions_summary=row[12],
-            evidence_policy=row[13],
-            authority_transfer=row[14],
-            requires_fresh_approval=bool(row[15]),
-            tags=json.loads(row[16]),
-        )
-
-    def close(self):
-        self._conn.close()
+    def _read_handoff_raw(self, handoff_id: str) -> HandoffRecord | None:
+        """Read a handoff record without security checks (internal use only)."""
+        row = self._conn.execute(
+            "SELECT * FROM handoffs WHERE handoff_id = ?", (handoff_id,)
+        ).fetchone()
+        return self._row_to_handoff(row) if row else None

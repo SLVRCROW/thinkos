@@ -35,7 +35,31 @@ def main():
             print(f"[thinkos] ERROR: {err}", file=sys.stderr)
         sys.exit(1)
 
-    engine = Engine(store, connector, TOOL_REGISTRY, GATE_REGISTRY, config)
+    # TAA initialization
+    handoff_service = None
+    identity_provider = None
+    taa_config = config.get("taa", {})
+    taa_enabled = taa_config.get("enabled", False)
+
+    if taa_enabled:
+        try:
+            from thinkos.identity.process_bound import ProcessBoundIdentityProvider
+            from thinkos.policy.handoff_policy import HandoffPolicy
+            from thinkos.service.handoff_service import TrustedHandoffService
+
+            identity_provider = ProcessBoundIdentityProvider(config)
+            ctx = identity_provider.get_context()
+            policy = HandoffPolicy(config)
+            handoff_service = TrustedHandoffService(store, ctx, policy)
+        except (ValueError, KeyError) as e:
+            print(f"[thinkos] TAA initialization failed: {e}", file=sys.stderr)
+            sys.exit(1)
+
+    engine = Engine(
+        store, connector, TOOL_REGISTRY, GATE_REGISTRY, config,
+        handoff_service=handoff_service,
+        identity_provider=identity_provider,
+    )
     engine.run()
 
 
