@@ -26,7 +26,16 @@ DEFAULT_CONFIG = {
     },
     "rehydration": {
         "max_packets": None,  # None = no truncation (backward compatible)
-    }
+    },
+    "taa": {
+        "enabled": False,
+        "principal": None,
+        "session_id": None,
+        "namespace": None,
+        "issuer": "process-bound",
+        "ttl_seconds": 3600,
+        "policy_version": "1",
+    },
 }
 
 
