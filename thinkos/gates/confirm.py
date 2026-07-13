@@ -1,12 +1,12 @@
 """ConfirmGate — asks for write approval via TTY, allows reads.
 
 Protocol design
-----------------
+---------------
 The confirm gate must NOT read approval from sys.stdin or write prompts to
 sys.stdout, because those channels carry JSON-Lines protocol messages between
 the engine and the driving agent.  Instead:
 
-  TTY mode (default when a controlling terminal exists):
+  TTY mode (default when /dev/tty is available):
     - prompt on stderr (clean separation from JSON-Lines stdout)
     - read approval from /dev/tty (the actual human's terminal)
     - y / yes -> allow; anything else -> deny
@@ -15,6 +15,12 @@ the engine and the driving agent.  Instead:
     - read tools: allowed (same as current behaviour)
     - write tools: deny / fail closed -- no prompt, no read attempt
     - THINKOS_NONINTERACTIVE=1|true|yes forces non-TTY even when a TTY exists
+
+  Two-channel architecture:
+    - sys.stdin / sys.stdout carry JSON-Lines protocol (agent channel)
+    - /dev/tty carries human approval (human channel)
+    - sys.stdin.isatty() is NOT used as a gate because in production
+      stdin is always piped (JSON-Lines).  The human channel is /dev/tty.
 """
 
 import os
@@ -40,14 +46,6 @@ class ConfirmGate:
         val = os.environ.get("THINKOS_NONINTERACTIVE", "").strip().lower()
         return val in _NONINTERACTIVE_TRUTHY
 
-    @staticmethod
-    def _has_interactive_stdin() -> bool:
-        """Return whether approval input is attached to an interactive terminal."""
-        try:
-            return bool(sys.stdin.isatty())
-        except (AttributeError, OSError, ValueError):
-            return False
-
     # ------------------------------------------------------------------
     # public interface
     # ------------------------------------------------------------------
@@ -57,6 +55,8 @@ class ConfirmGate:
             return {"action": "allow", "reason": "Read tool, no approval needed.", "ask_prompt": None}
 
         # Write tool -- determine mode
+
+        # THINKOS_NONINTERACTIVE forces fail-closed before any terminal access.
         if self._is_noninteractive_forced():
             return {
                 "action": "deny",
@@ -64,17 +64,10 @@ class ConfirmGate:
                 "ask_prompt": None,
             }
 
-        # Never open /dev/tty from a piped, captured, or StringIO-driven
-        # process: there is no interactive approval channel and waiting would
-        # block indefinitely. Fail closed before touching the terminal.
-        if not self._has_interactive_stdin():
-            return {
-                "action": "deny",
-                "reason": "Non-interactive mode: write approval unavailable",
-                "ask_prompt": None,
-            }
-
-        # Try to open /dev/tty -- if it fails we are in non-TTY mode
+        # Try to open /dev/tty -- if it fails we are in non-TTY mode.
+        # In the ThinkOS two-channel architecture, sys.stdin carries
+        # JSON-Lines protocol and is never a TTY in production.  The
+        # human approval channel is /dev/tty, not sys.stdin.isatty().
         try:
             tty = open("/dev/tty", "r")
         except OSError:
