@@ -194,3 +194,72 @@ class TestGenericUnavailableResponse:
             assert set(r.keys()) == {"status", "handoff_id", "audit_id", "audit_status"}
             assert r["status"] == "unavailable"
             assert r["handoff_id"] is None
+
+
+class TestEngineHandoffContainment:
+    """Engine-level handoff failure containment.
+
+    A handoff-store failure must:
+    1. Return the exact generic unavailable response.
+    2. Not expose internal failure details.
+    3. Leave the engine loop available for a subsequent request.
+    """
+
+    @pytest.fixture
+    def store(self):
+        s = SQLiteStore(":memory:")
+        yield s
+        s.close()
+
+    @pytest.fixture
+    def ctx(self):
+        return VerifiedExecutionContext(
+            principal="agent-a", session_id="session-source",
+            store_namespace="test-ns", provider="process-bound",
+            issuer="test-harness",
+            issued_at=datetime.now(timezone.utc).isoformat(),
+            expires_at=(datetime.now(timezone.utc) + timedelta(hours=1)).isoformat(),
+        )
+
+    @pytest.fixture
+    def policy(self):
+        return HandoffPolicy({"taa": {"namespace": "test-ns", "policy_version": "1"}})
+
+    def test_handoff_failure_contained_engine_continues(self, store, ctx, policy):
+        """A handoff failure returns generic unavailable and the engine
+        remains available for a subsequent successful request."""
+        service = TrustedHandoffService(store, ctx, policy)
+
+        # 1. Trigger a handoff failure (nonexistent handoff)
+        fail_result = service.read_handoff({"handoff_id": "hof_nonexistent"})
+        assert set(fail_result.keys()) == {"status", "handoff_id", "audit_id", "audit_status"}
+        assert fail_result["status"] == "unavailable"
+        assert fail_result["handoff_id"] is None
+
+        # 2. Subsequent request must still succeed
+        packet = ContextPacket(
+            packet_id=_id("ctx_"), session_id="session-source",
+            timestamp=datetime.now(timezone.utc).isoformat(),
+            content={"text": "evidence", "structured": None},
+        )
+        receipt = Receipt(
+            receipt_id=_id("rct_"), session_id="session-source",
+            sequence=1, timestamp=datetime.now(timezone.utc).isoformat(),
+            action=Action(agent="agent-a"),
+            result=Result(summary="evidence recorded"),
+        )
+        store.write_packet(packet)
+        store.write_receipt(receipt)
+
+        create_result = service.create_handoff({
+            "handoff": {
+                "target_session_id": "session-target",
+                "target_agent": "agent-b",
+                "purpose_summary": "After failure",
+                "packet_ids": [packet.packet_id],
+                "receipt_ids": [receipt.receipt_id],
+            }
+        })
+        assert create_result["status"] == "ok"
+        assert create_result["handoff_id"] is not None
+        assert create_result["handoff_id"].startswith("hof_")
