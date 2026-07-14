@@ -58,7 +58,7 @@ cd thinkos
 uv pip install .
 ```
 
-**Requirements:** Python 3.11 or later. No runtime dependencies.
+**Requirements:** Python 3.11 or later. No runtime dependencies. Build-time dependency: `setuptools` (installed automatically by pip).
 
 **PyPI:** Not published yet. PyPI support is planned.
 
@@ -252,19 +252,30 @@ python -m compileall -q thinkos/
 - Configurable rehydration packet window with response-level summary object
 - Read-only DAG traversal with `get_packet_chain()` and `get_packet_children()`
 - Configurable `list_packets()` filters (tags, parent_id, source, time_range, order)
+- **Trusted Agent Authentication (TAA) v0** — Process-bound trusted handoff boundary for bounded local same-store multi-agent handoff. One process gets one immutable identity bundle at startup. Evidence transfers; authority does not. See [`docs/SUCCESSION_DOGFOOD.md`](docs/SUCCESSION_DOGFOOD.md) for the cold two-process handoff proof.
+- **ConfirmGate** — Interactive write approval gate with automatic read passes.
+- **HandoffRecord** with `expires_at`, `evidence_policy: "evidence_only"`, and `authority_transfer: "none"`.
 
 **Planned:**
-- Multi-agent handoff protocol
 - Additional tool types
 - Additional gate types
 - PyPI publication
 - Public release
+
+**Explicit non-claims (TAA-v0 does not provide):**
+- Cryptographic attestation
+- Remote or cross-store handoff transport
+- MCP integration
+- Compromised-harness resistance
+- Production release
+- Turnkey public installation
 
 **Known limitations:**
 - The `confirm` gate's interactive prompt is incompatible with pipe/JSON-Lines mode. Use `always_allow` override for automated workflows.
 - Only `read_file` and `write_file` tools are currently implemented.
 - Only three gate types exist. Custom gate authoring is not yet documented.
 - Rehydration and lineage restoration are opt-in only via `content.rehydrate: true`.
+- TAA-v0 multi-agent handoff is bounded to local same-store operation only. Cross-store and remote transport are not implemented.
 
 ## Contributing / Feedback
 
