@@ -1,11 +1,20 @@
 """Subprocess integration proof: cold two-process handoff succession.
 
-Process A creates evidence + handoff, terminates.
+Process A creates evidence via write_file + read_file, then creates a handoff
+referencing the read_file's packet and receipt, then terminates.
 Process B starts independently and lists/reads/resolves the evidence.
+The continuation marker is extracted from the resolved packet's summary field,
+which contains the file content returned by read_file.
+
 Denial tests cover unrelated session, wrong namespace, source-resolve denial,
-caller identity injection, unverified context, and store failure.
+caller identity injection, unverified context, and store startup failure.
 
 Harness-neutral: no AdamOS or Hermes imports.
+
+Installed-package mode:
+  Set THINKOS_DOGFOOD_USE_INSTALLED=1 to run subprocesses from the installed
+  package rather than injecting the repository into PYTHONPATH. This proves
+  the succession workflow works against a clean pip-installed ThinkOS.
 """
 
 import json
@@ -21,24 +30,9 @@ import pytest
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 _THINKOS_PKG = str(_REPO_ROOT)
 
-# ── helpers ─────────────────────────────────────────────────────────────────
+# ── Installed-package mode ────────────────────────────────────────────────
 
-
-def _write_config(path: str, overrides: dict | None = None) -> str:
-    """Write a thinkos config file and return its path."""
-    config = {
-        "store": {"path": ":memory:"},
-        "gates": {"default": "always_allow", "overrides": {}},
-        "taa": {"enabled": False},
-    }
-    if overrides:
-        config.update(overrides)
-    config.setdefault("taa", {})
-    config["taa"].setdefault("enabled", False)
-    config["taa"].setdefault("policy_version", "1")
-    with open(path, "w") as f:
-        json.dump(config, f)
-    return path
+_USE_INSTALLED = os.environ.get("THINKOS_DOGFOOD_USE_INSTALLED") == "1"
 
 
 def _run_thinkos(config_path: str, stdin_lines: list[dict],
@@ -57,7 +51,8 @@ def _run_thinkos(config_path: str, stdin_lines: list[dict],
     merged_env = os.environ.copy()
     merged_env["PYTHONDONTWRITEBYTECODE"] = "1"
     merged_env["THINKOS_QUIET"] = "1"
-    merged_env["PYTHONPATH"] = f"{_THINKOS_PKG}:{merged_env.get('PYTHONPATH', '')}"
+    if not _USE_INSTALLED:
+        merged_env["PYTHONPATH"] = f"{_THINKOS_PKG}:{merged_env.get('PYTHONPATH', '')}"
     if env:
         merged_env.update(env)
 
@@ -197,11 +192,66 @@ def _assert_handoff_result_denial(response: dict):
     assert response["audit_status"] is None
 
 
+# ── Helpers for config and identity ───────────────────────────────────────
+
+
+def _write_config(path: str, overrides: dict | None = None) -> str:
+    """Write a thinkos config file and return its path."""
+    config = {
+        "store": {"path": ":memory:"},
+        "gates": {"default": "always_allow", "overrides": {}},
+        "taa": {"enabled": False},
+    }
+    if overrides:
+        config.update(overrides)
+    config.setdefault("taa", {})
+    config["taa"].setdefault("enabled", False)
+    config["taa"].setdefault("policy_version", "1")
+    with open(path, "w") as f:
+        json.dump(config, f)
+    return path
+
+
+def _env_for(principal: str, session_id: str,
+             namespace: str = "succession-test",
+             issuer: str = "succession-test-launcher",
+             ttl: str = "3600") -> dict:
+    return {
+        "THINKOS_PRINCIPAL": principal,
+        "THINKOS_SESSION_ID": session_id,
+        "THINKOS_NAMESPACE": namespace,
+        "THINKOS_ISSUER": issuer,
+        "THINKOS_TTL_SECONDS": ttl,
+    }
+
+
+def _config_with_store(store_path: str,
+                       namespace: str = "succession-test") -> dict:
+    return {
+        "store": {"path": store_path},
+        "gates": {
+            "default": "always_allow",
+            "overrides": {"write_file": "always_allow", "read_file": "always_allow"},
+        },
+        "taa": {
+            "enabled": True,
+            "namespace": namespace,
+            "policy_version": "1",
+        },
+    }
+
+
 # ── Positive flow test ─────────────────────────────────────────────────────
 
 
 class TestSuccessionDogfoodPositive:
-    """Process A creates evidence + handoff → terminates → Process B resumes."""
+    """Process A creates evidence + handoff → terminates → Process B resumes.
+
+    The continuation marker is extracted from the resolved packet's summary
+    field, which contains the file content returned by read_file. The test
+    fails if the resolved packet summary is absent, empty, replaced, or
+    belongs to another packet.
+    """
 
     _KNOWN_MARKER = "succession-dogfood-v0-source-marker"
 
@@ -210,65 +260,49 @@ class TestSuccessionDogfoodPositive:
         with tempfile.TemporaryDirectory(prefix="thinkos-sd-") as d:
             yield d
 
-    def _env_for(self, principal: str, session_id: str,
-                 namespace: str = "succession-test",
-                 issuer: str = "succession-test-launcher",
-                 ttl: str = "3600") -> dict:
-        return {
-            "THINKOS_PRINCIPAL": principal,
-            "THINKOS_SESSION_ID": session_id,
-            "THINKOS_NAMESPACE": namespace,
-            "THINKOS_ISSUER": issuer,
-            "THINKOS_TTL_SECONDS": ttl,
-        }
-
-    def _config_with_store(self, store_path: str,
-                           namespace: str = "succession-test") -> dict:
-        return {
-            "store": {"path": store_path},
-            "gates": {
-                "default": "always_allow",
-                "overrides": {"write_file": "always_allow"},
-            },
-            "taa": {
-                "enabled": True,
-                "namespace": namespace,
-                "policy_version": "1",
-            },
-        }
-
     def test_process_a_creates_handoff_then_b_resumes(self, tmp_dir):
         """Full succession: A creates evidence+handoff, B reads and resolves."""
         store_path = os.path.join(tmp_dir, "test_store.sqlite")
         config_path = os.path.join(tmp_dir, "thinkos.json")
-        _write_config(config_path, self._config_with_store(store_path))
+        _write_config(config_path, _config_with_store(store_path))
 
-        # ── Process A, Step 1: Create evidence (tool call) ────────────────
-        a_env = self._env_for("agent-a", "session-source")
+        note_path = os.path.join(tmp_dir, "note.txt")
+
+        # ── Process A, Step 1: Write the marker to a file ──────────────────
+        a_env = _env_for("agent-a", "session-source")
         a1_stdin = [
             _msg(session_id="session-source",
                  tool="write_file",
-                 params={"path": os.path.join(tmp_dir, "note.txt"),
-                         "content": self._KNOWN_MARKER}),
+                 params={"path": note_path, "content": self._KNOWN_MARKER}),
         ]
-
         a1_stdout, a1_stderr, a1_rc = _run_thinkos(
             config_path, a1_stdin, env=a_env, cwd=tmp_dir)
         assert a1_rc == 0, f"Process A step 1 failed:\nSTDERR:\n{a1_stderr}"
 
-        a1_results = _parse_stdout(a1_stdout)
-        assert len(a1_results) >= 1
+        # ── Process A, Step 2: Read the file to create evidence with
+        #    the marker in the tool output (and thus in the packet summary) ─
+        a2_stdin = [
+            _msg(session_id="session-source",
+                 tool="read_file",
+                 params={"path": note_path}),
+        ]
+        a2_stdout, a2_stderr, a2_rc = _run_thinkos(
+            config_path, a2_stdin, env=a_env, cwd=tmp_dir)
+        assert a2_rc == 0, f"Process A step 2 failed:\nSTDERR:\n{a2_stderr}"
 
-        msg1_content = a1_results[0].get("content", {})
-        a_packet_ids = msg1_content.get("context_packets", [])
-        a_receipt_ids = msg1_content.get("receipts", [])
+        a2_results = _parse_stdout(a2_stdout)
+        assert len(a2_results) >= 1
+
+        msg2_content = a2_results[0].get("content", {})
+        a_packet_ids = msg2_content.get("context_packets", [])
+        a_receipt_ids = msg2_content.get("receipts", [])
         assert len(a_packet_ids) >= 1, (
-            f"Expected >=1 packet from write_file\n"
-            f"Results: {json.dumps(a1_results, indent=2)}"
+            f"Expected >=1 packet from read_file\n"
+            f"Results: {json.dumps(a2_results, indent=2)}"
         )
 
-        # ── Process A, Step 2: Create handoff referencing the evidence ─────
-        a2_stdin = [
+        # ── Process A, Step 3: Create handoff referencing the read evidence ─
+        a3_stdin = [
             _handoff_create_msg(
                 session_id="session-source",
                 target_session_id="session-target",
@@ -278,21 +312,20 @@ class TestSuccessionDogfoodPositive:
                 receipt_ids=a_receipt_ids,
             ),
         ]
+        a3_stdout, a3_stderr, a3_rc = _run_thinkos(
+            config_path, a3_stdin, env=a_env, cwd=tmp_dir)
+        assert a3_rc == 0, f"Process A step 3 failed:\nSTDERR:\n{a3_stderr}"
 
-        a2_stdout, a2_stderr, a2_rc = _run_thinkos(
-            config_path, a2_stdin, env=a_env, cwd=tmp_dir)
-        assert a2_rc == 0, f"Process A step 2 failed:\nSTDERR:\n{a2_stderr}"
-
-        a2_results = _parse_stdout(a2_stdout)
-        handoff_id = _find_handoff_id(a2_results)
+        a3_results = _parse_stdout(a3_stdout)
+        handoff_id = _find_handoff_id(a3_results)
         assert handoff_id is not None, (
-            f"No handoff_id in Process A step 2.\n"
-            f"Results: {json.dumps(a2_results, indent=2)}\n"
-            f"STDERR: {a2_stderr}"
+            f"No handoff_id in Process A step 3.\n"
+            f"Results: {json.dumps(a3_results, indent=2)}\n"
+            f"STDERR: {a3_stderr}"
         )
 
         # ── Process B: same store, different identity ──────────────────────
-        b_env = self._env_for("agent-b", "session-target")
+        b_env = _env_for("agent-b", "session-target")
         b_stdin = [
             _handoff_list_msg(session_id="session-target",
                               target_session_id="session-target"),
@@ -301,7 +334,6 @@ class TestSuccessionDogfoodPositive:
             _handoff_resolve_msg(session_id="session-target",
                                  handoff_id=handoff_id),
         ]
-
         b_stdout, b_stderr, b_rc = _run_thinkos(
             config_path, b_stdin, env=b_env, cwd=tmp_dir)
         assert b_rc == 0, f"Process B failed:\nSTDERR:\n{b_stderr}"
@@ -343,28 +375,94 @@ class TestSuccessionDogfoodPositive:
         packets = resolve_resp.get("packets", [])
         assert len(packets) >= 1, f"Expected >=1 packet in resolve, got {packets}"
 
-        # ── Deterministic continuation marker ──────────────────────────────
-        # Derived from transferred evidence content, not handoff metadata.
-        # Process B receives the known source-marker from Process A's
-        # ContextPacket, combined with the receipt result status.
-        packet_ids_resolved = [p["id"] for p in packets]
-        assert a_packet_ids[0] in packet_ids_resolved, (
-            f"Expected packet {a_packet_ids[0]} in resolved packets.\n"
-            f"Resolved IDs: {packet_ids_resolved}"
+        receipts = resolve_resp.get("receipts", [])
+        assert len(receipts) >= 1, f"Expected >=1 receipt in resolve, got {receipts}"
+
+        # ── Evidence-derived continuation marker ────────────────────────────
+        # Locate the resolved packet by the exact read packet ID.
+        # Extract the summary from that packet.
+        # Verify it begins with the expected read-tool prefix.
+        # Extract the content marker from that summary.
+        # Assert the extracted marker equals _KNOWN_MARKER.
+        # Locate the receipt by the exact read receipt ID.
+        # Extract its status.
+        # Construct: SUCCESSOR_CONTINUED:<extracted-content-marker>:<resolved-receipt-status>
+        # Assert exactly: SUCCESSOR_CONTINUED:succession-dogfood-v0-source-marker:ok
+        #
+        # The continuation expression must not contain _KNOWN_MARKER, the
+        # packet ID, or a hardcoded marker substring. Those values may appear
+        # only in independent expected-value assertions.
+        # The test must fail if:
+        #   - the resolved packet is missing;
+        #   - the wrong packet is returned;
+        #   - its summary contains different content;
+        #   - the receipt is missing;
+        #   - the receipt status differs.
+
+        # 1. Locate the packet by the exact read packet ID
+        resolved_packet = None
+        for p in packets:
+            if p["id"] == a_packet_ids[0]:
+                resolved_packet = p
+                break
+        assert resolved_packet is not None, (
+            f"Packet {a_packet_ids[0]} not found in resolved packets.\n"
+            f"Resolved IDs: {[p['id'] for p in packets]}"
         )
 
-        receipts_resolved = resolve_resp.get("receipts", [])
-        assert len(receipts_resolved) >= 1
-        receipt_result = receipts_resolved[0].get("status", "")
+        # 2. Extract the summary from that packet
+        raw_summary = resolved_packet.get("summary", "")
+        assert raw_summary != "", "Resolved packet summary is empty"
 
-        # The continuation marker is the concatenation of evidence content:
-        #   SUCCESSOR_CONTINUED:<packet-marker>:<receipt-result>
-        continuation = f"SUCCESSOR_CONTINUED:{self._KNOWN_MARKER}:{receipt_result}"
+        # 3. Verify it begins with the expected read-tool prefix
+        assert raw_summary.startswith("Tool 'read_file' completed:"), (
+            f"Resolved packet summary does not start with read_file prefix: "
+            f"{raw_summary!r}"
+        )
 
-        # Verify the marker was derived from transferred evidence
-        assert self._KNOWN_MARKER in continuation
-        assert receipt_result == "ok"
-        assert continuation == f"SUCCESSOR_CONTINUED:{self._KNOWN_MARKER}:ok"
+        # 4. Extract the content marker from that summary.
+        #    The engine produces: "Tool 'read_file' completed: <line_num>|<content>"
+        #    The marker is the file content after the "<line_num>|" prefix.
+        pipe_prefix = "|"
+        pipe_pos = raw_summary.find(pipe_prefix)
+        assert pipe_pos >= 0, (
+            f"Could not find pipe separator in summary: {raw_summary!r}"
+        )
+        extracted_marker = raw_summary[pipe_pos + len(pipe_prefix):].strip()
+        assert extracted_marker != "", "Extracted marker is empty"
+
+        # 5. Assert the extracted marker equals _KNOWN_MARKER
+        assert extracted_marker == self._KNOWN_MARKER, (
+            f"Extracted marker {extracted_marker!r} does not match "
+            f"expected {self._KNOWN_MARKER!r}"
+        )
+
+        # 6. Locate the receipt by the exact read receipt ID
+        resolved_receipt = None
+        for r in receipts:
+            if r["id"] == a_receipt_ids[0]:
+                resolved_receipt = r
+                break
+        assert resolved_receipt is not None, (
+            f"Receipt {a_receipt_ids[0]} not found in resolved receipts.\n"
+            f"Resolved IDs: {[r['id'] for r in receipts]}"
+        )
+
+        # 7. Extract its status
+        receipt_status = resolved_receipt.get("status", "")
+        assert receipt_status == "ok", (
+            f"Resolved receipt status '{receipt_status}' expected 'ok'"
+        )
+
+        # 8. Construct the continuation marker exclusively from extracted values
+        #    The continuation expression must not contain _KNOWN_MARKER, the
+        #    packet ID, or a hardcoded marker substring.
+        continuation = f"SUCCESSOR_CONTINUED:{extracted_marker}:{receipt_status}"
+
+        # 9. Assert exactly the expected value
+        assert continuation == "SUCCESSOR_CONTINUED:succession-dogfood-v0-source-marker:ok", (
+            f"Continuation marker mismatch: {continuation!r}"
+        )
 
 
 # ── Denial tests ──────────────────────────────────────────────────────────
@@ -383,34 +481,11 @@ class TestSuccessionDogfoodDenials:
         with tempfile.TemporaryDirectory(prefix="thinkos-sddeny-") as d:
             yield d
 
-    def _env_for(self, **kwargs) -> dict:
-        env = {
-            "THINKOS_PRINCIPAL": "agent-a",
-            "THINKOS_SESSION_ID": "session-a",
-            "THINKOS_NAMESPACE": "succession-test",
-            "THINKOS_ISSUER": "test-launcher",
-            "THINKOS_TTL_SECONDS": "3600",
-        }
-        env.update(kwargs)
-        return env
-
-    def _config_with_store(self, store_path: str,
-                           namespace: str = "succession-test") -> dict:
-        return {
-            "store": {"path": store_path},
-            "gates": {"default": "always_allow", "overrides": {}},
-            "taa": {
-                "enabled": True,
-                "namespace": namespace,
-                "policy_version": "1",
-            },
-        }
-
     def _create_handoff(self, store_path: str, config_path: str,
                         target_session: str = "session-target",
                         cwd: str | None = None) -> str:
         """Create a handoff and return its ID."""
-        env = self._env_for(principal="agent-a", session_id="session-a")
+        env = _env_for("agent-a", "session-a")
         stdin = [
             _handoff_create_msg(
                 session_id="session-a",
@@ -430,18 +505,14 @@ class TestSuccessionDogfoodDenials:
     # ── 1. Unrelated session: read ─────────────────────────────────────────
 
     def test_unrelated_session_read(self, tmp_dir):
-        """Boundary: unrelated session read.
-        Same namespace, different principal/session, existing handoff.
-        Policy: authorize_read requires session matching source or target.
-        Unrelated session (session-unrelated) is neither → denied.
-        """
+        """Boundary: unrelated session read."""
         store_path = os.path.join(tmp_dir, "store.sqlite")
         config_path = os.path.join(tmp_dir, "thinkos.json")
-        _write_config(config_path, self._config_with_store(store_path))
+        _write_config(config_path, _config_with_store(store_path))
 
         handoff_id = self._create_handoff(store_path, config_path, cwd=tmp_dir)
 
-        env = self._env_for(principal="agent-c", session_id="session-unrelated")
+        env = _env_for("agent-c", "session-unrelated")
         stdin = [_handoff_read_msg(session_id="session-unrelated",
                                    handoff_id=handoff_id)]
         stdout, stderr, rc = _run_thinkos(config_path, stdin, env=env,
@@ -454,17 +525,14 @@ class TestSuccessionDogfoodDenials:
     # ── 2. Unrelated session: resolve ──────────────────────────────────────
 
     def test_unrelated_session_resolve(self, tmp_dir):
-        """Boundary: unrelated session resolve.
-        Policy: authorize_resolve requires session == target_session_intent.
-        Unrelated session → denied.
-        """
+        """Boundary: unrelated session resolve."""
         store_path = os.path.join(tmp_dir, "store.sqlite")
         config_path = os.path.join(tmp_dir, "thinkos.json")
-        _write_config(config_path, self._config_with_store(store_path))
+        _write_config(config_path, _config_with_store(store_path))
 
         handoff_id = self._create_handoff(store_path, config_path, cwd=tmp_dir)
 
-        env = self._env_for(principal="agent-c", session_id="session-unrelated")
+        env = _env_for("agent-c", "session-unrelated")
         stdin = [_handoff_resolve_msg(session_id="session-unrelated",
                                       handoff_id=handoff_id)]
         stdout, stderr, rc = _run_thinkos(config_path, stdin, env=env,
@@ -477,15 +545,12 @@ class TestSuccessionDogfoodDenials:
     # ── 3. Unrelated session: list ─────────────────────────────────────────
 
     def test_unrelated_session_list(self, tmp_dir):
-        """Boundary: unrelated session list.
-        Policy: authorize_list requires session == target_session_id.
-        Unrelated session listing someone else's targets → denied.
-        """
+        """Boundary: unrelated session list."""
         store_path = os.path.join(tmp_dir, "store.sqlite")
         config_path = os.path.join(tmp_dir, "thinkos.json")
-        _write_config(config_path, self._config_with_store(store_path))
+        _write_config(config_path, _config_with_store(store_path))
 
-        env = self._env_for(principal="agent-c", session_id="session-unrelated")
+        env = _env_for("agent-c", "session-unrelated")
         stdin = [_handoff_list_msg(session_id="session-unrelated",
                                    target_session_id="session-target")]
         stdout, stderr, rc = _run_thinkos(config_path, stdin, env=env,
@@ -498,20 +563,14 @@ class TestSuccessionDogfoodDenials:
     # ── 4. Wrong namespace: read ───────────────────────────────────────────
 
     def test_wrong_namespace_read(self, tmp_dir):
-        """Boundary: correct target session but wrong namespace.
-        Handoff created in 'succession-test' namespace.
-        Reader has correct principal/session but 'other-namespace'.
-        Policy: authorize_read checks context vs envelope vs policy namespace.
-        Mismatch → denied.
-        """
+        """Boundary: correct target session but wrong namespace."""
         store_path = os.path.join(tmp_dir, "store.sqlite")
         config_path = os.path.join(tmp_dir, "thinkos.json")
-        _write_config(config_path, self._config_with_store(store_path))
+        _write_config(config_path, _config_with_store(store_path))
 
         handoff_id = self._create_handoff(store_path, config_path, cwd=tmp_dir)
 
-        env = self._env_for(principal="agent-b", session_id="session-target",
-                            namespace="other-namespace")
+        env = _env_for("agent-b", "session-target", namespace="other-namespace")
         stdin = [_handoff_read_msg(session_id="session-target",
                                    handoff_id=handoff_id)]
         stdout, stderr, rc = _run_thinkos(config_path, stdin, env=env,
@@ -524,20 +583,14 @@ class TestSuccessionDogfoodDenials:
     # ── 5. Source resolve (read allowed, resolve denied) ───────────────────
 
     def test_source_session_read_allowed_resolve_denied(self, tmp_dir):
-        """Boundary: source session can read but not resolve.
-        Policy: authorize_read allows source or target session.
-        Policy: authorize_resolve requires session == target_session_intent.
-        Source session (session-a, the creator) can read the handoff but
-        resolve should return unavailable because only the target resolves.
-        """
+        """Boundary: source session can read but not resolve."""
         store_path = os.path.join(tmp_dir, "store.sqlite")
         config_path = os.path.join(tmp_dir, "thinkos.json")
-        _write_config(config_path, self._config_with_store(store_path))
+        _write_config(config_path, _config_with_store(store_path))
 
         handoff_id = self._create_handoff(store_path, config_path, cwd=tmp_dir)
 
-        # Source session can read
-        env = self._env_for(principal="agent-a", session_id="session-a")
+        env = _env_for("agent-a", "session-a")
         read_stdin = [_handoff_read_msg(session_id="session-a",
                                         handoff_id=handoff_id)]
         stdout, stderr, rc = _run_thinkos(config_path, read_stdin, env=env,
@@ -545,10 +598,8 @@ class TestSuccessionDogfoodDenials:
         assert rc == 0
         results = _parse_stdout(stdout)
         assert len(results) >= 1
-        # Read by source should succeed (status == "ok")
         assert results[0].get("status") == "ok"
 
-        # Source session cannot resolve
         resolve_stdin = [_handoff_resolve_msg(session_id="session-a",
                                               handoff_id=handoff_id)]
         stdout2, stderr2, rc2 = _run_thinkos(config_path, resolve_stdin,
@@ -561,16 +612,12 @@ class TestSuccessionDogfoodDenials:
     # ── 6. Caller privileged-field injection ───────────────────────────────
 
     def test_caller_privileged_field_injection(self, tmp_dir):
-        """Boundary: caller supplies prohibited privileged fields in create.
-        Fields like principal, issuer, namespace, store_namespace,
-        source_session_id, source_agent must be rejected.
-        Service rejects before policy evaluation → denied.
-        """
+        """Boundary: caller supplies prohibited privileged fields in create."""
         store_path = os.path.join(tmp_dir, "store.sqlite")
         config_path = os.path.join(tmp_dir, "thinkos.json")
-        _write_config(config_path, self._config_with_store(store_path))
+        _write_config(config_path, _config_with_store(store_path))
 
-        env = self._env_for(principal="agent-a", session_id="session-a")
+        env = _env_for("agent-a", "session-a")
         injection_msg = {
             "type": "handoff_create",
             "message_id": "msg_inject",
@@ -598,45 +645,41 @@ class TestSuccessionDogfoodDenials:
         assert len(results) >= 1
         _assert_handoff_result_denial(results[0])
 
-    # ── 7. Unverified context ──────────────────────────────────────────────
+    # ── 7. Unverified context (startup failure) ──────────────────────────
 
-    def test_unverified_context_denied(self, tmp_dir):
+    def test_unverified_context_startup_failure(self, tmp_dir):
         """Boundary: no identity bundle → process init failure.
-        TAA enabled but no env vars → ProcessBoundIdentityProvider
-        cannot get context → engine exits with code 1.
-        This proves fail-closed at startup: no handoff operation
-        can proceed without a verified context.
+        Proves fail-closed at startup: no handoff operation can proceed
+        without a verified context. Does NOT prove a generic unavailable
+        response or internal-detail suppression.
         """
         store_path = os.path.join(tmp_dir, "store.sqlite")
         config_path = os.path.join(tmp_dir, "thinkos.json")
-        _write_config(config_path, self._config_with_store(store_path))
+        _write_config(config_path, _config_with_store(store_path))
 
         stdin = [_handoff_create_msg(session_id="anon",
                                      target_session_id="session-target")]
         stdout, stderr, rc = _run_thinkos(config_path, stdin, env={},
                                           cwd=tmp_dir)
-        # Fail-closed: engine exits with code 1, no handoff response emitted
         assert rc != 0, "Expected TAA init failure for unverified context"
         assert "TAA initialization failed" in stderr
 
-    # ── 8. Store failure ────────────────────────────────────────────────────
+    # ── 8. Store startup failure ─────────────────────────────────────────
 
-    def test_store_failure_returns_unavailable(self, tmp_dir):
-        """Boundary: store failure returns generic unavailable.
-        A non-existent store path causes the engine to fail at startup.
-        This proves the engine does not leak internal store details.
+    def test_store_startup_failure(self, tmp_dir):
+        """Boundary: invalid store path → process init failure.
+        Proves fail-closed at startup: no handoff operation can proceed
+        when the store cannot be initialized. Does NOT prove a generic
+        unavailable response or internal-detail suppression.
         """
-        # Use a store path in a non-existent directory
         store_path = os.path.join(tmp_dir, "nonexistent", "store.sqlite")
         config_path = os.path.join(tmp_dir, "thinkos.json")
-        _write_config(config_path, self._config_with_store(store_path))
+        _write_config(config_path, _config_with_store(store_path))
 
-        env = self._env_for(principal="agent-a", session_id="session-a")
+        env = _env_for("agent-a", "session-a")
         stdin = [_handoff_create_msg(session_id="session-a",
                                      target_session_id="session-target")]
         stdout, stderr, rc = _run_thinkos(config_path, stdin, env=env,
                                           cwd=tmp_dir)
-        # Engine should fail at startup when it can't create the store
         assert rc != 0, "Expected engine failure for invalid store path"
-        # Error message should be generic, not leak internal details
-        assert "Error" in stderr or "error" in stderr or "failed" in stderr
+        assert stderr.strip() != ""

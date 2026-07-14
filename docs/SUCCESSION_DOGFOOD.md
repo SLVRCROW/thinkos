@@ -12,7 +12,7 @@ Institutional succession. Not PID identity.
 - Identity comes from a **complete trusted launcher or configuration bundle** (environment variables or config dict).
 - **PID is not authorization.** The process-bound identity uses env-var-driven principal, session, namespace, issuer, and TTL — not the operating system process ID.
 - Source or target may **read** handoff metadata.
-- Only the **target session** may **resolve** (recover the full evidence packets and receipts).
+- Only the **target session** may **resolve** (recover evidence packets and receipts).
 - **Evidence transfers; authority does not.** The handoff record carries `evidence_policy: "evidence_only"`, `authority_transfer: "none"`, and `requires_fresh_approval: True`.
 - Caller-supplied privileged identity fields are **rejected**.
 - Unrelated sessions and wrong namespaces are **denied** with a generic unavailable response.
@@ -47,7 +47,6 @@ pip install .
 **Verification:**
 
 ```bash
-python -m thinkos --help    # (if help is implemented)
 python -B -c "import thinkos; print('OK')"
 python -m pytest tests/test_succession_dogfood.py -v --tb=short
 ```
@@ -64,7 +63,8 @@ ThinkOS reads `thinkos.json` or `.thinkos.json` from the current working directo
   "gates": {
     "default": "always_allow",
     "overrides": {
-      "write_file": "always_allow"
+      "write_file": "always_allow",
+      "read_file": "always_allow"
     }
   },
   "taa": {
@@ -109,15 +109,23 @@ export THINKOS_TTL_SECONDS=3600
 
 ## 7. Process A Workflow
 
-Process A creates evidence, then creates a handoff referencing that evidence.
+Process A writes a known marker to a file, reads it back to create evidence, then creates a handoff referencing the read operation's packet and receipt.
 
-**Step 1 — Create evidence** (agent_message with write_file):
+**Step 1 — Write the marker** (agent_message with write_file):
 
 ```json
 {"type":"agent_message","message_id":"msg_ev_1","session_id":"session-source","timestamp":"2026-07-14T12:00:00Z","sender":"test","content":{"text":"create evidence","tool_calls":[{"tool":"write_file","params":{"path":"/tmp/note.txt","content":"succession-dogfood-v0-source-marker"},"call_id":"c1"}],"context_refs":[]}}
 ```
 
-**Step 2 — Create handoff** (handoff_create referencing the evidence):
+**Step 2 — Read the file** (agent_message with read_file):
+
+```json
+{"type":"agent_message","message_id":"msg_ev_2","session_id":"session-source","timestamp":"2026-07-14T12:00:00Z","sender":"test","content":{"text":"read evidence","tool_calls":[{"tool":"read_file","params":{"path":"/tmp/note.txt"},"call_id":"c2"}],"context_refs":[]}}
+```
+
+The read_file tool returns the file contents in its tool output. The engine creates a ContextPacket whose summary contains the returned content. This is the evidence that will be transferred.
+
+**Step 3 — Create handoff** (handoff_create referencing the read packet and read receipt):
 
 ```json
 {"type":"handoff_create","message_id":"msg_hc_1","session_id":"session-source","timestamp":"2026-07-14T12:00:00Z","handoff":{"target_session_id":"session-target","target_agent":"agent-b","purpose_summary":"Succession dogfood v0","packet_ids":["ctx_<uuid>"],"receipt_ids":["rct_<uuid>"]}}
@@ -153,28 +161,49 @@ Expected response includes the handoff record metadata (packet_ids, receipt_ids,
 
 Expected response includes:
 - `source_principal`: `agent-a`
-- `packets`: the ContextPackets created by Process A (including the known marker)
-- `receipts`: the Receipts created by Process A's tool call
+- `packets`: projected packet data (ID, kind, and summary capped at 500 characters — not full serialized ContextPacket objects)
+- `receipts`: projected receipt data (ID, result status, and tool — not full serialized Receipt objects)
 
 ## 9. Exact Continuation Marker
 
-Process B derives an exact deterministic continuation marker from the resolved evidence:
+Process B derives an exact deterministic continuation marker from the resolved evidence. The marker is constructed exclusively from values extracted from Process B's resolved response — not from class constants, packet IDs, or handoff metadata.
+
+**Extraction steps:**
+
+1. Locate the resolved packet by the exact read packet ID transferred from Process A.
+2. Extract the packet's projected `summary` field.
+3. Verify it begins with the expected read-tool prefix (`Tool 'read_file' completed:`).
+4. Parse the content after the first `|` delimiter (the line-number separator in read_file output).
+5. The parsed value is the **extracted content marker**.
+6. Locate the resolved receipt by the exact read receipt ID transferred from Process A.
+7. Extract the receipt's `status` field.
+
+**Construction:**
 
 ```
-SUCCESSOR_CONTINUED:<packet-marker>:<receipt-result>
+SUCCESSOR_CONTINUED:<extracted-content-marker>:<resolved-receipt-status>
 ```
 
-Where:
-- `<packet-marker>` = the known content marker written by Process A (e.g., `succession-dogfood-v0-source-marker`)
-- `<receipt-result>` = the result status of the receipt from Process A's tool call (e.g., `ok`)
-
-A valid marker looks like:
+**Expected value:**
 
 ```
 SUCCESSOR_CONTINUED:succession-dogfood-v0-source-marker:ok
 ```
 
-This proves Process B received the actual transferred evidence, not just handoff metadata.
+**What each field represents:**
+
+| Field | Source | Description |
+|---|---|---|
+| Packet ID | Resolved packet `id` | Reference identity — proves the correct packet was transferred |
+| Packet summary | Resolved packet `summary` | Projected evidence content — contains the read_file tool output |
+| Extracted marker | Parsed from summary after `\|` | The actual file content written by Process A |
+| Receipt ID | Resolved receipt `id` | Reference identity — proves the correct receipt was transferred |
+| Receipt status | Resolved receipt `status` | The result status of Process A's read_file call |
+
+The test fails if:
+- The resolved packet is missing or belongs to another packet.
+- The packet summary contains different content.
+- The receipt is missing or its status differs.
 
 ## 10. Denial Behavior
 
@@ -186,22 +215,50 @@ This proves Process B received the actual transferred evidence, not just handoff
 | Wrong namespace | `handoff_read` | `{"status":"unavailable","handoff_id":null,...}` | `test_wrong_namespace_read` (new) |
 | Source session resolve | `handoff_resolve` | `{"status":"unavailable","handoff_id":null,...}` | `test_source_session_read_allowed_resolve_denied` (new) |
 | Caller privileged-field injection | `handoff_create` | `{"status":"unavailable","handoff_id":null,...}` | `test_caller_privileged_field_injection` (new) |
-| Unverified context | any handoff | Process init failure (exit code 1) | `test_unverified_context_denied` (new) |
+| Unverified context | any handoff | Process init failure (exit code 1) | `test_unverified_context_startup_failure` (new) |
 | Expired context | any handoff | Policy-level denial | `test_handoff_policy.py::TestAuthorizeCreate::test_expired_denied` (existing) |
 | Legacy handoff (no envelope) | read/resolve | Store-level denial | `test_store_handoff_auth.py::TestStoreReadHandoffAuth::test_legacy_record_denied` (existing) |
-| Store failure (startup) | any handoff | Engine fails at startup, generic error | `test_store_failure_returns_unavailable` (new) |
-| Store failure (contained) | any handoff | Generic unavailable, engine continues | `test_connector_handoff_messages.py::TestEngineHandoffContainment::test_handoff_failure_contained_engine_continues` (new) |
+| Store failure (startup) | any handoff | Engine fails at startup, no handoff response | `test_store_startup_failure` (new) |
+| Store failure (contained) | any handoff | Generic unavailable, engine continues | `test_connector_handoff_messages.py::TestEngineHandoffContainment::test_injected_store_exception_contained_engine_loop_continues` (new) |
 
 All denial responses use the same generic unavailable shape — no internal reason is distinguishable from the public response.
 
-## 11. Automated Test Command
+**Runtime containment test details:**
+- The test invokes `Engine.run()` with a capture connector and two queued `handoff_read` messages.
+- The first request encounters an injected `RuntimeError("SIMULATED_STORE_FAILURE")` from `store.read_envelope`.
+- The engine returns the exact six-key generic unavailable response with no exception detail.
+- The same engine loop processes the second request successfully.
+- The simulated failure is proven to fire exactly once.
+
+**Startup failure tests** prove only that the engine fails closed at startup (exit code 1, no handoff response emitted). They do not prove generic unavailable response or internal-detail suppression — those properties are proven by the service-layer and engine-loop tests.
+
+## 11. Automated Test Commands
+
+### Source-tree mode (default)
 
 ```bash
 cd /path/to/thinkos
 python -m pytest tests/test_succession_dogfood.py -v --tb=short
 ```
 
-Expected output:
+### Installed-package mode
+
+```bash
+cd /path/to/thinkos
+pip install .
+THINKOS_DOGFOOD_USE_INSTALLED=1 python -m pytest tests/test_succession_dogfood.py -v --tb=short
+```
+
+This mode proves the succession workflow works against a clean pip-installed ThinkOS. The subprocesses resolve `thinkos` from the active environment's installed package rather than injecting the repository into PYTHONPATH.
+
+**Installed-package verification:** The evaluation must use a non-editable wheel installation. After installation, `thinkos.__file__` must resolve inside the fresh venv's `site-packages` directory, not inside the repository:
+
+```bash
+python -I -c "import thinkos; print(thinkos.__file__)"
+# Expected: /path/to/venv/lib/python3.12/site-packages/thinkos/__init__.py
+```
+
+### Expected output (both modes)
 
 ```
 tests/test_succession_dogfood.py::TestSuccessionDogfoodPositive::test_process_a_creates_handoff_then_b_resumes PASSED
@@ -211,8 +268,8 @@ tests/test_succession_dogfood.py::TestSuccessionDogfoodDenials::test_unrelated_s
 tests/test_succession_dogfood.py::TestSuccessionDogfoodDenials::test_wrong_namespace_read PASSED
 tests/test_succession_dogfood.py::TestSuccessionDogfoodDenials::test_source_session_read_allowed_resolve_denied PASSED
 tests/test_succession_dogfood.py::TestSuccessionDogfoodDenials::test_caller_privileged_field_injection PASSED
-tests/test_succession_dogfood.py::TestSuccessionDogfoodDenials::test_unverified_context_denied PASSED
-tests/test_succession_dogfood.py::TestSuccessionDogfoodDenials::test_store_failure_returns_unavailable PASSED
+tests/test_succession_dogfood.py::TestSuccessionDogfoodDenials::test_unverified_context_startup_failure PASSED
+tests/test_succession_dogfood.py::TestSuccessionDogfoodDenials::test_store_startup_failure PASSED
 
 9 passed in ~12s
 ```
@@ -247,7 +304,7 @@ Stop and escalate. Do not use alternate command construction, shell variables, a
 ### PASS
 
 - All 9 active tests pass
-- Continuation marker derived from transferred evidence content (packet marker + receipt result)
+- Continuation marker derived from transferred evidence content (extracted from resolved packet summary, not from class constants or packet IDs)
 - Every denial returns only the exact 6-key shape with no distinguishable reason
 - A cold successor with no chat history can reproduce the workflow from this document
 - No AdamOS or Hermes runtime code is imported or referenced
@@ -281,13 +338,15 @@ Stop and escalate. Do not use alternate command construction, shell variables, a
 
 ## 16. Independent Cold-Successor Evaluation
 
-**EVALUATOR PACKET PREPARED BUT NOT EXECUTABLE FROM GITHUB.**
-**FEATURE COMMIT AND REMOTE BRANCH DO NOT YET EXIST.**
+**EVALUATOR PACKET PREPARED.**
+**FEATURE COMMIT EXISTS REMOTELY: `a25ca9d3eef12c9915991c5e28f6d01b72e39d0c`**
+
+A later correction commit may supersede `a25ca9d`; the evaluator must use the final reviewed branch HEAD supplied after this pass.
 
 ### Repository and Branch
 
 - **Canonical base commit:** `aab57045d51632c534bdbe2ae70ee78d923c8a4b`
-- **Feature commit:** TO_BE_FILLED_AFTER_APPROVED_COMMIT
+- **Current feature commit:** `a25ca9d3eef12c9915991c5e28f6d01b72e39d0c`
 - **Branch:** `codex/succession-dogfood-v0`
 
 The evaluator must verify that the feature commit descends from the canonical base. It must not expect branch HEAD to equal the base commit after implementation is committed.
@@ -299,11 +358,17 @@ The evaluator workflow must begin with clean installation from the committed bra
 1. Clone the repository and check out the feature branch.
 2. Verify the feature commit descends from `aab57045...`.
 3. Read `docs/SUCCESSION_DOGFOOD.md`.
-4. Run `pip install .` from the repository root.
-5. Run `python -m pytest tests/test_succession_dogfood.py -v --tb=short`.
-6. Run `python -B -c "import thinkos; print('OK')"`.
-7. Run `python -m compileall -q thinkos/`.
-8. Run `python -m pytest tests/ -q`.
+4. Build a wheel: `python -m build --wheel --outdir /tmp/wheel`
+5. Create a fresh evaluation venv: `python -m venv /tmp/eval-venv`
+6. Install the wheel non-editably: `/tmp/eval-venv/bin/pip install /tmp/wheel/thinkos-*.whl`
+7. Verify the module path is in site-packages:
+   `/tmp/eval-venv/bin/python -I -c "import thinkos; print(thinkos.__file__)"`
+8. Run the succession suite with installed-package mode:
+   `THINKOS_DOGFOOD_USE_INSTALLED=1 /tmp/eval-venv/bin/python -m pytest tests/test_succession_dogfood.py -v --tb=short`
+9. Run import, compilation, and full-suite validation:
+   `/tmp/eval-venv/bin/python -B -c "import thinkos; print('OK')"`
+   `/tmp/eval-venv/bin/python -m compileall -q thinkos/`
+   `/tmp/eval-venv/bin/python -m pytest tests/ -q`
 
 ### Prohibited Context
 
@@ -323,14 +388,15 @@ The independent evaluator must NOT receive:
   "base_commit": "aab57045...",
   "feature_commit": "<commit SHA>",
   "descends_from_base": true,
+  "installed_module_path": "/path/to/venv/lib/python3.*/site-packages/thinkos/__init__.py",
   "succession_tests": {
     "collected": 9,
     "passed": 9,
     "failed": 0
   },
   "full_suite": {
-    "collected": 485,
-    "passed": 485,
+    "collected": 486,
+    "passed": 486,
     "failed": 0
   },
   "import": "OK",
