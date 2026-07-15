@@ -45,11 +45,15 @@ def make_provider_receipt(
     invocation_id: str,
     prompt: str,
     response: str,
-    cost: int,
+    cost: int | None = None,
     shared_source_id: str | None = None,
     parent_receipt_ids: list[str] | None = None,
 ) -> dict:
     response_hash = hashing.compute_sha256(response)
+    # Compute cost from hardcoded tokens if not provided
+    if cost is None:
+        result = accounting.calculate_call_cost(3, 1, 1, PRICES, True)
+        cost = result.calculated_micro_usd_cost
     receipt = {
         "receipt_id": "",
         "pilot_id": pilot_id,
@@ -140,15 +144,16 @@ def make_packet() -> evidence.EvidencePacketInput:
     physical_ids: list[str] = []
     physical_costs: dict[str, int] = {}
 
-    for condition, cost in (("clean", 7), ("drift", 8)):
+    for condition in ("clean", "drift"):
         source_id = f"source-A-{condition}"
         invocation_id = f"inv-A-{condition}"
         prompt = f"synthetic shared prompt {condition}\n"
         response = f"synthetic shared response {condition}\n"
         provider = make_provider_receipt(
             pilot_id, run_id, f"A-{condition}-shared", "A", 1,
-            invocation_id, prompt, response, cost, source_id,
+            invocation_id, prompt, response, shared_source_id=source_id,
         )
+        cost = provider["calculated_micro_usd_cost"]
         checkpoint = make_checkpoint(
             "A", 1, f"shared_sources/{condition}/raw/response.txt", response
         )
@@ -183,14 +188,14 @@ def make_packet() -> evidence.EvidencePacketInput:
         for worker in evidence.WORKERS:
             stage = evidence.WORKER_STAGES[worker]
             invocation_id = f"inv-{condition}-{architecture}-{worker}"
-            cost = stage + len(architecture)
             prompt = f"synthetic {trajectory_id} worker {worker} prompt\n"
             response = f"synthetic {trajectory_id} worker {worker} response\n"
             provider = make_provider_receipt(
                 pilot_id, run_id, trajectory_id, worker, stage, invocation_id,
-                prompt, response, cost,
+                prompt, response,
                 parent_receipt_ids=[source["provider_receipt"]["receipt_id"]],
             )
+            cost = provider["calculated_micro_usd_cost"]
             checkpoint = make_checkpoint(
                 worker,
                 stage,
@@ -676,6 +681,74 @@ class TestInputValidation(EvidenceTestCase):
             result = evidence.build_pilot_evidence(Path(tmp), packet)
             self.assertFalse(result.packet_valid)
             self.assertEqual(list(Path(tmp).iterdir()), [])
+
+
+# ── 4. Semantic reconstruction falsification tests ────────────────────
+
+
+class TestSemanticReconstructionFalsification(EvidenceTestCase):
+    """Prove that coordinated, rehashed tampering for each of the four
+    G1-B defect classes fails disk reconstruction."""
+
+    def test_falsify_cost_derivation(self):
+        """Defect 1: recorded cost disagrees with token/pricing derivation."""
+        packet, result, root = self.build()
+        self.assertTrue(result.packet_valid, result.errors)
+        path = root / "trajectories/A-clean-stateless/worker_B/provider_call_receipt.json"
+        self.rewrite_json(path, lambda data: data.__setitem__("calculated_micro_usd_cost", 999))
+        disk_errors = evidence.validate_pilot_evidence_from_disk(root)
+        self.assertTrue(
+            any("cost derivation" in e for e in disk_errors),
+            f"Expected cost-derivation error, got: {disk_errors}",
+        )
+
+    def test_falsify_allocation_rule(self):
+        """Defect 2: shared allocation violates quotient/remainder rule."""
+        packet, result, root = self.build()
+        self.assertTrue(result.packet_valid, result.errors)
+        path = root / "pilot_accounting.json"
+        def mutate(data):
+            data["shared_allocations"][0]["allocations"]["verified_state"] += 1
+            data["shared_allocations"][0]["sum_allocated"] += 1
+        self.rewrite_json(path, mutate)
+        disk_errors = evidence.validate_pilot_evidence_from_disk(root)
+        self.assertTrue(
+            any("allocation rule" in e for e in disk_errors),
+            f"Expected allocation-rule error, got: {disk_errors}",
+        )
+
+    def test_falsify_trajectory_lineage(self):
+        """Defect 3: successor_call_ids cross-wired between trajectories."""
+        packet, result, root = self.build()
+        self.assertTrue(result.packet_valid, result.errors)
+        path = root / "pilot_accounting.json"
+        def mutate(data):
+            # Swap the first successor ID of A-clean-stateless with A-drift-stateless
+            trajs = data["logical_trajectories"]
+            first_clean = trajs[0]
+            first_drift = trajs[3]
+            first_clean["successor_call_ids"][0] = first_drift["successor_call_ids"][0]
+        self.rewrite_json(path, mutate)
+        disk_errors = evidence.validate_pilot_evidence_from_disk(root)
+        self.assertTrue(
+            any("trajectory lineage" in e for e in disk_errors),
+            f"Expected trajectory-lineage error, got: {disk_errors}",
+        )
+
+    def test_falsify_foreign_receipt_identity(self):
+        """Defect 4: provider receipt belongs to a foreign pilot/run."""
+        packet, result, root = self.build()
+        self.assertTrue(result.packet_valid, result.errors)
+        path = root / "shared_sources/clean/provider_call_receipt.json"
+        def mutate(data):
+            data["pilot_id"] = "foreign-pilot"
+            data["receipt_id"] = hashing.compute_receipt_hash(data)
+        self.rewrite_json(path, mutate)
+        disk_errors = evidence.validate_pilot_evidence_from_disk(root)
+        self.assertTrue(
+            any("foreign receipt" in e for e in disk_errors),
+            f"Expected foreign-receipt error, got: {disk_errors}",
+        )
 
 
 if __name__ == "__main__":

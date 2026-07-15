@@ -18,6 +18,7 @@ from typing import Any
 
 from benchmarks.context_efficiency_v0 import schemas as g0_schemas
 
+from . import accounting as g1_accounting
 from . import g0_manifest
 from . import hashing
 from . import schemas
@@ -251,6 +252,17 @@ def validate_pilot_evidence_from_disk(pilot_dir: str | Path) -> list[str]:
     _validate_scores(pilot_scores, scores, pilot_id, errors)
     _validate_provider_identity(provider_receipts, errors)
     _crosscheck_accounting(pilot_accounting, provider_receipts, errors)
+    _revalidate_cost_derivation(provider_receipts, pricing_catalog, errors)
+    _revalidate_allocation_rule(
+        pilot_accounting.get("shared_allocations") if isinstance(pilot_accounting, dict) else None,
+        errors,
+    )
+    _revalidate_trajectory_lineage(
+        pilot_accounting.get("logical_trajectories") if isinstance(pilot_accounting, dict) else None,
+        provider_receipts,
+        errors,
+    )
+    _revalidate_foreign_receipt_identity(provider_receipts, pilot_id, run_id, errors)
     _validate_pilot_artifact_hashes(root, pilot_config, errors)
     _validate_pilot_receipt(
         root,
@@ -857,6 +869,168 @@ def _crosscheck_accounting(data: Any, providers: list[dict[str, Any]], errors: l
                 errors.append(f"{condition}: allocation shared_source_id does not match provider")
             if allocation.get("physical_calculated_cost") != provider.get("calculated_micro_usd_cost"):
                 errors.append(f"{condition}: allocation physical cost does not match provider")
+
+
+def _revalidate_cost_derivation(
+    providers: list[dict[str, Any]],
+    pricing_catalog: dict[str, Any],
+    errors: list[str],
+) -> None:
+    """Re-derive each provider receipt's cost from its stored tokens and
+    the frozen synthetic pricing catalog. Reject any receipt whose recorded
+    calculated_micro_usd_cost disagrees with the re-derived value."""
+    if not isinstance(pricing_catalog, dict):
+        return
+    entries = pricing_catalog.get("entries")
+    if not isinstance(entries, list) or len(entries) != 3:
+        return
+    prices: dict[str, int] = {}
+    for entry in entries:
+        if not isinstance(entry, dict):
+            return
+        cat = entry.get("category")
+        price = entry.get("price_per_million")
+        if not isinstance(cat, str) or not isinstance(price, int) or isinstance(price, bool):
+            return
+        prices[cat] = price
+    if set(prices) != {"uncached_input", "cached_input", "output"}:
+        return
+    for provider in providers:
+        if not isinstance(provider, dict):
+            continue
+        inv_id = provider.get("provider_invocation_id", "?")
+        recorded_cost = provider.get("calculated_micro_usd_cost")
+        prompt_total = provider.get("prompt_tokens_total")
+        cached = provider.get("cached_input_tokens")
+        completion = provider.get("completion_tokens")
+        call_valid = provider.get("call_accounting_valid", False)
+        if call_valid is not True:
+            if recorded_cost is not None:
+                errors.append(
+                    f"cost derivation: {inv_id} claims invalid but has non-null cost {recorded_cost}"
+                )
+            continue
+        if any(v is None for v in (prompt_total, cached, completion, recorded_cost)):
+            errors.append(
+                f"cost derivation: {inv_id} valid but missing token or cost field"
+            )
+            continue
+        rederived = g1_accounting.calculate_call_cost(
+            prompt_total, cached, completion, prices, True
+        )
+        if not rederived.call_accounting_valid:
+            errors.append(
+                f"cost derivation: {inv_id} re-derivation failed "
+                f"(tokens: prompt={prompt_total}, cached={cached}, completion={completion})"
+            )
+            continue
+        if rederived.calculated_micro_usd_cost != recorded_cost:
+            errors.append(
+                f"cost derivation: {inv_id} recorded cost {recorded_cost} "
+                f"!= re-derived {rederived.calculated_micro_usd_cost} "
+                f"(tokens: prompt={prompt_total}, cached={cached}, completion={completion})"
+            )
+
+
+def _revalidate_allocation_rule(
+    allocations: list[dict[str, Any]],
+    errors: list[str],
+) -> None:
+    """Verify that every shared allocation follows the frozen
+    stateless/summary/verified_state quotient/remainder rule."""
+    if not isinstance(allocations, list):
+        return
+    for condition, allocation in zip(CONDITIONS, allocations):
+        if not isinstance(allocation, dict):
+            continue
+        source_id = allocation.get("shared_source_id", "?")
+        physical = allocation.get("physical_calculated_cost")
+        if not isinstance(physical, int) or isinstance(physical, bool) or physical < 0:
+            continue
+        shares = allocation.get("allocations")
+        if not isinstance(shares, dict) or list(shares) != list(ARCHITECTURES):
+            continue
+        n = len(ARCHITECTURES)
+        base = physical // n
+        remainder = physical % n
+        expected: dict[str, int] = {}
+        for i, arch in enumerate(ARCHITECTURES):
+            expected[arch] = base + (1 if i < remainder else 0)
+        if shares != expected:
+            errors.append(
+                f"allocation rule: {source_id} shares {shares} "
+                f"!= expected {expected} (physical={physical}, "
+                f"quotient={base}, remainder={remainder})"
+            )
+
+
+def _revalidate_trajectory_lineage(
+    logical_trajectories: list[dict[str, Any]],
+    providers: list[dict[str, Any]],
+    errors: list[str],
+) -> None:
+    """Verify that each logical trajectory's successor_call_ids exactly
+    equal the provider invocation IDs of its Worker B, C, and D receipts."""
+    if not isinstance(logical_trajectories, list):
+        return
+    # Build a map: trajectory_id -> {worker -> invocation_id}
+    traj_workers: dict[str, dict[str, str]] = {}
+    for provider in providers:
+        if not isinstance(provider, dict):
+            continue
+        tid = provider.get("trajectory_id")
+        worker = provider.get("worker_label")
+        inv_id = provider.get("provider_invocation_id")
+        if isinstance(tid, str) and isinstance(worker, str) and isinstance(inv_id, str):
+            if worker in ("B", "C", "D"):
+                traj_workers.setdefault(tid, {})[worker] = inv_id
+    for item in logical_trajectories:
+        if not isinstance(item, dict):
+            continue
+        tid = item.get("trajectory_id")
+        successor_ids = item.get("successor_call_ids")
+        if not isinstance(tid, str) or not isinstance(successor_ids, list):
+            continue
+        expected = [
+            traj_workers.get(tid, {}).get(w, "")
+            for w in ("B", "C", "D")
+        ]
+        if not all(expected):
+            errors.append(
+                f"trajectory lineage: {tid} missing worker invocation IDs"
+            )
+            continue
+        if successor_ids != expected:
+            errors.append(
+                f"trajectory lineage: {tid} successor_call_ids {successor_ids} "
+                f"!= expected {expected}"
+            )
+
+
+def _revalidate_foreign_receipt_identity(
+    providers: list[dict[str, Any]],
+    pilot_id: Any,
+    run_id: Any,
+    errors: list[str],
+) -> None:
+    """Reject any provider receipt whose pilot_id or run_id differs from
+    the enclosing pilot configuration."""
+    for provider in providers:
+        if not isinstance(provider, dict):
+            continue
+        inv_id = provider.get("provider_invocation_id", "?")
+        receipt_pilot = provider.get("pilot_id")
+        receipt_run = provider.get("run_id")
+        if receipt_pilot is not None and receipt_pilot != pilot_id:
+            errors.append(
+                f"foreign receipt: {inv_id} has pilot_id {receipt_pilot} "
+                f"!= enclosing {pilot_id}"
+            )
+        if receipt_run is not None and receipt_run != run_id:
+            errors.append(
+                f"foreign receipt: {inv_id} has run_id {receipt_run} "
+                f"!= enclosing {run_id}"
+            )
 
 
 def _validate_references(
