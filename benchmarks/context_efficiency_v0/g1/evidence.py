@@ -1,7 +1,7 @@
-"""G1-B evidence-packet construction.
+"""G1-B evidence-packet construction and disk-only reconstruction.
 
-Builds and validates the §20 pilot evidence structure from recorded
-synthetic inputs. No runtime evidence may enter the Git worktree.
+Builder: validates complete synthetic input before writing, then constructs.
+Disk validator: accepts only pilot_dir, validates using files on disk only.
 """
 
 from __future__ import annotations
@@ -16,65 +16,35 @@ from . import serialization
 from . import schemas as g1_schemas
 
 
-# ── Evidence packet paths (relative to G1_RUN_ROOT) ────────────────────
-
-
 SHARED_SOURCES_DIR = "shared_sources"
 TRAJECTORIES_DIR = "trajectories"
 
-
-def shared_source_path(condition: str) -> str:
-    return f"{SHARED_SOURCES_DIR}/{condition}"
-
-
-def trajectory_path(trajectory_id: str) -> str:
-    return f"{TRAJECTORIES_DIR}/{trajectory_id}"
-
-
-# ── Required §20 file tree ────────────────────────────────────────────
-
-# Every path that must exist for a valid packet.
 REQUIRED_PILOT_FILES = frozenset({
-    "pilot_config.json",
-    "pilot_accounting.json",
-    "pilot_scores.json",
-    "pilot_result.json",
-    "pricing_catalog.json",
-    "provider_selection.md",
+    "pilot_config.json", "pilot_accounting.json", "pilot_scores.json",
+    "pilot_result.json", "pricing_catalog.json", "provider_selection.md",
     "pilot_receipt.json",
 })
-
-REQUIRED_SHARED_SOURCE_FILES = frozenset({
-    "provider_call_receipt.json",
-    "checkpoint_receipt.json",
-})
-
+REQUIRED_SHARED_SOURCE_FILES = frozenset({"provider_call_receipt.json", "checkpoint_receipt.json"})
 REQUIRED_SHARED_SOURCE_DIRS = frozenset({"raw"})
-
 REQUIRED_TRAJECTORY_FILES = frozenset({
-    "config.json",
-    "worker_A_shared_source_ref.json",
-    "trajectory_score.json",
-    "trajectory_result.json",
-    "trajectory_receipt.json",
+    "config.json", "worker_A_shared_source_ref.json",
+    "trajectory_score.json", "trajectory_result.json", "trajectory_receipt.json",
 })
-
 REQUIRED_TRAJECTORY_DIRS = frozenset({"worker_B", "worker_C", "worker_D"})
-
-REQUIRED_WORKER_FILES = frozenset({
-    "provider_call_receipt.json",
-    "checkpoint_receipt.json",
-})
-
+REQUIRED_WORKER_FILES = frozenset({"provider_call_receipt.json", "checkpoint_receipt.json"})
 REQUIRED_WORKER_DIRS = frozenset({"raw"})
 
-# ── Evidence packet builder ──────────────────────────────────────────
+# Files that must contain non-empty, structurally valid content
+NONEMPTY_FILES = frozenset({
+    "pilot_config.json", "pilot_accounting.json", "pilot_scores.json",
+    "pilot_result.json", "pricing_catalog.json", "pilot_receipt.json",
+    "config.json", "trajectory_score.json", "trajectory_result.json",
+    "trajectory_receipt.json",
+})
 
 
 @dataclasses.dataclass(frozen=True)
 class EvidencePacketResult:
-    """Result of building and validating an evidence packet."""
-
     packet_valid: bool
     shared_source_count: int
     trajectory_count: int
@@ -83,65 +53,261 @@ class EvidencePacketResult:
     warnings: tuple[str, ...] = ()
 
 
-def _build_required_paths(
-    pilot_dir: Path,
-    condition_names: list[str],
-    trajectory_ids: list[str],
-) -> list[Path]:
-    """Build the complete set of required paths for a valid §20 packet."""
-    paths = []
+# ── Builder ──────────────────────────────────────────────────────────
+
+
+def build_pilot_evidence(
+    run_root: Path,
+    pilot_id: str,
+    shared_sources: dict[str, dict],
+    trajectories: dict[str, dict],
+    trajectory_refs: dict[str, list[str]] | None = None,
+    expected_refs_per_condition: int = 3,
+) -> EvidencePacketResult:
+    """Build and validate a pilot evidence packet.
+
+    Validates complete synthetic input before writing, then constructs.
+    """
+    errors = []
+    warnings = []
+
+    condition_names = list(shared_sources.keys())
+    trajectory_ids = list(trajectories.keys())
+
+    # Step 1: Validate paths
+    path_errors = _validate_path_safety(pilot_id, condition_names, trajectory_ids, run_root)
+    if path_errors:
+        errors.extend(path_errors)
+        return _fail(len(shared_sources), len(trajectories), errors, warnings)
+
+    pilot_dir = run_root / pilot_id
+
+    # Step 2: Preflight collision check
+    collision_errors = _preflight_collision_check(pilot_dir, condition_names, trajectory_ids)
+    if collision_errors:
+        errors.extend(collision_errors)
+        return _fail(len(shared_sources), len(trajectories), errors, warnings)
+
+    # Step 3: Validate synthetic input content before writing
+    content_errors = _validate_synthetic_content(shared_sources, trajectories, condition_names, trajectory_ids)
+    if content_errors:
+        errors.extend(content_errors)
+        return _fail(len(shared_sources), len(trajectories), errors, warnings)
+
+    # Step 4: Create directory structure and write files
+    shared_dir = pilot_dir / SHARED_SOURCES_DIR
+    traj_dir = pilot_dir / TRAJECTORIES_DIR
+    shared_dir.mkdir(parents=True, exist_ok=False)
+    traj_dir.mkdir(parents=True, exist_ok=False)
 
     # Pilot-level files
-    for fname in REQUIRED_PILOT_FILES:
-        paths.append(pilot_dir / fname)
+    _write_json(pilot_dir / "pilot_config.json", {"pilot_id": pilot_id, "synthetic": True, "g1_phase": "G1-B"})
+    _write_json(pilot_dir / "pilot_accounting.json", {"pilot_id": pilot_id, "total_physical_cost": 0, "total_logical_cost": 0, "synthetic": True})
+    _write_json(pilot_dir / "pilot_scores.json", {"pilot_id": pilot_id, "trajectory_count": len(trajectories), "synthetic": True})
+    _write_json(pilot_dir / "pilot_result.json", {"pilot_id": pilot_id, "status": "synthetic", "synthetic": True})
+    _write_json(pilot_dir / "pricing_catalog.json", {"provider": "test-provider", "model": "test-model", "categories": {"uncached_input": 2500000, "cached_input": 1250000, "output": 10000000}, "synthetic": True})
+    (pilot_dir / "provider_selection.md").write_text(
+        "# Provider Selection\n\n"
+        "This packet uses a synthetic G1-B fixture. "
+        "Real provider selection is deferred to G1-D.\n",
+        encoding="utf-8",
+    )
+    # Pilot receipt with proper checksum
+    pilot_receipt = {"pilot_id": pilot_id, "synthetic": True}
+    pilot_receipt["checksum"] = g1_hashing.compute_sha256(
+        serialization.canonical_json({k: v for k, v in pilot_receipt.items() if k != "checksum"})
+    )
+    _write_json(pilot_dir / "pilot_receipt.json", pilot_receipt)
 
-    # Shared source files and dirs
-    for cond in condition_names:
-        cond_dir = pilot_dir / SHARED_SOURCES_DIR / cond
-        for fname in REQUIRED_SHARED_SOURCE_FILES:
-            paths.append(cond_dir / fname)
-        for dname in REQUIRED_SHARED_SOURCE_DIRS:
-            paths.append(cond_dir / dname)
+    # Shared sources
+    for condition, receipt in shared_sources.items():
+        cond_dir = shared_dir / condition
+        cond_dir.mkdir(parents=True, exist_ok=False)
+        _write_json(cond_dir / "provider_call_receipt.json", receipt)
+        _write_json(cond_dir / "checkpoint_receipt.json", {"receipt_id": f"chk-{condition}-001"})
+        (cond_dir / "raw").mkdir(parents=True, exist_ok=False)
 
-    # Trajectory files and dirs
-    for tid in trajectory_ids:
-        tdir = pilot_dir / TRAJECTORIES_DIR / tid
-        for fname in REQUIRED_TRAJECTORY_FILES:
-            paths.append(tdir / fname)
-        for dname in REQUIRED_TRAJECTORY_DIRS:
-            paths.append(tdir / dname)
-            # Worker files and dirs
-            for wfname in REQUIRED_WORKER_FILES:
-                paths.append(tdir / dname / wfname)
-            for wdname in REQUIRED_WORKER_DIRS:
-                paths.append(tdir / dname / wdname)
+    # Trajectories
+    for tid, tdata in trajectories.items():
+        tdir = traj_dir / tid
+        tdir.mkdir(parents=True, exist_ok=False)
+        _write_json(tdir / "config.json", {"trajectory_id": tid, "synthetic": True, "g1_phase": "G1-B"})
+        _write_json(tdir / "trajectory_score.json", {"trajectory_id": tid, "synthetic": True})
+        _write_json(tdir / "trajectory_result.json", {"trajectory_id": tid, "status": "synthetic", "synthetic": True})
+        # Trajectory receipt with proper checksum
+        traj_receipt = {"trajectory_id": tid, "synthetic": True}
+        traj_receipt["checksum"] = g1_hashing.compute_sha256(
+            serialization.canonical_json({k: v for k, v in traj_receipt.items() if k != "checksum"})
+        )
+        _write_json(tdir / "trajectory_receipt.json", traj_receipt)
 
-    return paths
+        for worker in ("B", "C", "D"):
+            wdir = tdir / f"worker_{worker}"
+            wdir.mkdir(parents=True, exist_ok=False)
+            receipt = tdata.get(f"worker_{worker}_receipt")
+            if receipt:
+                _write_json(wdir / "provider_call_receipt.json", receipt)
+            _write_json(wdir / "checkpoint_receipt.json", {"receipt_id": f"chk-{tid}-{worker}"})
+            (wdir / "raw").mkdir(parents=True, exist_ok=False)
+
+        ref = tdata.get("worker_a_shared_source_ref")
+        if ref:
+            _write_json(tdir / "worker_A_shared_source_ref.json", ref)
+
+    # Step 5: Validate counts
+    if len(shared_sources) != 2:
+        errors.append(f"expected 2 shared sources, got {len(shared_sources)}")
+    if len(trajectories) != 6:
+        errors.append(f"expected 6 trajectories, got {len(trajectories)}")
+
+    # Step 6: Run disk-only validation
+    disk_errors = validate_pilot_evidence_from_disk(pilot_dir)
+    errors.extend(disk_errors)
+
+    ref_count = sum(
+        1 for tid in trajectories
+        if (traj_dir / tid / "worker_A_shared_source_ref.json").exists()
+    )
+
+    return EvidencePacketResult(
+        packet_valid=len(errors) == 0,
+        shared_source_count=len(shared_sources),
+        trajectory_count=len(trajectories),
+        reference_count=ref_count,
+        errors=tuple(errors),
+        warnings=tuple(warnings),
+    )
 
 
-def _validate_path_safety(
-    pilot_id: str,
-    condition_names: list[str],
-    trajectory_ids: list[str],
-    run_root: Path,
-) -> list[str]:
-    """Validate all identifiers and paths before any filesystem mutation.
+# ── Disk-only validator ──────────────────────────────────────────────
 
-    Uses Path.is_relative_to() for containment. Rejects absolute paths,
-    '.', '..', path separators inside identifiers, traversal attempts,
-    symlink-based escapes, and any resolved destination outside the
-    resolved run root.
+
+def validate_pilot_evidence_from_disk(pilot_dir: Path) -> list[str]:
+    """Validate a pilot evidence packet using files on disk only.
+
+    Does not trust the original shared_sources or trajectories dicts.
+    Returns list of error strings. Empty list means valid.
     """
     errors = []
 
-    # Resolve the run root to an absolute canonical path
+    if not pilot_dir.exists():
+        errors.append("pilot directory does not exist")
+        return errors
+
+    # Discover conditions and trajectory IDs from disk
+    shared_dir = pilot_dir / SHARED_SOURCES_DIR
+    traj_dir = pilot_dir / TRAJECTORIES_DIR
+
+    condition_names = sorted(
+        d.name for d in shared_dir.iterdir() if d.is_dir()
+    ) if shared_dir.exists() else []
+    trajectory_ids = sorted(
+        d.name for d in traj_dir.iterdir() if d.is_dir()
+    ) if traj_dir.exists() else []
+
+    # 1. Validate required file tree
+    tree_errors = _validate_required_file_tree(pilot_dir, condition_names, trajectory_ids)
+    errors.extend(tree_errors)
+
+    # 2. Validate non-empty content
+    content_errors = _validate_nonempty_content(pilot_dir, condition_names, trajectory_ids)
+    errors.extend(content_errors)
+
+    # 3. Validate provider_selection.md
+    sel_path = pilot_dir / "provider_selection.md"
+    if sel_path.exists():
+        text = sel_path.read_text(encoding="utf-8")
+        if not text.strip():
+            errors.append("provider_selection.md is empty")
+    else:
+        errors.append("missing provider_selection.md")
+
+    # 4. Validate provider receipts through G1-A schema
+    for cond in condition_names:
+        rpath = shared_dir / cond / "provider_call_receipt.json"
+        if rpath.exists():
+            try:
+                data = json.loads(rpath.read_text(encoding="utf-8"))
+                schema_errors = g1_schemas.validate_provider_call_receipt(data)
+                if schema_errors:
+                    errors.append(f"shared source '{cond}' receipt: {'; '.join(schema_errors)}")
+            except (json.JSONDecodeError, OSError) as e:
+                errors.append(f"shared source '{cond}' receipt: {e}")
+
+    for tid in trajectory_ids:
+        for worker in ("B", "C", "D"):
+            rpath = traj_dir / tid / f"worker_{worker}" / "provider_call_receipt.json"
+            if rpath.exists():
+                try:
+                    data = json.loads(rpath.read_text(encoding="utf-8"))
+                    schema_errors = g1_schemas.validate_provider_call_receipt(data)
+                    if schema_errors:
+                        errors.append(f"trajectory '{tid}' worker_{worker}: {'; '.join(schema_errors)}")
+                except (json.JSONDecodeError, OSError) as e:
+                    errors.append(f"trajectory '{tid}' worker_{worker}: {e}")
+
+    # 5. Validate checkpoint receipts (non-empty, has receipt_id)
+    for cond in condition_names:
+        cpath = shared_dir / cond / "checkpoint_receipt.json"
+        if cpath.exists():
+            try:
+                data = json.loads(cpath.read_text(encoding="utf-8"))
+                if not data:
+                    errors.append(f"shared source '{cond}' checkpoint_receipt is empty")
+                elif not data.get("receipt_id"):
+                    errors.append(f"shared source '{cond}' checkpoint_receipt has no receipt_id")
+            except (json.JSONDecodeError, OSError) as e:
+                errors.append(f"shared source '{cond}' checkpoint_receipt: {e}")
+
+    for tid in trajectory_ids:
+        for worker in ("B", "C", "D"):
+            cpath = traj_dir / tid / f"worker_{worker}" / "checkpoint_receipt.json"
+            if cpath.exists():
+                try:
+                    data = json.loads(cpath.read_text(encoding="utf-8"))
+                    if not data:
+                        errors.append(f"trajectory '{tid}' worker_{worker} checkpoint_receipt is empty")
+                    elif not data.get("receipt_id"):
+                        errors.append(f"trajectory '{tid}' worker_{worker} checkpoint_receipt has no receipt_id")
+                except (json.JSONDecodeError, OSError) as e:
+                    errors.append(f"trajectory '{tid}' worker_{worker} checkpoint_receipt: {e}")
+
+    # 6. Validate trajectory manifests (mandatory checksums)
+    for tid in trajectory_ids:
+        _validate_trajectory_manifest(traj_dir / tid, tid, errors)
+
+    # 7. Validate pilot manifest
+    _validate_pilot_manifest(pilot_dir, errors)
+
+    # 8. Validate references from disk
+    ref_errors = _validate_references_from_disk(pilot_dir, condition_names, trajectory_ids)
+    errors.extend(ref_errors)
+
+    # 9. Reject unexpected disk contents
+    unexpected_errors = _reject_unexpected_contents(pilot_dir, condition_names, trajectory_ids)
+    errors.extend(unexpected_errors)
+
+    return errors
+
+
+# ── Internal helpers ────────────────────────────────────────────────
+
+
+def _fail(sc, tc, errors, warnings):
+    return EvidencePacketResult(
+        packet_valid=False, shared_source_count=sc, trajectory_count=tc,
+        reference_count=0, errors=tuple(errors), warnings=tuple(warnings),
+    )
+
+
+def _validate_path_safety(pilot_id, condition_names, trajectory_ids, run_root):
+    errors = []
     try:
         resolved_root = run_root.resolve(strict=False)
     except (OSError, ValueError) as e:
         errors.append(f"cannot resolve run_root: {e}")
         return errors
 
-    # Validate pilot_id
     if not pilot_id:
         errors.append("pilot_id must be non-empty")
     else:
@@ -152,7 +318,6 @@ def _validate_path_safety(
         if pilot_id.startswith("/"):
             errors.append(f"pilot_id is absolute: {pilot_id}")
 
-    # Validate condition names
     for cond in condition_names:
         if not cond:
             errors.append("condition name must be non-empty")
@@ -164,7 +329,6 @@ def _validate_path_safety(
         if cond.startswith("/"):
             errors.append(f"condition name is absolute: {cond}")
 
-    # Validate trajectory IDs
     for tid in trajectory_ids:
         if not tid:
             errors.append("trajectory ID must be non-empty")
@@ -176,8 +340,6 @@ def _validate_path_safety(
         if tid.startswith("/"):
             errors.append(f"trajectory ID is absolute: {tid}")
 
-    # Validate that no generated destination escapes the run root
-    # using Path.is_relative_to() for proper containment
     pilot_dir = resolved_root / pilot_id
     shared_dir = pilot_dir / SHARED_SOURCES_DIR
     traj_dir = pilot_dir / TRAJECTORIES_DIR
@@ -187,9 +349,7 @@ def _validate_path_safety(
         try:
             resolved = dest.resolve(strict=False)
             if not resolved.is_relative_to(resolved_root):
-                errors.append(
-                    f"condition '{cond}' resolves outside run root: {resolved}"
-                )
+                errors.append(f"condition '{cond}' resolves outside run root: {resolved}")
         except (OSError, ValueError) as e:
             errors.append(f"cannot resolve path for condition '{cond}': {e}")
 
@@ -198,29 +358,19 @@ def _validate_path_safety(
         try:
             resolved = dest.resolve(strict=False)
             if not resolved.is_relative_to(resolved_root):
-                errors.append(
-                    f"trajectory '{tid}' resolves outside run root: {resolved}"
-                )
+                errors.append(f"trajectory '{tid}' resolves outside run root: {resolved}")
         except (OSError, ValueError) as e:
             errors.append(f"cannot resolve path for trajectory '{tid}': {e}")
 
-    # Check for symlink-based escape: verify no component is a symlink
-    # pointing outside the run root
     for cond in condition_names:
-        dest = shared_dir / cond
-        _check_symlink_escape(dest, resolved_root, errors, f"condition '{cond}'")
-
+        _check_symlink_escape(shared_dir / cond, resolved_root, errors, f"condition '{cond}'")
     for tid in trajectory_ids:
-        dest = traj_dir / tid
-        _check_symlink_escape(dest, resolved_root, errors, f"trajectory '{tid}'")
+        _check_symlink_escape(traj_dir / tid, resolved_root, errors, f"trajectory '{tid}'")
 
     return errors
 
 
-def _check_symlink_escape(
-    path: Path, resolved_root: Path, errors: list[str], label: str
-) -> None:
-    """Check that no component of path is a symlink pointing outside resolved_root."""
+def _check_symlink_escape(path, resolved_root, errors, label):
     try:
         parts = list(path.parts)
         for i in range(len(parts), 0, -1):
@@ -228,168 +378,175 @@ def _check_symlink_escape(
             if check.exists() or check.is_symlink():
                 if check.is_symlink():
                     target = check.readlink()
-                    if target.is_absolute():
-                        resolved_target = target.resolve()
-                    else:
-                        resolved_target = (check.parent / target).resolve()
+                    resolved_target = target.resolve() if target.is_absolute() else (check.parent / target).resolve()
                     if not resolved_target.is_relative_to(resolved_root):
-                        errors.append(
-                            f"symlink escape via {label}: {check} -> {target} "
-                            f"(resolves to {resolved_target})"
-                        )
+                        errors.append(f"symlink escape via {label}: {check} -> {target} (resolves to {resolved_target})")
                 break
     except (OSError, ValueError):
         pass
 
 
-def _preflight_collision_check(
-    pilot_dir: Path,
-    condition_names: list[str],
-    trajectory_ids: list[str],
-) -> list[str]:
-    """Check for unexpected pre-existing files, dirs, or symlinks before writing.
-
-    Never overwrite an existing artifact. Treat unexpected files as errors.
-    """
+def _preflight_collision_check(pilot_dir, condition_names, trajectory_ids):
     errors = []
-
-    # Check pilot-level files
     for fname in REQUIRED_PILOT_FILES:
-        fpath = pilot_dir / fname
-        if fpath.exists():
+        if (pilot_dir / fname).exists():
             errors.append(f"pilot-level file already exists: {fname}")
-
-    # Check shared source paths
     for cond in condition_names:
         cond_dir = pilot_dir / SHARED_SOURCES_DIR / cond
         if cond_dir.exists():
             errors.append(f"shared source directory already exists: {cond}")
         for fname in REQUIRED_SHARED_SOURCE_FILES:
-            fpath = cond_dir / fname
-            if fpath.exists():
+            if (cond_dir / fname).exists():
                 errors.append(f"shared source file already exists: {cond}/{fname}")
         for dname in REQUIRED_SHARED_SOURCE_DIRS:
-            dpath = cond_dir / dname
-            if dpath.exists():
+            if (cond_dir / dname).exists():
                 errors.append(f"shared source dir already exists: {cond}/{dname}")
-
-    # Check trajectory paths
     for tid in trajectory_ids:
         tdir = pilot_dir / TRAJECTORIES_DIR / tid
         if tdir.exists():
             errors.append(f"trajectory directory already exists: {tid}")
         for fname in REQUIRED_TRAJECTORY_FILES:
-            fpath = tdir / fname
-            if fpath.exists():
+            if (tdir / fname).exists():
                 errors.append(f"trajectory file already exists: {tid}/{fname}")
         for dname in REQUIRED_TRAJECTORY_DIRS:
             dpath = tdir / dname
             if dpath.exists():
                 errors.append(f"trajectory dir already exists: {tid}/{dname}")
             for wfname in REQUIRED_WORKER_FILES:
-                wpath = dpath / wfname
-                if wpath.exists():
+                if (dpath / wfname).exists():
                     errors.append(f"worker file already exists: {tid}/{dname}/{wfname}")
             for wdname in REQUIRED_WORKER_DIRS:
-                wdpath = dpath / wdname
-                if wdpath.exists():
+                if (dpath / wdname).exists():
                     errors.append(f"worker dir already exists: {tid}/{dname}/{wdname}")
-
     return errors
 
 
-def _validate_receipts_and_manifests(
-    pilot_dir: Path,
-    shared_sources: dict[str, dict],
-    trajectories: dict[str, dict],
-) -> list[str]:
-    """Validate receipt and manifest integrity.
-
-    - Validate synthetic provider receipts through the frozen G1-A schema.
-    - Validate checkpoint receipts through the G0 interface.
-    - Verify all required receipt IDs and manifest checksums.
-    - Missing hashes must fail.
-    - Mismatched hashes must fail.
-    - Use the §21 self-exclusion rules.
-    - Write and read JSON explicitly as UTF-8.
-    - Reject malformed or unexpected files during reconstruction.
-    """
+def _validate_synthetic_content(shared_sources, trajectories, condition_names, trajectory_ids):
+    """Validate synthetic input content before writing. No empty placeholders."""
     errors = []
-
-    # Validate shared source receipts through G1-A schema
-    for condition, receipt in shared_sources.items():
-        schema_errors = g1_schemas.validate_provider_call_receipt(receipt)
-        if schema_errors:
-            errors.append(
-                f"shared source '{condition}' receipt validation failed: "
-                f"{'; '.join(schema_errors)}"
-            )
-
-    # Validate trajectory receipts through G1-A schema
-    for tid, tdata in trajectories.items():
+    for cond in condition_names:
+        receipt = shared_sources.get(cond, {})
+        if not receipt:
+            errors.append(f"shared source '{cond}' receipt is empty")
+        else:
+            schema_errors = g1_schemas.validate_provider_call_receipt(receipt)
+            if schema_errors:
+                errors.append(f"shared source '{cond}' receipt: {'; '.join(schema_errors)}")
+    for tid in trajectory_ids:
+        tdata = trajectories.get(tid, {})
         for worker in ("B", "C", "D"):
             receipt = tdata.get(f"worker_{worker}_receipt")
             if receipt:
                 schema_errors = g1_schemas.validate_provider_call_receipt(receipt)
                 if schema_errors:
-                    errors.append(
-                        f"trajectory '{tid}' worker_{worker} receipt validation failed: "
-                        f"{'; '.join(schema_errors)}"
-                    )
-
-    # Validate that written files can be read back as UTF-8 JSON
-    for condition in shared_sources:
-        receipt_path = pilot_dir / SHARED_SOURCES_DIR / condition / "provider_call_receipt.json"
-        if receipt_path.exists():
-            try:
-                data = json.loads(receipt_path.read_text(encoding="utf-8"))
-                if not isinstance(data, dict):
-                    errors.append(f"malformed receipt file for condition '{condition}'")
-            except (json.JSONDecodeError, UnicodeDecodeError, OSError) as e:
-                errors.append(f"cannot read receipt for condition '{condition}': {e}")
-
-    for tid in trajectories:
-        for worker in ("B", "C", "D"):
-            receipt_path = (
-                pilot_dir / TRAJECTORIES_DIR / tid / f"worker_{worker}" / "provider_call_receipt.json"
-            )
-            if receipt_path.exists():
-                try:
-                    data = json.loads(receipt_path.read_text(encoding="utf-8"))
-                    if not isinstance(data, dict):
-                        errors.append(
-                            f"malformed receipt file for trajectory '{tid}' worker_{worker}"
-                        )
-                except (json.JSONDecodeError, UnicodeDecodeError, OSError) as e:
-                    errors.append(
-                        f"cannot read receipt for trajectory '{tid}' worker_{worker}: {e}"
-                    )
-
+                    errors.append(f"trajectory '{tid}' worker_{worker}: {'; '.join(schema_errors)}")
+        ref = tdata.get("worker_a_shared_source_ref")
+        if not ref:
+            errors.append(f"trajectory '{tid}' has no worker_a_shared_source_ref")
     return errors
 
 
-def _validate_trajectory_manifest(tdir: Path, tid: str, errors: list[str]) -> None:
-    """Validate a single trajectory receipt manifest with §21 self-exclusion."""
-    receipt_path = tdir / "trajectory_receipt.json"
-    if not receipt_path.exists():
+def _validate_required_file_tree(pilot_dir, condition_names, trajectory_ids):
+    errors = []
+    for fname in REQUIRED_PILOT_FILES:
+        if not (pilot_dir / fname).exists():
+            errors.append(f"missing required pilot file: {fname}")
+    for cond in condition_names:
+        cond_dir = pilot_dir / SHARED_SOURCES_DIR / cond
+        if not cond_dir.exists():
+            errors.append(f"missing shared source directory: {cond}")
+            continue
+        for fname in REQUIRED_SHARED_SOURCE_FILES:
+            if not (cond_dir / fname).exists():
+                errors.append(f"missing shared source file: {cond}/{fname}")
+        for dname in REQUIRED_SHARED_SOURCE_DIRS:
+            if not (cond_dir / dname).exists():
+                errors.append(f"missing shared source dir: {cond}/{dname}")
+    for tid in trajectory_ids:
+        tdir = pilot_dir / TRAJECTORIES_DIR / tid
+        if not tdir.exists():
+            errors.append(f"missing trajectory directory: {tid}")
+            continue
+        for fname in REQUIRED_TRAJECTORY_FILES:
+            if not (tdir / fname).exists():
+                errors.append(f"missing trajectory file: {tid}/{fname}")
+        for dname in REQUIRED_TRAJECTORY_DIRS:
+            dpath = tdir / dname
+            if not dpath.exists():
+                errors.append(f"missing trajectory dir: {tid}/{dname}")
+                continue
+            for wfname in REQUIRED_WORKER_FILES:
+                if not (dpath / wfname).exists():
+                    errors.append(f"missing worker file: {tid}/{dname}/{wfname}")
+            for wdname in REQUIRED_WORKER_DIRS:
+                if not (dpath / wdname).exists():
+                    errors.append(f"missing worker dir: {tid}/{dname}/{wdname}")
+    return errors
+
+
+def _validate_nonempty_content(pilot_dir, condition_names, trajectory_ids):
+    """Reject empty {}, empty string, or structurally invalid content in required files."""
+    errors = []
+    # Pilot-level nonempty files
+    for fname in NONEMPTY_FILES:
+        fpath = pilot_dir / fname
+        if fpath.exists():
+            _check_nonempty_json(fpath, fname, errors)
+    # Trajectory config, score, result, receipt
+    for tid in trajectory_ids:
+        tdir = pilot_dir / TRAJECTORIES_DIR / tid
+        for fname in ("config.json", "trajectory_score.json", "trajectory_result.json", "trajectory_receipt.json"):
+            fpath = tdir / fname
+            if fpath.exists():
+                _check_nonempty_json(fpath, f"{tid}/{fname}", errors)
+    # Checkpoint receipts
+    for cond in condition_names:
+        cpath = pilot_dir / SHARED_SOURCES_DIR / cond / "checkpoint_receipt.json"
+        if cpath.exists():
+            _check_nonempty_json(cpath, f"{cond}/checkpoint_receipt.json", errors)
+    for tid in trajectory_ids:
+        for worker in ("B", "C", "D"):
+            cpath = pilot_dir / TRAJECTORIES_DIR / tid / f"worker_{worker}" / "checkpoint_receipt.json"
+            if cpath.exists():
+                _check_nonempty_json(cpath, f"{tid}/{worker}/checkpoint_receipt.json", errors)
+    return errors
+
+
+def _check_nonempty_json(fpath, label, errors):
+    try:
+        data = json.loads(fpath.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as e:
+        errors.append(f"cannot read {label}: {e}")
+        return
+    if not data:
+        errors.append(f"{label} is empty")
+    elif not isinstance(data, dict):
+        errors.append(f"{label} is not a dict")
+
+
+def _validate_trajectory_manifest(tdir, tid, errors):
+    """Validate trajectory receipt manifest with mandatory checksum."""
+    rpath = tdir / "trajectory_receipt.json"
+    if not rpath.exists():
         errors.append(f"missing trajectory receipt for '{tid}'")
         return
     try:
-        data = json.loads(receipt_path.read_text(encoding="utf-8"))
+        data = json.loads(rpath.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError) as e:
         errors.append(f"cannot read trajectory receipt for '{tid}': {e}")
         return
     if not isinstance(data, dict):
         errors.append(f"malformed trajectory receipt for '{tid}'")
         return
-    # Empty dict is a valid placeholder — skip checksum validation
     if not data:
+        errors.append(f"trajectory '{tid}' receipt is empty")
         return
-    # Verify checksum with §21 self-exclusion
-    checksum = data.get("checksum", "")
-    if not checksum:
+    if "trajectory_id" not in data:
+        errors.append(f"trajectory '{tid}' receipt has no trajectory_id")
+    if "checksum" not in data:
         errors.append(f"trajectory '{tid}' receipt has no checksum")
         return
+    checksum = data["checksum"]
     content = {k: v for k, v in data.items() if k != "checksum"}
     computed = g1_hashing.compute_sha256(serialization.canonical_json(content))
     if checksum != computed:
@@ -399,27 +556,27 @@ def _validate_trajectory_manifest(tdir: Path, tid: str, errors: list[str]) -> No
         )
 
 
-def _validate_pilot_manifest(pilot_dir: Path, errors: list[str]) -> None:
-    """Validate the pilot receipt manifest with §21 self-exclusion."""
-    receipt_path = pilot_dir / "pilot_receipt.json"
-    if not receipt_path.exists():
+def _validate_pilot_manifest(pilot_dir, errors):
+    """Validate pilot receipt manifest with mandatory checksum."""
+    rpath = pilot_dir / "pilot_receipt.json"
+    if not rpath.exists():
         errors.append("missing pilot receipt")
         return
     try:
-        data = json.loads(receipt_path.read_text(encoding="utf-8"))
+        data = json.loads(rpath.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError) as e:
         errors.append(f"cannot read pilot receipt: {e}")
         return
     if not isinstance(data, dict):
         errors.append("malformed pilot receipt")
         return
-    # Empty dict is a valid placeholder — skip checksum validation
     if not data:
+        errors.append("pilot receipt is empty")
         return
-    checksum = data.get("checksum", "")
-    if not checksum:
+    if "checksum" not in data:
         errors.append("pilot receipt has no checksum")
         return
+    checksum = data["checksum"]
     content = {k: v for k, v in data.items() if k != "checksum"}
     computed = g1_hashing.compute_sha256(serialization.canonical_json(content))
     if checksum != computed:
@@ -429,20 +586,9 @@ def _validate_pilot_manifest(pilot_dir: Path, errors: list[str]) -> None:
         )
 
 
-def _validate_references_from_actual_files(
-    pilot_dir: Path,
-    trajectories: dict[str, dict],
-    shared_sources: dict[str, dict],
-) -> list[str]:
-    """Validate real references from actual trajectory reference records.
-
-    Every Worker-A reference must contain all mandatory fields. The referenced
-    provider and checkpoint receipt IDs must resolve exactly to the single
-    shared source for that condition. Missing files, missing fields, malformed
-    receipts, conflicting IDs, or unresolved references must fail.
-    """
+def _validate_references_from_disk(pilot_dir, condition_names, trajectory_ids):
+    """Validate references from disk. Exact ID matching, no substring rules."""
     errors = []
-
     traj_dir = pilot_dir / TRAJECTORIES_DIR
     shared_dir = pilot_dir / SHARED_SOURCES_DIR
 
@@ -451,10 +597,10 @@ def _validate_references_from_actual_files(
         "checkpoint_receipt_id", "condition", "allocated_shared_source_cost",
     })
 
-    refs_by_condition: dict[str, int] = {}
+    refs_by_condition = {}
     total_refs = 0
 
-    for tid in trajectories:
+    for tid in trajectory_ids:
         ref_file = traj_dir / tid / "worker_A_shared_source_ref.json"
         if not ref_file.exists():
             errors.append(f"missing reference file for trajectory '{tid}'")
@@ -470,345 +616,165 @@ def _validate_references_from_actual_files(
             errors.append(f"malformed reference for trajectory '{tid}'")
             continue
 
-        # Validate reference hash with §21 self-exclusion
+        # Validate reference hash
         ref_hash = ref_data.get("reference_hash", "")
         if not ref_hash:
             errors.append(f"trajectory '{tid}' reference has no reference_hash")
         else:
             content = {k: v for k, v in ref_data.items() if k != "reference_hash"}
-            computed = g1_hashing.compute_sha256(
-                serialization.canonical_json(content)
-            )
+            computed = g1_hashing.compute_sha256(serialization.canonical_json(content))
             if ref_hash != computed:
-                errors.append(
-                    f"reference hash mismatch for trajectory '{tid}': "
-                    f"got {ref_hash[:16]}..., expected {computed[:16]}..."
-                )
+                errors.append(f"reference hash mismatch for trajectory '{tid}'")
 
-        # Check all mandatory fields are present and non-empty
+        # Check mandatory fields
         for field in MANDATORY_REF_FIELDS:
             val = ref_data.get(field)
             if val is None or (isinstance(val, str) and not val):
-                errors.append(
-                    f"trajectory '{tid}' reference missing or empty field: {field}"
-                )
+                errors.append(f"trajectory '{tid}' reference missing or empty field: {field}")
 
-        # Extract condition
         condition = ref_data.get("condition")
         if condition not in ("clean", "drift"):
             errors.append(f"trajectory '{tid}' reference has unknown condition: {condition}")
             continue
 
-        # Verify the shared source directory exists
+        # Exact shared_source_id match
+        ref_shared_id = ref_data.get("shared_source_id")
+        if ref_shared_id:
+            expected_id = f"shared-{condition}-001"
+            if ref_shared_id != expected_id:
+                errors.append(
+                    f"trajectory '{tid}' shared_source_id ({ref_shared_id}) "
+                    f"does not match expected ({expected_id})"
+                )
+
+        # Verify shared source directory exists
         cond_dir = shared_dir / condition
         if not cond_dir.exists():
-            errors.append(
-                f"trajectory '{tid}' references condition '{condition}' "
-                f"but no shared source directory exists"
-            )
+            errors.append(f"trajectory '{tid}' references condition '{condition}' but no shared source dir exists")
             continue
 
         # Verify provider_invocation_id matches
         ref_inv_id = ref_data.get("provider_invocation_id")
-        receipt_path = cond_dir / "provider_call_receipt.json"
-        if receipt_path.exists() and ref_inv_id:
+        rpath = cond_dir / "provider_call_receipt.json"
+        if rpath.exists() and ref_inv_id:
             try:
-                receipt_data = json.loads(receipt_path.read_text(encoding="utf-8"))
+                receipt_data = json.loads(rpath.read_text(encoding="utf-8"))
                 actual_inv_id = receipt_data.get("provider_invocation_id")
                 if actual_inv_id and ref_inv_id != actual_inv_id:
-                    errors.append(
-                        f"trajectory '{tid}' provider_invocation_id "
-                        f"({ref_inv_id}) does not match shared source "
-                        f"({actual_inv_id})"
-                    )
+                    errors.append(f"trajectory '{tid}' provider_invocation_id ({ref_inv_id}) != shared source ({actual_inv_id})")
             except (json.JSONDecodeError, OSError):
                 pass
 
         # Verify provider_receipt_id matches
         ref_receipt_id = ref_data.get("provider_receipt_id")
-        if receipt_path.exists() and ref_receipt_id:
+        if rpath.exists() and ref_receipt_id:
             try:
-                receipt_data = json.loads(receipt_path.read_text(encoding="utf-8"))
+                receipt_data = json.loads(rpath.read_text(encoding="utf-8"))
                 actual_receipt_id = receipt_data.get("receipt_id")
                 if actual_receipt_id and ref_receipt_id != actual_receipt_id:
-                    errors.append(
-                        f"trajectory '{tid}' provider_receipt_id "
-                        f"({ref_receipt_id}) does not match shared source "
-                        f"({actual_receipt_id})"
-                    )
+                    errors.append(f"trajectory '{tid}' provider_receipt_id ({ref_receipt_id}) != shared source ({actual_receipt_id})")
             except (json.JSONDecodeError, OSError):
                 pass
 
         # Verify checkpoint_receipt_id matches
         ref_checkpoint_id = ref_data.get("checkpoint_receipt_id")
-        checkpoint_path = cond_dir / "checkpoint_receipt.json"
-        if checkpoint_path.exists() and ref_checkpoint_id:
+        cpath = cond_dir / "checkpoint_receipt.json"
+        if cpath.exists() and ref_checkpoint_id:
             try:
-                checkpoint_data = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+                checkpoint_data = json.loads(cpath.read_text(encoding="utf-8"))
                 actual_checkpoint_id = checkpoint_data.get("receipt_id")
                 if actual_checkpoint_id and ref_checkpoint_id != actual_checkpoint_id:
-                    errors.append(
-                        f"trajectory '{tid}' checkpoint_receipt_id "
-                        f"({ref_checkpoint_id}) does not match shared source "
-                        f"({actual_checkpoint_id})"
-                    )
+                    errors.append(f"trajectory '{tid}' checkpoint_receipt_id ({ref_checkpoint_id}) != shared source ({actual_checkpoint_id})")
             except (json.JSONDecodeError, OSError):
                 pass
-
-        # Verify shared_source_id matches
-        ref_shared_id = ref_data.get("shared_source_id")
-        if ref_shared_id:
-            # Check against the condition name
-            if ref_shared_id != condition and f"shared-{condition}" not in ref_shared_id:
-                errors.append(
-                    f"trajectory '{tid}' shared_source_id "
-                    f"({ref_shared_id}) does not match condition '{condition}'"
-                )
 
         refs_by_condition[condition] = refs_by_condition.get(condition, 0) + 1
         total_refs += 1
 
-    # Check total reference count
     if total_refs != 6:
         errors.append(f"expected exactly 6 trajectory references, got {total_refs}")
+    if refs_by_condition.get("clean", 0) != 3:
+        errors.append(f"expected exactly 3 references to clean, got {refs_by_condition.get('clean', 0)}")
+    if refs_by_condition.get("drift", 0) != 3:
+        errors.append(f"expected exactly 3 references to drift, got {refs_by_condition.get('drift', 0)}")
 
-    # Check clean references
-    clean_count = refs_by_condition.get("clean", 0)
-    if clean_count != 3:
-        errors.append(f"expected exactly 3 references to clean, got {clean_count}")
-
-    # Check drift references
-    drift_count = refs_by_condition.get("drift", 0)
-    if drift_count != 3:
-        errors.append(f"expected exactly 3 references to drift, got {drift_count}")
-
-    # Check for copied Worker-A receipts inside trajectories
-    for tid in trajectories:
+    # Check for copied Worker-A receipts
+    for tid in trajectory_ids:
         copied = traj_dir / tid / "worker_A" / "provider_call_receipt.json"
         if copied.exists():
-            errors.append(
-                f"copied Worker-A receipt found in trajectory {tid}"
-            )
+            errors.append(f"copied Worker-A receipt found in trajectory {tid}")
 
     return errors
 
 
-def _validate_required_file_tree(
-    pilot_dir: Path,
-    condition_names: list[str],
-    trajectory_ids: list[str],
-) -> list[str]:
-    """Validate that every required §20 file and directory exists.
-
-    A missing required file or directory must invalidate reconstruction.
-    """
+def _reject_unexpected_contents(pilot_dir, condition_names, trajectory_ids):
+    """Reject unexpected files, directories, duplicate receipt IDs, etc."""
     errors = []
-
-    # Pilot-level files
-    for fname in REQUIRED_PILOT_FILES:
-        fpath = pilot_dir / fname
-        if not fpath.exists():
-            errors.append(f"missing required pilot file: {fname}")
-
-    # Shared source files and dirs
-    for cond in condition_names:
-        cond_dir = pilot_dir / SHARED_SOURCES_DIR / cond
-        if not cond_dir.exists():
-            errors.append(f"missing shared source directory: {cond}")
-            continue
-        for fname in REQUIRED_SHARED_SOURCE_FILES:
-            fpath = cond_dir / fname
-            if not fpath.exists():
-                errors.append(f"missing shared source file: {cond}/{fname}")
-        for dname in REQUIRED_SHARED_SOURCE_DIRS:
-            dpath = cond_dir / dname
-            if not dpath.exists():
-                errors.append(f"missing shared source dir: {cond}/{dname}")
-
-    # Trajectory files and dirs
-    for tid in trajectory_ids:
-        tdir = pilot_dir / TRAJECTORIES_DIR / tid
-        if not tdir.exists():
-            errors.append(f"missing trajectory directory: {tid}")
-            continue
-        for fname in REQUIRED_TRAJECTORY_FILES:
-            fpath = tdir / fname
-            if not fpath.exists():
-                errors.append(f"missing trajectory file: {tid}/{fname}")
-        for dname in REQUIRED_TRAJECTORY_DIRS:
-            dpath = tdir / dname
-            if not dpath.exists():
-                errors.append(f"missing trajectory dir: {tid}/{dname}")
-                continue
-            for wfname in REQUIRED_WORKER_FILES:
-                wpath = dpath / wfname
-                if not wpath.exists():
-                    errors.append(f"missing worker file: {tid}/{dname}/{wfname}")
-            for wdname in REQUIRED_WORKER_DIRS:
-                wdpath = dpath / wdname
-                if not wdpath.exists():
-                    errors.append(f"missing worker dir: {tid}/{dname}/{wdname}")
-
-    return errors
-
-
-def build_pilot_evidence(
-    run_root: Path,
-    pilot_id: str,
-    shared_sources: dict[str, dict],  # condition -> receipt dict
-    trajectories: dict[str, dict],  # trajectory_id -> trajectory data
-    trajectory_refs: dict[str, list[str]] | None = None,  # deprecated — derived from files
-    expected_refs_per_condition: int = 3,
-) -> EvidencePacketResult:
-    """Build and validate a pilot evidence packet in a temporary directory.
-
-    Stores each physical shared Worker-A receipt once under shared_sources/.
-    Stores trajectory references instead of copied Worker-A receipts.
-    Validates reference counts, path safety, and canonical hashes.
-    """
-    errors = []
-    warnings = []
-
-    # Collect all identifiers for path validation
-    condition_names = list(shared_sources.keys())
-    trajectory_ids = list(trajectories.keys())
-
-    # ── Step 1: Validate paths before writing anything ──
-    path_errors = _validate_path_safety(
-        pilot_id, condition_names, trajectory_ids, run_root
-    )
-    if path_errors:
-        errors.extend(path_errors)
-        return EvidencePacketResult(
-            packet_valid=False,
-            shared_source_count=len(shared_sources),
-            trajectory_count=len(trajectories),
-            reference_count=0,
-            errors=tuple(errors),
-            warnings=tuple(warnings),
-        )
-
-    # ── Step 2: Preflight collision check ──
-    pilot_dir = run_root / pilot_id
-    collision_errors = _preflight_collision_check(
-        pilot_dir, condition_names, trajectory_ids
-    )
-    if collision_errors:
-        errors.extend(collision_errors)
-        return EvidencePacketResult(
-            packet_valid=False,
-            shared_source_count=len(shared_sources),
-            trajectory_count=len(trajectories),
-            reference_count=0,
-            errors=tuple(errors),
-            warnings=tuple(warnings),
-        )
-
-    # ── Step 3: Create directory structure ──
-    shared_dir = pilot_dir / SHARED_SOURCES_DIR
     traj_dir = pilot_dir / TRAJECTORIES_DIR
+    shared_dir = pilot_dir / SHARED_SOURCES_DIR
 
-    shared_dir.mkdir(parents=True, exist_ok=False)
-    traj_dir.mkdir(parents=True, exist_ok=False)
+    # Unexpected files at pilot level
+    expected_pilot = REQUIRED_PILOT_FILES
+    if pilot_dir.exists():
+        for f in pilot_dir.iterdir():
+            if f.is_file() and f.name not in expected_pilot:
+                errors.append(f"unexpected pilot-level file: {f.name}")
 
-    # Write pilot-level files
-    for fname in REQUIRED_PILOT_FILES:
-        _write_json(pilot_dir / fname, {})
+    # Unexpected files in shared source dirs
+    for cond in condition_names:
+        cond_dir = shared_dir / cond
+        if cond_dir.exists():
+            expected_shared = set(REQUIRED_SHARED_SOURCE_FILES) | set(REQUIRED_SHARED_SOURCE_DIRS)
+            for f in cond_dir.iterdir():
+                if f.name not in expected_shared:
+                    errors.append(f"unexpected content in shared source '{cond}': {f.name}")
 
-    # Write shared sources
-    for condition, receipt in shared_sources.items():
-        cond_dir = shared_dir / condition
-        cond_dir.mkdir(parents=True, exist_ok=False)
-        _write_json(cond_dir / "provider_call_receipt.json", receipt)
-        # Write checkpoint receipt with a proper receipt_id
-        checkpoint_data = {"receipt_id": f"chk-{condition}-001"}
-        _write_json(cond_dir / "checkpoint_receipt.json", checkpoint_data)
-        (cond_dir / "raw").mkdir(parents=True, exist_ok=False)
-
-    # Write trajectories
-    for tid, tdata in trajectories.items():
+    # Unexpected files in trajectory dirs
+    for tid in trajectory_ids:
         tdir = traj_dir / tid
-        tdir.mkdir(parents=True, exist_ok=False)
+        if tdir.exists():
+            expected_traj = set(REQUIRED_TRAJECTORY_FILES) | set(REQUIRED_TRAJECTORY_DIRS)
+            for f in tdir.iterdir():
+                if f.name not in expected_traj:
+                    errors.append(f"unexpected content in trajectory '{tid}': {f.name}")
+            for dname in REQUIRED_TRAJECTORY_DIRS:
+                wdir = tdir / dname
+                if wdir.exists():
+                    expected_worker = set(REQUIRED_WORKER_FILES) | set(REQUIRED_WORKER_DIRS)
+                    for f in wdir.iterdir():
+                        if f.name not in expected_worker:
+                            errors.append(f"unexpected content in trajectory '{tid}/{dname}': {f.name}")
 
-        # Write trajectory-level files
-        _write_json(tdir / "config.json", {})
-        _write_json(tdir / "trajectory_score.json", {})
-        _write_json(tdir / "trajectory_result.json", {})
-        _write_json(tdir / "trajectory_receipt.json", {})
-
-        # Write worker_B, C, D directories
+    # Duplicate receipt IDs across all provider_call_receipt.json files
+    receipt_ids_seen = set()
+    for cond in condition_names:
+        rpath = shared_dir / cond / "provider_call_receipt.json"
+        if rpath.exists():
+            try:
+                data = json.loads(rpath.read_text(encoding="utf-8"))
+                rid = data.get("receipt_id")
+                if rid:
+                    if rid in receipt_ids_seen:
+                        errors.append(f"duplicate receipt ID: {rid[:16]}...")
+                    receipt_ids_seen.add(rid)
+            except (json.JSONDecodeError, OSError):
+                pass
+    for tid in trajectory_ids:
         for worker in ("B", "C", "D"):
-            wdir = tdir / f"worker_{worker}"
-            wdir.mkdir(parents=True, exist_ok=False)
-            receipt = tdata.get(f"worker_{worker}_receipt")
-            if receipt:
-                _write_json(wdir / "provider_call_receipt.json", receipt)
-            _write_json(wdir / "checkpoint_receipt.json", {})
-            (wdir / "raw").mkdir(parents=True, exist_ok=False)
+            rpath = traj_dir / tid / f"worker_{worker}" / "provider_call_receipt.json"
+            if rpath.exists():
+                try:
+                    data = json.loads(rpath.read_text(encoding="utf-8"))
+                    rid = data.get("receipt_id")
+                    if rid:
+                        if rid in receipt_ids_seen:
+                            errors.append(f"duplicate receipt ID: {rid[:16]}...")
+                        receipt_ids_seen.add(rid)
+                except (json.JSONDecodeError, OSError):
+                    pass
 
-        # Write shared source reference (not a copy of the receipt)
-        ref = tdata.get("worker_a_shared_source_ref")
-        if ref:
-            _write_json(tdir / "worker_A_shared_source_ref.json", ref)
-
-    # ── Step 4: Validate shared source count ──
-    actual_shared = len(shared_sources)
-    if actual_shared != 2:
-        errors.append(
-            f"expected 2 shared sources, got {actual_shared}"
-        )
-
-    # ── Step 5: Validate trajectory count ──
-    actual_traj = len(trajectories)
-    if actual_traj != 6:
-        errors.append(
-            f"expected 6 trajectories, got {actual_traj}"
-        )
-
-    # ── Step 6: Validate required file tree ──
-    tree_errors = _validate_required_file_tree(
-        pilot_dir, condition_names, trajectory_ids
-    )
-    errors.extend(tree_errors)
-
-    # ── Step 7: Validate references from actual files ──
-    ref_errors = _validate_references_from_actual_files(
-        pilot_dir, trajectories, shared_sources
-    )
-    errors.extend(ref_errors)
-
-    # ── Step 8: Validate receipts and manifests ──
-    receipt_errors = _validate_receipts_and_manifests(
-        pilot_dir, shared_sources, trajectories
-    )
-    errors.extend(receipt_errors)
-
-    # ── Step 9: Validate trajectory manifests ──
-    for tid in trajectories:
-        tdir = traj_dir / tid
-        _validate_trajectory_manifest(tdir, tid, errors)
-
-    # ── Step 10: Validate pilot manifest ──
-    _validate_pilot_manifest(pilot_dir, errors)
-
-    # Compute reference count from actual files
-    ref_count = 0
-    for tid in trajectories:
-        ref_file = traj_dir / tid / "worker_A_shared_source_ref.json"
-        if ref_file.exists():
-            ref_count += 1
-
-    packet_valid = len(errors) == 0
-    return EvidencePacketResult(
-        packet_valid=packet_valid,
-        shared_source_count=actual_shared,
-        trajectory_count=actual_traj,
-        reference_count=ref_count,
-        errors=tuple(errors),
-        warnings=tuple(warnings),
-    )
+    return errors
 
 
 def _write_json(path: Path, data: dict) -> None:
-    """Write a JSON file with canonical serialization as UTF-8."""
     path.write_text(serialization.canonical_json(data) + "\n", encoding="utf-8")

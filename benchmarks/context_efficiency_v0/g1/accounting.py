@@ -17,10 +17,10 @@ class PricingEntry:
 
     provider: str
     model: str
-    category: str  # "uncached_input", "cached_input", "output"
-    price_per_million: int  # micro-USD per 1M tokens
-    effective_date: str  # RFC 3339 UTC
-    source: str  # provenance reference
+    category: str
+    price_per_million: int
+    effective_date: str
+    source: str
 
 
 # ── Per-call accounting result ────────────────────────────────────────
@@ -49,7 +49,7 @@ class SharedSourceAllocation:
 
     shared_source_id: str
     physical_calculated_cost: int
-    allocations: dict[str, int]  # architecture -> allocated micro-USD
+    allocations: dict[str, int]
     sum_allocated: int
     allocation_valid: bool
     errors: tuple[str, ...] = ()
@@ -79,7 +79,7 @@ class PhysicalPilotAccounting:
     """Physical-level accounting for the entire pilot."""
 
     physical_invocation_ids: tuple[str, ...]
-    physical_calculated_costs: dict[str, int]  # invocation_id -> cost
+    physical_calculated_costs: dict[str, int]
     total_physical_calculated_cost: int
     deduplication_valid: bool
     errors: tuple[str, ...] = ()
@@ -110,7 +110,7 @@ REQUIRED_PRICE_CATEGORIES = frozenset({"uncached_input", "cached_input", "output
 
 
 def ceiling_div(numerator: int, denominator: int) -> int:
-    """Integer ceiling division. Returns (numerator + denominator - 1) // denominator."""
+    """Integer ceiling division."""
     if denominator <= 0:
         raise ValueError(f"denominator must be positive, got {denominator}")
     if numerator < 0:
@@ -119,7 +119,6 @@ def ceiling_div(numerator: int, denominator: int) -> int:
 
 
 def _validate_prices(prices: dict[str, Any]) -> list[str]:
-    """Validate the prices dict. Returns list of error strings."""
     errors = []
     if not isinstance(prices, dict):
         errors.append("prices must be a dict")
@@ -137,7 +136,6 @@ def _validate_prices(prices: dict[str, Any]) -> list[str]:
 
 
 def _safe_int(val: Any, name: str, errors: list[str]) -> int | None:
-    """Safely coerce a value to int or None, appending errors on malformed input."""
     if val is None:
         return None
     if isinstance(val, bool):
@@ -152,34 +150,40 @@ def _safe_int(val: Any, name: str, errors: list[str]) -> int | None:
     return None
 
 
+def _validate_cost(val: Any, name: str, errors: list[str]) -> int | None:
+    """Validate a cost value is a non-negative integer or None. Rejects bool/float/string."""
+    if val is None:
+        return None
+    if isinstance(val, bool):
+        errors.append(f"{name} must be an integer or null, got bool")
+        return None
+    if isinstance(val, int):
+        if val < 0:
+            errors.append(f"{name} must be non-negative, got {val}")
+            return None
+        return val
+    errors.append(f"{name} must be an integer or null, got {type(val).__name__}")
+    return None
+
+
 def calculate_call_cost(
     prompt_tokens_total: int | None,
     cached_input_tokens: int | None,
     completion_tokens: int | None,
     prices: dict[str, int],
-    cached_included: bool,  # True if prompt_tokens_total includes cached
+    cached_included: bool,
 ) -> CallAccounting:
-    """Calculate cost for one provider call.
-
-    prices must contain keys: "uncached_input", "cached_input", "output"
-    each as integer micro-USD per million tokens.
-    """
     errors = []
-
-    # Validate prices
     price_errors = _validate_prices(prices)
     errors.extend(price_errors)
 
-    # Validate cached_included is boolean
     if not isinstance(cached_included, bool):
         errors.append(f"cached_included must be a boolean, got {type(cached_included).__name__}")
 
-    # Safely coerce token values — malformed types produce invalid accounting, not TypeError
     prompt_tokens_total = _safe_int(prompt_tokens_total, "prompt_tokens_total", errors)
     cached_input_tokens = _safe_int(cached_input_tokens, "cached_input_tokens", errors)
     completion_tokens = _safe_int(completion_tokens, "completion_tokens", errors)
 
-    # Validate non-negative
     for name, val in [
         ("prompt_tokens_total", prompt_tokens_total),
         ("cached_input_tokens", cached_input_tokens),
@@ -188,7 +192,6 @@ def calculate_call_cost(
         if val is not None and val < 0:
             errors.append(f"{name} must be non-negative, got {val}")
 
-    # Decompose
     uncached_input_tokens: int | None = None
     if prompt_tokens_total is not None and cached_input_tokens is not None:
         if cached_included:
@@ -196,7 +199,6 @@ def calculate_call_cost(
         else:
             uncached_input_tokens = prompt_tokens_total
 
-    # Validate decomposition
     if uncached_input_tokens is not None and uncached_input_tokens < 0:
         errors.append(
             f"negative uncached_input_tokens ({uncached_input_tokens}): "
@@ -213,7 +215,6 @@ def calculate_call_cost(
                 f"prompt_tokens_total ({prompt_tokens_total})"
             )
 
-    # Calculate cost
     calculated_cost: int | None = None
     call_valid = True
 
@@ -225,21 +226,12 @@ def calculate_call_cost(
         and not errors
     ):
         cost = 0
-        # Uncached input
         if uncached_input_tokens > 0:
-            cost += ceiling_div(
-                uncached_input_tokens * prices["uncached_input"], 1_000_000
-            )
-        # Cached input
+            cost += ceiling_div(uncached_input_tokens * prices["uncached_input"], 1_000_000)
         if cached_input_tokens > 0:
-            cost += ceiling_div(
-                cached_input_tokens * prices["cached_input"], 1_000_000
-            )
-        # Output
+            cost += ceiling_div(cached_input_tokens * prices["cached_input"], 1_000_000)
         if completion_tokens > 0:
-            cost += ceiling_div(
-                completion_tokens * prices["output"], 1_000_000
-            )
+            cost += ceiling_div(completion_tokens * prices["output"], 1_000_000)
         calculated_cost = cost
     else:
         call_valid = False
@@ -264,14 +256,7 @@ def allocate_shared_cost(
     physical_calculated_cost: int,
     architecture_order: tuple[str, ...] | None = None,
 ) -> SharedSourceAllocation:
-    """Allocate a shared Worker-A cost across architecture arms.
-
-    Uses quotient/remainder allocation per contract §11.
-    The only permitted allocation order is ALLOCATION_ORDER.
-    """
     errors = []
-
-    # Freeze allocation order — caller-selected alternate orders are rejected
     if architecture_order is not None and architecture_order != ALLOCATION_ORDER:
         errors.append(
             f"invalid allocation order: got {architecture_order}, "
@@ -279,7 +264,6 @@ def allocate_shared_cost(
         )
     order = ALLOCATION_ORDER
 
-    # Safely coerce cost — malformed types produce invalid accounting, not TypeError
     if isinstance(physical_calculated_cost, bool):
         errors.append("physical_calculated_cost must be an integer")
         physical_calculated_cost = 0
@@ -298,8 +282,7 @@ def allocate_shared_cost(
         base = physical_calculated_cost // n
         remainder = physical_calculated_cost % n
         for i, arch in enumerate(order):
-            alloc = base + (1 if i < remainder else 0)
-            allocations[arch] = alloc
+            allocations[arch] = base + (1 if i < remainder else 0)
 
     sum_allocated = sum(allocations.values())
     allocation_valid = (
@@ -332,34 +315,48 @@ def compute_physical_accounting(
 ) -> PhysicalPilotAccounting:
     """Compute physical pilot accounting with deduplication.
 
-    Deduplicates by provider_invocation_id. Repeated identical references
-    to one shared Worker-A receipt are permitted. Conflicting receipts
-    using the same invocation ID are rejected.
-
-    Two records using the same provider_invocation_id are identical only
-    if all accounting fields agree — not merely their calculated cost.
-    The fingerprint includes call_accounting_valid.
+    Rejects boolean, float, string, or other non-integer calculated costs
+    before comparison or summation. Also rejects malformed or negative token
+    fields even if a manually constructed CallAccounting incorrectly claims
+    validity.
     """
     errors = []
     seen: dict[str, tuple] = {}
-    # (cost, prompt, cached, uncached, completion, valid)
+
     for ca in call_accountings:
         iid = ca.provider_invocation_id
         if not iid:
             errors.append("empty provider_invocation_id")
             continue
-        cost = ca.calculated_micro_usd_cost
+
+        # Validate cost type — reject bool, float, string before comparison
+        cost = _validate_cost(ca.calculated_micro_usd_cost, f"cost for {iid}", errors)
         if cost is None:
+            if ca.calculated_micro_usd_cost is not None:
+                # Already appended error from _validate_cost
+                continue
             errors.append(f"null cost for {iid}")
             continue
-        if cost < 0:
-            errors.append(f"negative cost for {iid}: {cost}")
-            continue
-        # Invalid call with a non-null cost
+
+        # Validate token fields even if call claims validity
+        for name, val in [
+            ("prompt_tokens_total", ca.prompt_tokens_total),
+            ("cached_input_tokens", ca.cached_input_tokens),
+            ("uncached_input_tokens", ca.uncached_input_tokens),
+            ("completion_tokens", ca.completion_tokens),
+        ]:
+            if val is not None:
+                if isinstance(val, bool):
+                    errors.append(f"{name} for {iid} must be an integer or null, got bool")
+                elif not isinstance(val, int):
+                    errors.append(f"{name} for {iid} must be an integer or null, got {type(val).__name__}")
+                elif val < 0:
+                    errors.append(f"{name} for {iid} must be non-negative, got {val}")
+
         if not ca.call_accounting_valid and cost is not None:
             errors.append(f"invalid call {iid} has non-null cost {cost}")
             continue
-        # Build full accounting fingerprint including validity state
+
         fingerprint = (
             cost,
             ca.prompt_tokens_total,
@@ -374,7 +371,6 @@ def compute_physical_accounting(
                     f"conflicting duplicate for {iid}: "
                     f"first={seen[iid]}, second={fingerprint}"
                 )
-            # else: repeated identical reference — permitted
         else:
             seen[iid] = fingerprint
 
@@ -397,28 +393,17 @@ def compute_logical_trajectory_accounting(
     successor_costs: dict[str, int],
     allocated_worker_a_cost: int,
 ) -> LogicalTrajectoryAccounting:
-    """Compute accounting for one logical trajectory.
-
-    Requires exactly three successor invocation IDs, three distinct non-empty
-    IDs, a cost for every successor, all successor costs nonnegative, and a
-    nonnegative allocated Worker-A cost.
-    """
     errors = []
 
-    # Validate exactly three successors
     if len(successor_call_ids) != 3:
-        errors.append(
-            f"expected exactly 3 successor call IDs, got {len(successor_call_ids)}"
-        )
+        errors.append(f"expected exactly 3 successor call IDs, got {len(successor_call_ids)}")
 
-    # Validate distinct, non-empty IDs
     for sid in successor_call_ids:
         if not sid:
             errors.append("empty successor call ID")
     if len(set(successor_call_ids)) != len(successor_call_ids):
         errors.append("duplicate successor call IDs")
 
-    # Safely coerce allocated_worker_a_cost — malformed types produce invalid accounting
     if isinstance(allocated_worker_a_cost, bool):
         errors.append("allocated_worker_a_cost must be an integer")
         allocated_worker_a_cost = 0
@@ -464,49 +449,25 @@ def compute_accounting_invariants(
     trajectory_accountings: list[LogicalTrajectoryAccounting],
     shared_allocations: list[SharedSourceAllocation],
 ) -> AccountingInvariants:
-    """Compute aggregate invariant checks for the pilot.
-
-    invariant_valid is true only when ALL of these are true:
-    - Physical deduplication is valid.
-    - Every physical call has call_accounting_valid = true.
-    - Every trajectory accounting is valid.
-    - Every shared-source allocation is valid.
-    - Physical and logical totals are equal.
-    """
     errors = []
 
-    # 1. Physical deduplication must be valid
     if not physical_accounting.deduplication_valid:
-        errors.append(
-            f"physical deduplication invalid: {physical_accounting.errors}"
-        )
+        errors.append(f"physical deduplication invalid: {physical_accounting.errors}")
 
-    total_logical = sum(
-        ta.logical_trajectory_cost for ta in trajectory_accountings
-    )
+    total_logical = sum(ta.logical_trajectory_cost for ta in trajectory_accountings)
     total_physical = physical_accounting.total_physical_calculated_cost
 
-    # 2. Every trajectory accounting must be valid
     for ta in trajectory_accountings:
         if not ta.trajectory_accounting_valid:
-            errors.append(
-                f"invalid trajectory accounting for {ta.trajectory_id}: {ta.errors}"
-            )
+            errors.append(f"invalid trajectory accounting for {ta.trajectory_id}: {ta.errors}")
 
-    # 3. Every shared-source allocation must be valid
     for sa in shared_allocations:
         if not sa.allocation_valid:
-            errors.append(
-                f"invalid allocation for {sa.shared_source_id}: {sa.errors}"
-            )
+            errors.append(f"invalid allocation for {sa.shared_source_id}: {sa.errors}")
 
-    # 4. Physical and logical totals must be equal
     totals_match = total_logical == total_physical
     if not totals_match:
-        errors.append(
-            f"logical total ({total_logical}) != "
-            f"physical total ({total_physical})"
-        )
+        errors.append(f"logical total ({total_logical}) != physical total ({total_physical})")
 
     invariant_valid = (
         physical_accounting.deduplication_valid
