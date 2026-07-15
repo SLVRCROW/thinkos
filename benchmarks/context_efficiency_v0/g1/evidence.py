@@ -252,6 +252,7 @@ def validate_pilot_evidence_from_disk(pilot_dir: str | Path) -> list[str]:
     _validate_scores(pilot_scores, scores, pilot_id, errors)
     _validate_provider_identity(provider_receipts, errors)
     _crosscheck_accounting(pilot_accounting, provider_receipts, errors)
+    _revalidate_cached_decomposition(provider_receipts, errors)
     _revalidate_cost_derivation(provider_receipts, pricing_catalog, errors)
     _revalidate_allocation_rule(
         pilot_accounting.get("shared_allocations") if isinstance(pilot_accounting, dict) else None,
@@ -869,6 +870,64 @@ def _crosscheck_accounting(data: Any, providers: list[dict[str, Any]], errors: l
                 errors.append(f"{condition}: allocation shared_source_id does not match provider")
             if allocation.get("physical_calculated_cost") != provider.get("calculated_micro_usd_cost"):
                 errors.append(f"{condition}: allocation physical cost does not match provider")
+
+
+def _revalidate_cached_decomposition(
+    providers: list[dict[str, Any]],
+    errors: list[str],
+) -> None:
+    """Independently validate the cached-token decomposition for every
+    receipt with call_accounting_valid = true.
+
+    The G1-B synthetic mapping is:
+      prompt_tokens_total includes cached_input_tokens
+
+    Therefore require:
+      uncached_input_tokens == prompt_tokens_total - cached_input_tokens
+
+    Reject missing decomposition fields, negative decomposition,
+    cached > prompt, and stored uncached_input_tokens that differs
+    from the derived value.
+    """
+    for provider in providers:
+        if not isinstance(provider, dict):
+            continue
+        inv_id = provider.get("provider_invocation_id", "?")
+        call_valid = provider.get("call_accounting_valid", False)
+        if call_valid is not True:
+            continue
+        prompt_total = provider.get("prompt_tokens_total")
+        cached = provider.get("cached_input_tokens")
+        stored_uncached = provider.get("uncached_input_tokens")
+        if any(v is None for v in (prompt_total, cached, stored_uncached)):
+            errors.append(
+                f"cached decomposition: {inv_id} valid but missing "
+                f"prompt_tokens_total, cached_input_tokens, or uncached_input_tokens"
+            )
+            continue
+        if not all(isinstance(v, int) and not isinstance(v, bool) for v in (prompt_total, cached, stored_uncached)):
+            errors.append(
+                f"cached decomposition: {inv_id} token fields must be integers"
+            )
+            continue
+        if prompt_total < 0 or cached < 0 or stored_uncached < 0:
+            errors.append(
+                f"cached decomposition: {inv_id} negative token count"
+            )
+            continue
+        if cached > prompt_total:
+            errors.append(
+                f"cached decomposition: {inv_id} cached_input_tokens ({cached}) "
+                f"> prompt_tokens_total ({prompt_total})"
+            )
+            continue
+        derived_uncached = prompt_total - cached
+        if stored_uncached != derived_uncached:
+            errors.append(
+                f"cached decomposition: {inv_id} stored uncached_input_tokens "
+                f"({stored_uncached}) != derived ({derived_uncached}) "
+                f"(prompt_total={prompt_total}, cached={cached})"
+            )
 
 
 def _revalidate_cost_derivation(

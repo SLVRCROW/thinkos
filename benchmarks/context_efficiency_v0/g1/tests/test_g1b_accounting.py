@@ -683,71 +683,260 @@ class TestInputValidation(EvidenceTestCase):
             self.assertEqual(list(Path(tmp).iterdir()), [])
 
 
-# ── 4. Semantic reconstruction falsification tests ────────────────────
+# ── 4. Coordinated tampering rebuild helper ────────────────────────────
 
 
-class TestSemanticReconstructionFalsification(EvidenceTestCase):
-    """Prove that coordinated, rehashed tampering for each of the four
-    G1-B defect classes fails disk reconstruction."""
+def rebuild_integrity(root: Path) -> None:
+    """Rebuild all integrity metadata (receipt IDs, file hashes, checksums,
+    artifact hashes, pilot receipt) after a semantic mutation.
 
-    def test_falsify_cost_derivation(self):
-        """Defect 1: recorded cost disagrees with token/pricing derivation."""
+    This repairs every non-semantic integrity dependency so that the
+    only remaining errors are the intended semantic defects.
+    """
+    # 1. Recompute every provider receipt_id
+    for path in root.rglob("provider_call_receipt.json"):
+        data = json.loads(path.read_text(encoding="utf-8"))
+        data["receipt_id"] = hashing.compute_receipt_hash(data)
+        path.write_text(serialization.canonical_json(data) + "\n", encoding="utf-8")
+
+    # 2. Recompute every checkpoint receipt_id
+    for path in root.rglob("checkpoint_receipt.json"):
+        data = json.loads(path.read_text(encoding="utf-8"))
+        data["receipt_id"] = hashing.compute_receipt_hash(data)
+        path.write_text(serialization.canonical_json(data) + "\n", encoding="utf-8")
+
+    # 3. Recompute every trajectory receipt (file_sha256 + checksum)
+    for trajectory_id in evidence.TRAJECTORY_ORDER:
+        tdir = root / "trajectories" / trajectory_id
+        if not tdir.is_dir():
+            continue
+        manifest_path = tdir / "trajectory_receipt.json"
+        if not manifest_path.exists():
+            continue
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["file_sha256"] = evidence._trajectory_file_hashes(tdir)
+        manifest["checksum"] = ""
+        manifest["checksum"] = hashing.compute_manifest_hash(manifest)
+        manifest_path.write_text(
+            serialization.canonical_json(manifest) + "\n", encoding="utf-8"
+        )
+
+    # 4. Recompute pilot_config artifact_sha256
+    config_path = root / "pilot_config.json"
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    config["artifact_sha256"] = evidence._pilot_artifact_hashes(root)
+    config_path.write_text(serialization.canonical_json(config) + "\n", encoding="utf-8")
+
+    # 5. Recompute pilot receipt
+    receipt_path = root / "pilot_receipt.json"
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    receipt["pilot_config_sha256"] = evidence._file_hash(config_path)
+    # Rebuild provider_receipt_ids from disk
+    provider_ids = []
+    for path in sorted(root.rglob("provider_call_receipt.json")):
+        data = json.loads(path.read_text(encoding="utf-8"))
+        provider_ids.append(data.get("receipt_id", ""))
+    receipt["provider_receipt_ids"] = provider_ids
+    # Rebuild trajectory_receipt_ids from disk
+    traj_ids = []
+    for tid in evidence.TRAJECTORY_ORDER:
+        tpath = root / "trajectories" / tid / "trajectory_receipt.json"
+        if tpath.exists():
+            data = json.loads(tpath.read_text(encoding="utf-8"))
+            traj_ids.append(data.get("checksum", ""))
+    receipt["trajectory_receipt_ids"] = traj_ids
+    receipt["checksum"] = ""
+    receipt["checksum"] = hashing.compute_manifest_hash(receipt)
+    receipt_path.write_text(serialization.canonical_json(receipt) + "\n", encoding="utf-8")
+
+
+# ── 5. Coordinated semantic reconstruction falsification tests ──────────
+
+
+class TestCoordinatedSemanticFalsification(EvidenceTestCase):
+    """Prove that coordinated, integrity-consistent tampering for each
+    of the five G1-B semantic defect classes fails disk reconstruction
+    while all unrelated integrity checks remain satisfied."""
+
+    def _assert_only_semantic_error(self, disk_errors, expected_substring, test_name):
+        """Assert that the intended semantic error is present and that
+        no unrelated hash, manifest, total, or missing-file errors appear."""
+        self.assertTrue(
+            any(expected_substring in e for e in disk_errors),
+            f"{test_name}: Expected '{expected_substring}' in errors, got: {disk_errors}",
+        )
+        # Verify no unrelated integrity errors
+        unrelated_patterns = [
+            "missing", "unexpected", "checksum mismatch", "hash mismatch",
+            "receipt_id", "artifact_sha256", "file_sha256", "pilot_config",
+            "pilot_receipt", "trajectory_receipt", "manifest",
+            "duplicate", "symlink", "canonical", "JSON",
+            "worker/stage", "artifact_path", "checkpoint",
+            "score", "result", "pricing", "provider_selection",
+            "pilot_accounting", "physical_invocation_ids",
+            "physical_calculated_costs", "total_calculated_pilot_cost",
+            "logical_trajectories", "shared_allocations",
+            "accounting_valid", "invocation IDs", "costs do not match",
+            "shared_source_id", "shared provider receipt ID",
+            "shared checkpoint receipt ID", "shared provider invocation ID",
+            "allocated shared-source cost",
+        ]
+        for error in disk_errors:
+            if expected_substring in error:
+                continue  # This is the intended semantic error
+            for pattern in unrelated_patterns:
+                if pattern in error:
+                    self.fail(
+                        f"{test_name}: Unrelated integrity error found: '{error}'"
+                    )
+
+    def test_falsify_cached_decomposition(self):
+        """Defect 1: stored uncached_input_tokens disagrees with
+        prompt_tokens_total - cached_input_tokens derivation."""
         packet, result, root = self.build()
         self.assertTrue(result.packet_valid, result.errors)
+
+        # Mutate: change uncached_input_tokens to 999 while keeping
+        # prompt=3, cached=1, completion=1, cost=17
+        path = root / "trajectories/A-clean-stateless/worker_B/provider_call_receipt.json"
+        self.rewrite_json(path, lambda data: data.__setitem__("uncached_input_tokens", 999))
+        rebuild_integrity(root)
+
+        disk_errors = evidence.validate_pilot_evidence_from_disk(root)
+        self._assert_only_semantic_error(
+            disk_errors, "cached decomposition", "cached_decomposition"
+        )
+
+    def test_falsify_cost_derivation(self):
+        """Defect 2: recorded cost disagrees with token/pricing derivation,
+        with all other integrity metadata consistent."""
+        packet, result, root = self.build()
+        self.assertTrue(result.packet_valid, result.errors)
+
+        # Mutate: change calculated_micro_usd_cost to 999 while leaving
+        # tokens unchanged (prompt=3, cached=1, completion=1)
         path = root / "trajectories/A-clean-stateless/worker_B/provider_call_receipt.json"
         self.rewrite_json(path, lambda data: data.__setitem__("calculated_micro_usd_cost", 999))
+        rebuild_integrity(root)
+
+        # Also update pilot_accounting so sum/cross-reference checks pass
+        acct_path = root / "pilot_accounting.json"
+        acct = json.loads(acct_path.read_text(encoding="utf-8"))
+        inv_id = "inv-clean-stateless-B"
+        old_cost = acct["physical_calculated_costs"][inv_id]
+        acct["physical_calculated_costs"][inv_id] = 999
+        acct["total_calculated_pilot_cost"] += (999 - old_cost)
+        # Update logical trajectory successor cost
+        for lt in acct["logical_trajectories"]:
+            if lt["trajectory_id"] == "A-clean-stateless":
+                lt["successor_calculated_cost"] += (999 - old_cost)
+                lt["logical_trajectory_cost"] += (999 - old_cost)
+        acct_path.write_text(
+            serialization.canonical_json(acct) + "\n", encoding="utf-8"
+        )
+        rebuild_integrity(root)
+
         disk_errors = evidence.validate_pilot_evidence_from_disk(root)
-        self.assertTrue(
-            any("cost derivation" in e for e in disk_errors),
-            f"Expected cost-derivation error, got: {disk_errors}",
+        self._assert_only_semantic_error(
+            disk_errors, "cost derivation", "cost_derivation"
         )
 
     def test_falsify_allocation_rule(self):
-        """Defect 2: shared allocation violates quotient/remainder rule."""
+        """Defect 3: shared allocation violates frozen quotient/remainder
+        rule while preserving total cost and propagating consistently."""
         packet, result, root = self.build()
         self.assertTrue(result.packet_valid, result.errors)
-        path = root / "pilot_accounting.json"
-        def mutate(data):
-            data["shared_allocations"][0]["allocations"]["verified_state"] += 1
-            data["shared_allocations"][0]["sum_allocated"] += 1
-        self.rewrite_json(path, mutate)
+
+        # Read the current allocation for clean (cost=17)
+        acct_path = root / "pilot_accounting.json"
+        acct = json.loads(acct_path.read_text(encoding="utf-8"))
+        clean_alloc = acct["shared_allocations"][0]
+        physical = clean_alloc["physical_calculated_cost"]  # 17
+        # Replace with a different valid-looking distribution that sums
+        # to the same total but violates the quotient/remainder rule.
+        # Correct: 17 -> {stateless: 6, summary: 6, verified_state: 5}
+        # Wrong but same total: {stateless: 7, summary: 5, verified_state: 5}
+        clean_alloc["allocations"] = {
+            "stateless": 7, "summary": 5, "verified_state": 5
+        }
+        clean_alloc["sum_allocated"] = 7 + 5 + 5
+
+        # Propagate into Worker-A references and logical trajectory accounting
+        for lt in acct["logical_trajectories"]:
+            if "clean" in lt["trajectory_id"]:
+                _, _, arch = lt["trajectory_id"].split("-", 2)
+                new_alloc = clean_alloc["allocations"][arch]
+                old_alloc = lt["allocated_shared_source_cost"]
+                lt["allocated_shared_source_cost"] = new_alloc
+                lt["logical_trajectory_cost"] += (new_alloc - old_alloc)
+
+        acct_path.write_text(
+            serialization.canonical_json(acct) + "\n", encoding="utf-8"
+        )
+
+        # Update Worker-A reference files on disk
+        for trajectory_id in evidence.TRAJECTORY_ORDER:
+            if "clean" not in trajectory_id:
+                continue
+            _, _, arch = trajectory_id.split("-", 2)
+            ref_path = root / "trajectories" / trajectory_id / "worker_A_shared_source_ref.json"
+            ref = json.loads(ref_path.read_text(encoding="utf-8"))
+            ref["allocated_shared_source_cost"] = clean_alloc["allocations"][arch]
+            ref_path.write_text(
+                serialization.canonical_json(ref) + "\n", encoding="utf-8"
+            )
+
+        rebuild_integrity(root)
+
         disk_errors = evidence.validate_pilot_evidence_from_disk(root)
-        self.assertTrue(
-            any("allocation rule" in e for e in disk_errors),
-            f"Expected allocation-rule error, got: {disk_errors}",
+        self._assert_only_semantic_error(
+            disk_errors, "allocation rule", "allocation_rule"
         )
 
     def test_falsify_trajectory_lineage(self):
-        """Defect 3: successor_call_ids cross-wired between trajectories."""
+        """Defect 4: successor_call_ids cross-wired between trajectories
+        with equal successor costs, preserving all sums."""
         packet, result, root = self.build()
         self.assertTrue(result.packet_valid, result.errors)
-        path = root / "pilot_accounting.json"
-        def mutate(data):
-            # Swap the first successor ID of A-clean-stateless with A-drift-stateless
-            trajs = data["logical_trajectories"]
-            first_clean = trajs[0]
-            first_drift = trajs[3]
-            first_clean["successor_call_ids"][0] = first_drift["successor_call_ids"][0]
-        self.rewrite_json(path, mutate)
+
+        # Cross-wire: swap the first successor ID between
+        # A-clean-stateless and A-drift-stateless.
+        # Both have the same successor cost (3 * 17 = 51), so sums
+        # remain unchanged.
+        acct_path = root / "pilot_accounting.json"
+        acct = json.loads(acct_path.read_text(encoding="utf-8"))
+        trajs = acct["logical_trajectories"]
+        # trajs[0] = A-clean-stateless, trajs[3] = A-drift-stateless
+        trajs[0]["successor_call_ids"][0], trajs[3]["successor_call_ids"][0] = \
+            trajs[3]["successor_call_ids"][0], trajs[0]["successor_call_ids"][0]
+        acct_path.write_text(
+            serialization.canonical_json(acct) + "\n", encoding="utf-8"
+        )
+
+        rebuild_integrity(root)
+
         disk_errors = evidence.validate_pilot_evidence_from_disk(root)
-        self.assertTrue(
-            any("trajectory lineage" in e for e in disk_errors),
-            f"Expected trajectory-lineage error, got: {disk_errors}",
+        self._assert_only_semantic_error(
+            disk_errors, "trajectory lineage", "trajectory_lineage"
         )
 
     def test_falsify_foreign_receipt_identity(self):
-        """Defect 4: provider receipt belongs to a foreign pilot/run."""
+        """Defect 5: a non-shared Worker-B receipt has a foreign pilot_id
+        and run_id, with all integrity metadata rebuilt."""
         packet, result, root = self.build()
         self.assertTrue(result.packet_valid, result.errors)
-        path = root / "shared_sources/clean/provider_call_receipt.json"
+
+        # Mutate: change pilot_id and run_id on a Worker-B receipt
+        path = root / "trajectories/A-clean-stateless/worker_B/provider_call_receipt.json"
         def mutate(data):
             data["pilot_id"] = "foreign-pilot"
-            data["receipt_id"] = hashing.compute_receipt_hash(data)
+            data["run_id"] = "foreign-run"
         self.rewrite_json(path, mutate)
+        rebuild_integrity(root)
+
         disk_errors = evidence.validate_pilot_evidence_from_disk(root)
-        self.assertTrue(
-            any("foreign receipt" in e for e in disk_errors),
-            f"Expected foreign-receipt error, got: {disk_errors}",
+        self._assert_only_semantic_error(
+            disk_errors, "foreign receipt", "foreign_receipt_identity"
         )
 
 
