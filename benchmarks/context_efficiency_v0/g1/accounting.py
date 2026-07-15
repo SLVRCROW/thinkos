@@ -136,6 +136,22 @@ def _validate_prices(prices: dict[str, Any]) -> list[str]:
     return errors
 
 
+def _safe_int(val: Any, name: str, errors: list[str]) -> int | None:
+    """Safely coerce a value to int or None, appending errors on malformed input."""
+    if val is None:
+        return None
+    if isinstance(val, bool):
+        errors.append(f"{name} must be an integer or null, got bool")
+        return None
+    if isinstance(val, int):
+        return val
+    if isinstance(val, float):
+        errors.append(f"{name} must be an integer or null, got float")
+        return None
+    errors.append(f"{name} must be an integer or null, got {type(val).__name__}")
+    return None
+
+
 def calculate_call_cost(
     prompt_tokens_total: int | None,
     cached_input_tokens: int | None,
@@ -158,26 +174,19 @@ def calculate_call_cost(
     if not isinstance(cached_included, bool):
         errors.append(f"cached_included must be a boolean, got {type(cached_included).__name__}")
 
-    # Validate token counts are non-negative integers or None
+    # Safely coerce token values — malformed types produce invalid accounting, not TypeError
+    prompt_tokens_total = _safe_int(prompt_tokens_total, "prompt_tokens_total", errors)
+    cached_input_tokens = _safe_int(cached_input_tokens, "cached_input_tokens", errors)
+    completion_tokens = _safe_int(completion_tokens, "completion_tokens", errors)
+
+    # Validate non-negative
     for name, val in [
         ("prompt_tokens_total", prompt_tokens_total),
         ("cached_input_tokens", cached_input_tokens),
         ("completion_tokens", completion_tokens),
     ]:
-        if val is not None:
-            if not isinstance(val, int) or isinstance(val, bool):
-                errors.append(f"{name} must be an integer or null, got {type(val).__name__}")
-            elif val < 0:
-                errors.append(f"{name} must be non-negative, got {val}")
-
-    # Validate cached_input_tokens is boolean-consistent
-    if cached_input_tokens is not None:
-        if not isinstance(cached_input_tokens, int) or isinstance(cached_input_tokens, bool):
-            errors.append(f"cached_input_tokens must be an integer or null, got {type(cached_input_tokens).__name__}")
-
-    # Normalize cached tokens
-    if cached_input_tokens is None:
-        pass  # unknown — keep null
+        if val is not None and val < 0:
+            errors.append(f"{name} must be non-negative, got {val}")
 
     # Decompose
     uncached_input_tokens: int | None = None
@@ -270,8 +279,13 @@ def allocate_shared_cost(
         )
     order = ALLOCATION_ORDER
 
-    if not isinstance(physical_calculated_cost, int) or isinstance(physical_calculated_cost, bool):
+    # Safely coerce cost — malformed types produce invalid accounting, not TypeError
+    if isinstance(physical_calculated_cost, bool):
         errors.append("physical_calculated_cost must be an integer")
+        physical_calculated_cost = 0
+    elif not isinstance(physical_calculated_cost, int):
+        errors.append(f"physical_calculated_cost must be an integer, got {type(physical_calculated_cost).__name__}")
+        physical_calculated_cost = 0
     elif physical_calculated_cost < 0:
         errors.append("physical_calculated_cost must be non-negative")
 
@@ -324,10 +338,11 @@ def compute_physical_accounting(
 
     Two records using the same provider_invocation_id are identical only
     if all accounting fields agree — not merely their calculated cost.
+    The fingerprint includes call_accounting_valid.
     """
     errors = []
-    seen: dict[str, tuple[int, int | None, int | None, int | None, int | None]] = {}
-    # (cost, prompt, cached, uncached, completion)
+    seen: dict[str, tuple] = {}
+    # (cost, prompt, cached, uncached, completion, valid)
     for ca in call_accountings:
         iid = ca.provider_invocation_id
         if not iid:
@@ -344,13 +359,14 @@ def compute_physical_accounting(
         if not ca.call_accounting_valid and cost is not None:
             errors.append(f"invalid call {iid} has non-null cost {cost}")
             continue
-        # Build full accounting fingerprint
+        # Build full accounting fingerprint including validity state
         fingerprint = (
             cost,
             ca.prompt_tokens_total,
             ca.cached_input_tokens,
             ca.uncached_input_tokens,
             ca.completion_tokens,
+            ca.call_accounting_valid,
         )
         if iid in seen:
             if seen[iid] != fingerprint:
@@ -402,9 +418,13 @@ def compute_logical_trajectory_accounting(
     if len(set(successor_call_ids)) != len(successor_call_ids):
         errors.append("duplicate successor call IDs")
 
-    # Validate allocated Worker-A cost
-    if not isinstance(allocated_worker_a_cost, int) or isinstance(allocated_worker_a_cost, bool):
+    # Safely coerce allocated_worker_a_cost — malformed types produce invalid accounting
+    if isinstance(allocated_worker_a_cost, bool):
         errors.append("allocated_worker_a_cost must be an integer")
+        allocated_worker_a_cost = 0
+    elif not isinstance(allocated_worker_a_cost, int):
+        errors.append(f"allocated_worker_a_cost must be an integer, got {type(allocated_worker_a_cost).__name__}")
+        allocated_worker_a_cost = 0
     elif allocated_worker_a_cost < 0:
         errors.append(f"allocated_worker_a_cost must be non-negative, got {allocated_worker_a_cost}")
 
@@ -414,7 +434,9 @@ def compute_logical_trajectory_accounting(
         if cost is None:
             errors.append(f"missing successor cost for {sid}")
         else:
-            if not isinstance(cost, int) or isinstance(cost, bool):
+            if isinstance(cost, bool):
+                errors.append(f"successor cost for {sid} must be an integer, got bool")
+            elif not isinstance(cost, int):
                 errors.append(f"successor cost for {sid} must be an integer, got {type(cost).__name__}")
             elif cost < 0:
                 errors.append(f"successor cost for {sid} must be non-negative, got {cost}")

@@ -29,9 +29,9 @@ from benchmarks.context_efficiency_v0.g1 import schemas as g1_schemas
 
 
 PRICES_INCLUDED = {
-    "uncached_input": 2_500_000,  # $2.50/1M
-    "cached_input": 1_250_000,    # $1.25/1M
-    "output": 10_000_000,         # $10.00/1M
+    "uncached_input": 2_500_000,
+    "cached_input": 1_250_000,
+    "output": 10_000_000,
 }
 
 PRICES_EXCLUDED = {
@@ -53,7 +53,6 @@ def _make_call(
         PRICES_INCLUDED if cached_included else PRICES_EXCLUDED,
         cached_included,
     )
-    # Patch the invocation ID onto the result
     return accounting.CallAccounting(
         provider_invocation_id=inv_id,
         prompt_tokens_total=result.prompt_tokens_total,
@@ -67,7 +66,6 @@ def _make_call(
 
 
 def _make_synthetic_receipt(
-    receipt_id: str,
     inv_id: str,
     cost: int | None = 1000,
     worker_label: str = "A",
@@ -78,7 +76,6 @@ def _make_synthetic_receipt(
     The receipt_id is computed from the canonical hash of the receipt
     content (excluding receipt_id itself) per §21 self-exclusion rules.
     """
-    # Build the receipt dict without receipt_id first
     receipt = {
         "pilot_id": "pilot-test",
         "run_id": "run-001",
@@ -125,10 +122,54 @@ def _make_synthetic_receipt(
         "contamination_flags": [],
         "warnings": [],
     }
-    # Compute receipt_id from canonical hash (self-excluding)
     computed_id = g1_hashing.compute_receipt_hash(receipt)
     receipt["receipt_id"] = computed_id
     return receipt
+
+
+def _make_synthetic_pilot_data():
+    """Build synthetic data for a 6-trajectory, 2-shared-source pilot.
+
+    Returns (shared_sources, trajectories) where shared_sources maps
+    condition name to a valid ProviderCallReceipt dict, and trajectories
+    maps trajectory_id to a dict with worker receipts and a reference.
+    """
+    shared_sources = {
+        "clean": _make_synthetic_receipt("shared-clean", 5000),
+        "drift": _make_synthetic_receipt("shared-drift", 4000),
+    }
+
+    clean_receipt_id = shared_sources["clean"]["receipt_id"]
+    drift_receipt_id = shared_sources["drift"]["receipt_id"]
+
+    trajectories = {}
+    for arch in ("stateless", "summary", "verified_state"):
+        for cond in ("clean", "drift"):
+            tid = f"A-{cond}-{arch}"
+            trajectories[tid] = {
+                f"worker_{w}_receipt": _make_synthetic_receipt(
+                    f"{arch}-{cond}-{w}",
+                    1000,
+                    worker_label=w,
+                )
+                for w in ("B", "C", "D")
+            }
+            receipt_id = clean_receipt_id if cond == "clean" else drift_receipt_id
+            ref_content = {
+                "shared_source_id": f"shared-{cond}-001",
+                "provider_invocation_id": f"shared-{cond}",
+                "provider_receipt_id": receipt_id,
+                "checkpoint_receipt_id": f"chk-{cond}-001",
+                "condition": cond,
+                "allocated_shared_source_cost": 1667,
+            }
+            ref_hash = g1_hashing.compute_sha256(
+                serialization.canonical_json(ref_content)
+            )
+            ref_content["reference_hash"] = ref_hash
+            trajectories[tid]["worker_a_shared_source_ref"] = ref_content
+
+    return shared_sources, trajectories
 
 
 # ── 1. Ceiling division ──────────────────────────────────────────────
@@ -168,7 +209,6 @@ class TestCostCalculation(unittest.TestCase):
     """Per-call cost calculation with cached-token decomposition."""
 
     def test_cached_included_basic(self):
-        """500 total, 100 cached, 150 completion with cached_included=True."""
         result = _make_call("inv-1", 500, 100, 150, cached_included=True)
         self.assertTrue(result.call_accounting_valid)
         self.assertEqual(result.uncached_input_tokens, 400)
@@ -176,70 +216,57 @@ class TestCostCalculation(unittest.TestCase):
         self.assertGreater(result.calculated_micro_usd_cost, 0)
 
     def test_cached_excluded_basic(self):
-        """500 total, 100 cached, 150 completion with cached_included=False."""
         result = _make_call("inv-1", 500, 100, 150, cached_included=False)
         self.assertTrue(result.call_accounting_valid)
         self.assertEqual(result.uncached_input_tokens, 500)
         self.assertIsNotNone(result.calculated_micro_usd_cost)
 
     def test_zero_tokens_cost_zero(self):
-        """Zero tokens in all categories must cost zero."""
         result = _make_call("inv-0", 0, 0, 0, cached_included=True)
         self.assertTrue(result.call_accounting_valid)
         self.assertEqual(result.calculated_micro_usd_cost, 0)
 
     def test_null_prompt_tokens(self):
-        """Null prompt_tokens_total must set accounting_valid=False."""
         result = _make_call("inv-null", None, 0, 150, cached_included=True)
         self.assertFalse(result.call_accounting_valid)
         self.assertIsNone(result.calculated_micro_usd_cost)
 
     def test_null_completion_tokens(self):
-        """Null completion_tokens must set accounting_valid=False."""
         result = _make_call("inv-null-c", 500, 0, None, cached_included=True)
         self.assertFalse(result.call_accounting_valid)
         self.assertIsNone(result.calculated_micro_usd_cost)
 
     def test_negative_decomposition_rejected(self):
-        """cached > prompt_total with cached_included=True must fail."""
         result = _make_call("inv-neg", 100, 200, 150, cached_included=True)
         self.assertFalse(result.call_accounting_valid)
         self.assertIsNone(result.calculated_micro_usd_cost)
         self.assertTrue(any("negative" in e or "exceeds" in e for e in result.errors))
 
     def test_explicit_zero_cache(self):
-        """Explicitly reported zero cached tokens is valid."""
         result = _make_call("inv-no-cache", 500, 0, 150, cached_included=True)
         self.assertTrue(result.call_accounting_valid)
         self.assertEqual(result.uncached_input_tokens, 500)
 
     def test_null_cache_unknown(self):
-        """Null cached_input_tokens means unknown, not zero."""
         result = _make_call("inv-unk-cache", 500, None, 150, cached_included=True)
         self.assertFalse(result.call_accounting_valid)
         self.assertIsNone(result.calculated_micro_usd_cost)
 
     def test_single_token_rounds_up(self):
-        """A single token at a nonzero price rounds up to at least 1 micro-USD.
-        1 uncached token * $2.50/1M = 2,500,000 micro-USD / 1,000,000 = 3 (ceiling)."""
         result = _make_call("inv-1tok", 1, 0, 0, cached_included=True)
         self.assertTrue(result.call_accounting_valid)
         self.assertIsNotNone(result.calculated_micro_usd_cost)
         self.assertGreater(result.calculated_micro_usd_cost, 0)
 
     def test_uncached_only(self):
-        """Only uncached input, no cached, no output."""
         result = _make_call("inv-uncached", 1000, 0, 0, cached_included=True)
         self.assertTrue(result.call_accounting_valid)
         self.assertIsNotNone(result.calculated_micro_usd_cost)
 
     def test_output_only(self):
-        """Only output tokens, no input."""
         result = _make_call("inv-out", 0, 0, 1000, cached_included=True)
         self.assertTrue(result.call_accounting_valid)
         self.assertIsNotNone(result.calculated_micro_usd_cost)
-
-    # ── New: Strengthened per-call validation ──
 
     def test_negative_prompt_tokens_rejected(self):
         result = _make_call("inv-neg-p", -1, 0, 150)
@@ -290,6 +317,11 @@ class TestCostCalculation(unittest.TestCase):
         self.assertIsNone(result.calculated_micro_usd_cost)
         self.assertNotEqual(result.calculated_micro_usd_cost, 0)
 
+    def test_malformed_float_cost_returns_invalid_not_typeerror(self):
+        result = accounting.calculate_call_cost(500.0, 100, 150, PRICES_INCLUDED, True)
+        self.assertFalse(result.call_accounting_valid)
+        self.assertIsNone(result.calculated_micro_usd_cost)
+
 
 # ── 3. Shared-source allocation ───────────────────────────────────────
 
@@ -298,7 +330,6 @@ class TestSharedSourceAllocation(unittest.TestCase):
     """Shared Worker-A cost allocation per contract §11."""
 
     def test_remainder_0(self):
-        """60 micro-USD split 3 ways = 20 each."""
         result = accounting.allocate_shared_cost("src-0", 60)
         self.assertTrue(result.allocation_valid)
         self.assertEqual(result.allocations, {
@@ -307,7 +338,6 @@ class TestSharedSourceAllocation(unittest.TestCase):
         self.assertEqual(result.sum_allocated, 60)
 
     def test_remainder_1(self):
-        """61 micro-USD: stateless gets 21, others 20."""
         result = accounting.allocate_shared_cost("src-1", 61)
         self.assertTrue(result.allocation_valid)
         self.assertEqual(result.allocations["stateless"], 21)
@@ -316,7 +346,6 @@ class TestSharedSourceAllocation(unittest.TestCase):
         self.assertEqual(result.sum_allocated, 61)
 
     def test_remainder_2(self):
-        """62 micro-USD: stateless 21, summary 21, verified_state 20."""
         result = accounting.allocate_shared_cost("src-2", 62)
         self.assertTrue(result.allocation_valid)
         self.assertEqual(result.allocations["stateless"], 21)
@@ -325,7 +354,6 @@ class TestSharedSourceAllocation(unittest.TestCase):
         self.assertEqual(result.sum_allocated, 62)
 
     def test_zero_cost(self):
-        """Zero cost allocates zero to all arms."""
         result = accounting.allocate_shared_cost("src-zero", 0)
         self.assertTrue(result.allocation_valid)
         self.assertEqual(result.allocations, {
@@ -333,7 +361,6 @@ class TestSharedSourceAllocation(unittest.TestCase):
         })
 
     def test_small_cost(self):
-        """1 micro-USD goes to stateless."""
         result = accounting.allocate_shared_cost("src-small", 1)
         self.assertTrue(result.allocation_valid)
         self.assertEqual(result.allocations["stateless"], 1)
@@ -345,15 +372,11 @@ class TestSharedSourceAllocation(unittest.TestCase):
         self.assertFalse(result.allocation_valid)
 
     def test_sum_equals_physical(self):
-        """Allocated sum must always equal physical cost."""
         for cost in [0, 1, 2, 3, 4, 5, 10, 100, 1000]:
             result = accounting.allocate_shared_cost("src", cost)
             self.assertEqual(result.sum_allocated, cost)
 
-    # ── New: Freeze allocation order ──
-
     def test_rejects_alternate_architecture_order(self):
-        """Caller-selected alternate orders must be rejected."""
         result = accounting.allocate_shared_cost(
             "src-alt", 60,
             architecture_order=("summary", "stateless", "verified_state"),
@@ -369,6 +392,10 @@ class TestSharedSourceAllocation(unittest.TestCase):
         self.assertFalse(result.allocation_valid)
         self.assertTrue(any("invalid allocation order" in e for e in result.errors))
 
+    def test_malformed_float_cost_returns_invalid_not_typeerror(self):
+        result = accounting.allocate_shared_cost("src-float", 60.0)
+        self.assertFalse(result.allocation_valid)
+
 
 # ── 4. Physical accounting ───────────────────────────────────────────
 
@@ -377,10 +404,9 @@ class TestPhysicalAccounting(unittest.TestCase):
     """Physical pilot accounting with deduplication."""
 
     def test_basic_deduplication(self):
-        """Repeated identical references to one shared receipt are permitted."""
         calls = [
             _make_call("shared-1", 500, 100, 150),
-            _make_call("shared-1", 500, 100, 150),  # identical repeat
+            _make_call("shared-1", 500, 100, 150),
             _make_call("unique-1", 300, 0, 100),
         ]
         result = accounting.compute_physical_accounting(calls)
@@ -388,17 +414,15 @@ class TestPhysicalAccounting(unittest.TestCase):
         self.assertEqual(len(result.physical_invocation_ids), 2)
 
     def test_conflicting_ids_rejected(self):
-        """Conflicting receipts using the same invocation ID are rejected."""
         calls = [
             _make_call("conflict-1", 500, 100, 150),
-            _make_call("conflict-1", 100, 0, 50),  # different cost
+            _make_call("conflict-1", 100, 0, 50),
         ]
         result = accounting.compute_physical_accounting(calls)
         self.assertFalse(result.deduplication_valid)
         self.assertTrue(any("conflicting" in e for e in result.errors))
 
     def test_null_cost_rejected(self):
-        """Null costs must be rejected, never converted to zero."""
         calls = [
             accounting.CallAccounting(
                 provider_invocation_id="null-cost",
@@ -426,7 +450,6 @@ class TestPhysicalAccounting(unittest.TestCase):
         self.assertFalse(result.deduplication_valid)
 
     def test_total_is_sum(self):
-        """Total must equal sum of unique invocation costs."""
         calls = [
             _make_call("a", 500, 100, 150),
             _make_call("b", 300, 0, 100),
@@ -434,16 +457,10 @@ class TestPhysicalAccounting(unittest.TestCase):
         ]
         result = accounting.compute_physical_accounting(calls)
         self.assertTrue(result.deduplication_valid)
-        expected = sum(
-            c.calculated_micro_usd_cost or 0
-            for c in calls
-        )
+        expected = sum(c.calculated_micro_usd_cost or 0 for c in calls)
         self.assertEqual(result.total_physical_calculated_cost, expected)
 
-    # ── New: Strengthened physical deduplication ──
-
     def test_same_invocation_id_different_tokens_rejected(self):
-        """Same invocation ID with different token fields but same rounded cost."""
         call1 = accounting.CallAccounting(
             provider_invocation_id="dup",
             prompt_tokens_total=500, cached_input_tokens=100,
@@ -455,7 +472,7 @@ class TestPhysicalAccounting(unittest.TestCase):
             provider_invocation_id="dup",
             prompt_tokens_total=100, cached_input_tokens=0,
             uncached_input_tokens=100, completion_tokens=50,
-            calculated_micro_usd_cost=5,  # same cost, different tokens
+            calculated_micro_usd_cost=5,
             call_accounting_valid=True,
         )
         result = accounting.compute_physical_accounting([call1, call2])
@@ -490,6 +507,33 @@ class TestPhysicalAccounting(unittest.TestCase):
         self.assertFalse(result.deduplication_valid)
         self.assertTrue(any("invalid call" in e for e in result.errors))
 
+    def test_duplicate_fingerprint_includes_validity_state(self):
+        """The duplicate fingerprint must include validity state.
+
+        Two calls with same invocation ID, same tokens, same cost, but
+        different validity state must be detected as conflicting.
+        """
+        call1 = accounting.CallAccounting(
+            provider_invocation_id="dup",
+            prompt_tokens_total=500, cached_input_tokens=100,
+            uncached_input_tokens=400, completion_tokens=150,
+            calculated_micro_usd_cost=5,
+            call_accounting_valid=True,
+        )
+        call2 = accounting.CallAccounting(
+            provider_invocation_id="dup",
+            prompt_tokens_total=500, cached_input_tokens=100,
+            uncached_input_tokens=400, completion_tokens=150,
+            calculated_micro_usd_cost=5,
+            call_accounting_valid=False,
+        )
+        result = accounting.compute_physical_accounting([call1, call2])
+        self.assertFalse(result.deduplication_valid)
+        self.assertTrue(
+            any("invalid call" in e for e in result.errors),
+            f"Expected 'invalid call' error, got: {result.errors}"
+        )
+
 
 # ── 5. Logical trajectory accounting ─────────────────────────────────
 
@@ -498,7 +542,6 @@ class TestLogicalTrajectoryAccounting(unittest.TestCase):
     """Logical trajectory accounting."""
 
     def test_basic_trajectory(self):
-        """Three successors plus allocated Worker-A share."""
         result = accounting.compute_logical_trajectory_accounting(
             "A-clean-stateless",
             ["b-1", "c-1", "d-1"],
@@ -510,7 +553,6 @@ class TestLogicalTrajectoryAccounting(unittest.TestCase):
         self.assertEqual(result.logical_trajectory_cost, 500)
 
     def test_missing_successor(self):
-        """Missing successor cost must set valid=False."""
         result = accounting.compute_logical_trajectory_accounting(
             "A-clean-stateless",
             ["b-1", "c-1", "missing"],
@@ -518,8 +560,6 @@ class TestLogicalTrajectoryAccounting(unittest.TestCase):
             50,
         )
         self.assertFalse(result.trajectory_accounting_valid)
-
-    # ── New: Strengthened logical trajectory accounting ──
 
     def test_requires_exactly_three_successors(self):
         result = accounting.compute_logical_trajectory_accounting(
@@ -556,6 +596,12 @@ class TestLogicalTrajectoryAccounting(unittest.TestCase):
         self.assertFalse(result.trajectory_accounting_valid)
         self.assertTrue(any("non-negative" in e for e in result.errors))
 
+    def test_malformed_float_worker_a_cost_returns_invalid_not_typeerror(self):
+        result = accounting.compute_logical_trajectory_accounting(
+            "tid", ["a", "b", "c"], {"a": 100, "b": 200, "c": 150}, 50.0,
+        )
+        self.assertFalse(result.trajectory_accounting_valid)
+
 
 # ── 6. Aggregate invariants ──────────────────────────────────────────
 
@@ -564,26 +610,19 @@ class TestAccountingInvariants(unittest.TestCase):
     """Aggregate invariant checks with synthetic full-pilot fixture."""
 
     def _build_synthetic_pilot(self):
-        """Build a synthetic 20-call, 6-trajectory, 2-shared-source pilot."""
-        # Two shared Worker-A sources (clean, drift)
         shared_clean = _make_call("shared-clean", 1000, 200, 500)
         shared_drift = _make_call("shared-drift", 800, 100, 400)
 
-        # 18 unique successor calls (3 architectures x 2 conditions x 3 workers)
         successors = {}
         for arch in ("stateless", "summary", "verified_state"):
             for cond in ("clean", "drift"):
                 for worker in ("B", "C", "D"):
                     iid = f"{arch}-{cond}-{worker}"
-                    successors[iid] = _make_call(
-                        iid, 500, 100, 200,
-                    )
+                    successors[iid] = _make_call(iid, 500, 100, 200)
 
-        # Build physical accounting
         all_calls = [shared_clean, shared_drift] + list(successors.values())
         physical = accounting.compute_physical_accounting(all_calls)
 
-        # Build shared allocations
         alloc_clean = accounting.allocate_shared_cost(
             "shared-clean",
             shared_clean.calculated_micro_usd_cost or 0,
@@ -593,7 +632,6 @@ class TestAccountingInvariants(unittest.TestCase):
             shared_drift.calculated_micro_usd_cost or 0,
         )
 
-        # Build trajectory accountings
         traj_accountings = []
         for arch in ("stateless", "summary", "verified_state"):
             for cond in ("clean", "drift"):
@@ -603,9 +641,7 @@ class TestAccountingInvariants(unittest.TestCase):
                     sid: successors[sid].calculated_micro_usd_cost or 0
                     for sid in succ_ids
                 }
-                alloc = (
-                    alloc_clean if cond == "clean" else alloc_drift
-                )
+                alloc = alloc_clean if cond == "clean" else alloc_drift
                 ta = accounting.compute_logical_trajectory_accounting(
                     tid, succ_ids, succ_costs,
                     alloc.allocations.get(arch, 0),
@@ -619,22 +655,18 @@ class TestAccountingInvariants(unittest.TestCase):
         return invariants, physical, traj_accountings
 
     def test_20_physical_invocations(self):
-        """Synthetic pilot must have exactly 20 unique physical invocations."""
         invariants, physical, _ = self._build_synthetic_pilot()
         self.assertEqual(len(physical.physical_invocation_ids), 20)
 
     def test_6_trajectories(self):
-        """Synthetic pilot must have exactly 6 trajectories."""
         invariants, _, trajs = self._build_synthetic_pilot()
         self.assertEqual(len(trajs), 6)
 
     def test_2_shared_sources(self):
-        """Synthetic pilot must have exactly 2 shared source allocations."""
         invariants, _, _ = self._build_synthetic_pilot()
         self.assertEqual(len(invariants.shared_source_allocations), 2)
 
     def test_invariant_valid(self):
-        """Logical total must equal physical total."""
         invariants, _, _ = self._build_synthetic_pilot()
         self.assertTrue(
             invariants.invariant_valid,
@@ -644,7 +676,6 @@ class TestAccountingInvariants(unittest.TestCase):
         )
 
     def test_invariant_equality(self):
-        """Explicit equality check."""
         invariants, _, _ = self._build_synthetic_pilot()
         self.assertEqual(
             invariants.total_physical_calculated_cost,
@@ -652,8 +683,6 @@ class TestAccountingInvariants(unittest.TestCase):
         )
 
     def test_missing_or_invalid_sets_validity_false(self):
-        """A missing call must set aggregate validity false."""
-        # Build with a null-cost call
         bad_call = accounting.CallAccounting(
             provider_invocation_id="bad",
             prompt_tokens_total=None, cached_input_tokens=None,
@@ -664,13 +693,8 @@ class TestAccountingInvariants(unittest.TestCase):
         physical = accounting.compute_physical_accounting([bad_call])
         self.assertFalse(physical.deduplication_valid)
 
-    # ── New: Fail aggregate accounting closed ──
-
     def test_invalid_physical_fails_aggregate(self):
-        """Invalid physical accounting with equal totals still fails."""
-        # Build a valid pilot, then corrupt physical
         invariants, physical, trajs = self._build_synthetic_pilot()
-        # Create a physical with deduplication failure but equal totals
         bad_physical = accounting.PhysicalPilotAccounting(
             physical_invocation_ids=physical.physical_invocation_ids,
             physical_calculated_costs=physical.physical_calculated_costs,
@@ -686,9 +710,7 @@ class TestAccountingInvariants(unittest.TestCase):
         self.assertTrue(any("deduplication" in e for e in result.errors))
 
     def test_invalid_trajectory_fails_aggregate(self):
-        """Invalid trajectory still fails aggregate validity."""
         invariants, physical, trajs = self._build_synthetic_pilot()
-        # Corrupt one trajectory
         bad_trajs = list(trajs)
         bad_trajs[0] = accounting.LogicalTrajectoryAccounting(
             trajectory_id="bad-traj",
@@ -707,7 +729,6 @@ class TestAccountingInvariants(unittest.TestCase):
         self.assertTrue(any("invalid trajectory" in e for e in result.errors))
 
     def test_invalid_shared_allocation_fails_aggregate(self):
-        """Invalid shared allocation still fails aggregate validity."""
         invariants, physical, trajs = self._build_synthetic_pilot()
         bad_alloc = accounting.SharedSourceAllocation(
             shared_source_id="bad",
@@ -724,7 +745,6 @@ class TestAccountingInvariants(unittest.TestCase):
         self.assertTrue(any("invalid allocation" in e for e in result.errors))
 
     def test_duplicate_invocation_id_with_equal_cost_different_tokens_fails_aggregate(self):
-        """Duplicate invocation ID with equal cost but different token data fails."""
         call1 = accounting.CallAccounting(
             provider_invocation_id="dup",
             prompt_tokens_total=500, cached_input_tokens=100,
@@ -741,8 +761,6 @@ class TestAccountingInvariants(unittest.TestCase):
         )
         physical = accounting.compute_physical_accounting([call1, call2])
         self.assertFalse(physical.deduplication_valid)
-
-        # Even if totals match, aggregate must fail
         traj = accounting.compute_logical_trajectory_accounting(
             "tid", ["a", "b", "c"], {"a": 5, "b": 0, "c": 0}, 0,
         )
@@ -759,51 +777,9 @@ class TestAccountingInvariants(unittest.TestCase):
 class TestEvidencePacket(unittest.TestCase):
     """Evidence-packet construction and validation."""
 
-    def _make_synthetic_pilot_data(self):
-        """Build synthetic data for a 6-trajectory, 2-shared-source pilot."""
-        shared_sources = {
-            "clean": _make_synthetic_receipt("shared-clean-001", "shared-clean", 5000),
-            "drift": _make_synthetic_receipt("shared-drift-001", "shared-drift", 4000),
-        }
-
-        # Extract actual receipt IDs from the generated receipts
-        clean_receipt_id = shared_sources["clean"]["receipt_id"]
-        drift_receipt_id = shared_sources["drift"]["receipt_id"]
-
-        trajectories = {}
-        for arch in ("stateless", "summary", "verified_state"):
-            for cond in ("clean", "drift"):
-                tid = f"A-{cond}-{arch}"
-                trajectories[tid] = {
-                    f"worker_{w}_receipt": _make_synthetic_receipt(
-                        f"rct-{arch}-{cond}-{w}",
-                        f"{arch}-{cond}-{w}",
-                        1000,
-                        worker_label=w,
-                    )
-                    for w in ("B", "C", "D")
-                }
-                # Build ref dict, compute hash over content excluding reference_hash
-                receipt_id = clean_receipt_id if cond == "clean" else drift_receipt_id
-                ref_content = {
-                    "shared_source_id": f"shared-{cond}-001",
-                    "provider_invocation_id": f"shared-{cond}",
-                    "provider_receipt_id": receipt_id,
-                    "checkpoint_receipt_id": f"chk-{cond}-001",
-                    "condition": cond,
-                    "allocated_shared_source_cost": 1667,
-                }
-                ref_hash = g1_hashing.compute_sha256(
-                    serialization.canonical_json(ref_content)
-                )
-                ref_content["reference_hash"] = ref_hash
-                trajectories[tid]["worker_a_shared_source_ref"] = ref_content
-
-        return shared_sources, trajectories
-
     def test_valid_pilot_packet(self):
         """A valid synthetic pilot packet must pass validation."""
-        shared, trajs = self._make_synthetic_pilot_data()
+        shared, trajs = _make_synthetic_pilot_data()
         with tempfile.TemporaryDirectory() as tmp:
             result = evidence.build_pilot_evidence(
                 Path(tmp), "pilot-test-001",
@@ -815,7 +791,7 @@ class TestEvidencePacket(unittest.TestCase):
             )
 
     def test_shared_source_count(self):
-        shared, trajs = self._make_synthetic_pilot_data()
+        shared, trajs = _make_synthetic_pilot_data()
         with tempfile.TemporaryDirectory() as tmp:
             result = evidence.build_pilot_evidence(
                 Path(tmp), "pilot-test", shared, trajs,
@@ -823,7 +799,7 @@ class TestEvidencePacket(unittest.TestCase):
             self.assertEqual(result.shared_source_count, 2)
 
     def test_trajectory_count(self):
-        shared, trajs = self._make_synthetic_pilot_data()
+        shared, trajs = _make_synthetic_pilot_data()
         with tempfile.TemporaryDirectory() as tmp:
             result = evidence.build_pilot_evidence(
                 Path(tmp), "pilot-test", shared, trajs,
@@ -831,7 +807,7 @@ class TestEvidencePacket(unittest.TestCase):
             self.assertEqual(result.trajectory_count, 6)
 
     def test_reference_count(self):
-        shared, trajs = self._make_synthetic_pilot_data()
+        shared, trajs = _make_synthetic_pilot_data()
         with tempfile.TemporaryDirectory() as tmp:
             result = evidence.build_pilot_evidence(
                 Path(tmp), "pilot-test", shared, trajs,
@@ -839,19 +815,17 @@ class TestEvidencePacket(unittest.TestCase):
             self.assertEqual(result.reference_count, 6)
 
     def test_rejects_absolute_path(self):
-        shared, trajs = self._make_synthetic_pilot_data()
+        shared, trajs = _make_synthetic_pilot_data()
         with tempfile.TemporaryDirectory() as tmp:
-            # Inject a condition name with path traversal
-            shared["../evil"] = _make_synthetic_receipt("evil", "evil")
+            shared["../evil"] = _make_synthetic_receipt("evil")
             result = evidence.build_pilot_evidence(
                 Path(tmp), "pilot-test", shared, trajs,
             )
             self.assertFalse(result.packet_valid)
 
     def test_rejects_copied_worker_a_receipt(self):
-        shared, trajs = self._make_synthetic_pilot_data()
+        shared, trajs = _make_synthetic_pilot_data()
         with tempfile.TemporaryDirectory() as tmp:
-            # Manually create a copied Worker-A receipt inside a trajectory
             tdir = Path(tmp) / "pilot-test" / "trajectories" / "A-clean-stateless" / "worker_A"
             tdir.mkdir(parents=True, exist_ok=True)
             (tdir / "provider_call_receipt.json").write_text("{}")
@@ -861,8 +835,7 @@ class TestEvidencePacket(unittest.TestCase):
             self.assertFalse(result.packet_valid)
 
     def test_rejects_wrong_shared_source_count(self):
-        shared, trajs = self._make_synthetic_pilot_data()
-        # Remove one shared source
+        shared, trajs = _make_synthetic_pilot_data()
         del shared["drift"]
         with tempfile.TemporaryDirectory() as tmp:
             result = evidence.build_pilot_evidence(
@@ -871,21 +844,15 @@ class TestEvidencePacket(unittest.TestCase):
             self.assertFalse(result.packet_valid)
 
     def test_canonical_hash_trajectory_manifest(self):
-        """Trajectory manifest must be canonically hashable."""
-        shared, trajs = self._make_synthetic_pilot_data()
+        shared, trajs = _make_synthetic_pilot_data()
         with tempfile.TemporaryDirectory() as tmp:
             result = evidence.build_pilot_evidence(
                 Path(tmp), "pilot-test", shared, trajs,
             )
-            # If packet is valid, hashes were verified
             self.assertTrue(result.packet_valid)
 
-    # ── New: Evidence packet corrections ──
-
     def test_empty_reference_map_fails(self):
-        """Empty reference map (no trajectory refs) must fail."""
-        shared, trajs = self._make_synthetic_pilot_data()
-        # Remove all reference hashes from trajectories
+        shared, trajs = _make_synthetic_pilot_data()
         for tid in trajs:
             del trajs[tid]["worker_a_shared_source_ref"]
         with tempfile.TemporaryDirectory() as tmp:
@@ -895,9 +862,7 @@ class TestEvidencePacket(unittest.TestCase):
             self.assertFalse(result.packet_valid)
 
     def test_missing_clean_references_fails(self):
-        """Missing clean references must fail."""
-        shared, trajs = self._make_synthetic_pilot_data()
-        # Remove clean condition trajectories
+        shared, trajs = _make_synthetic_pilot_data()
         for tid in list(trajs.keys()):
             if "clean" in tid:
                 del trajs[tid]
@@ -908,8 +873,7 @@ class TestEvidencePacket(unittest.TestCase):
             self.assertFalse(result.packet_valid)
 
     def test_missing_drift_references_fails(self):
-        """Missing drift references must fail."""
-        shared, trajs = self._make_synthetic_pilot_data()
+        shared, trajs = _make_synthetic_pilot_data()
         for tid in list(trajs.keys()):
             if "drift" in tid:
                 del trajs[tid]
@@ -920,9 +884,7 @@ class TestEvidencePacket(unittest.TestCase):
             self.assertFalse(result.packet_valid)
 
     def test_reference_ids_that_do_not_resolve_fail(self):
-        """Reference IDs that do not resolve must fail."""
-        shared, trajs = self._make_synthetic_pilot_data()
-        # Corrupt a reference to point to a non-existent shared source
+        shared, trajs = _make_synthetic_pilot_data()
         trajs["A-clean-stateless"]["worker_a_shared_source_ref"]["condition"] = "nonexistent"
         ref_content = {k: v for k, v in trajs["A-clean-stateless"]["worker_a_shared_source_ref"].items() if k != "reference_hash"}
         trajs["A-clean-stateless"]["worker_a_shared_source_ref"]["reference_hash"] = g1_hashing.compute_sha256(
@@ -935,10 +897,8 @@ class TestEvidencePacket(unittest.TestCase):
             self.assertFalse(result.packet_valid)
 
     def test_missing_required_s20_files_fail(self):
-        """Missing required §20 files must fail reconstruction."""
-        shared, trajs = self._make_synthetic_pilot_data()
+        shared, trajs = _make_synthetic_pilot_data()
         with tempfile.TemporaryDirectory() as tmp:
-            # Build with a missing shared source
             shared_minus_clean = dict(shared)
             del shared_minus_clean["clean"]
             result = evidence.build_pilot_evidence(
@@ -947,9 +907,7 @@ class TestEvidencePacket(unittest.TestCase):
             self.assertFalse(result.packet_valid)
 
     def test_missing_hashes_fail(self):
-        """Missing hashes must fail."""
-        shared, trajs = self._make_synthetic_pilot_data()
-        # Remove reference_hash from one trajectory
+        shared, trajs = _make_synthetic_pilot_data()
         del trajs["A-clean-stateless"]["worker_a_shared_source_ref"]["reference_hash"]
         with tempfile.TemporaryDirectory() as tmp:
             result = evidence.build_pilot_evidence(
@@ -958,9 +916,7 @@ class TestEvidencePacket(unittest.TestCase):
             self.assertFalse(result.packet_valid)
 
     def test_mismatched_hashes_fail(self):
-        """Mismatched hashes must fail."""
-        shared, trajs = self._make_synthetic_pilot_data()
-        # Corrupt a reference hash
+        shared, trajs = _make_synthetic_pilot_data()
         trajs["A-clean-stateless"]["worker_a_shared_source_ref"]["reference_hash"] = "x" * 64
         with tempfile.TemporaryDirectory() as tmp:
             result = evidence.build_pilot_evidence(
@@ -969,45 +925,36 @@ class TestEvidencePacket(unittest.TestCase):
             self.assertFalse(result.packet_valid)
 
     def test_absolute_path_creates_no_files(self):
-        """Absolute path attempts must write nothing outside the run root."""
-        shared, trajs = self._make_synthetic_pilot_data()
+        shared, trajs = _make_synthetic_pilot_data()
         with tempfile.TemporaryDirectory() as tmp:
             run_root = Path(tmp)
-            # Try to use an absolute pilot_id
             result = evidence.build_pilot_evidence(
                 run_root, "/etc/evil", shared, trajs,
             )
             self.assertFalse(result.packet_valid)
-            # Verify no files were created outside the temp dir
             for f in run_root.rglob("*"):
                 self.assertTrue(str(f).startswith(str(run_root)))
 
     def test_traversal_attempt_creates_no_files(self):
-        """Traversal attempts must write nothing outside the run root."""
-        shared, trajs = self._make_synthetic_pilot_data()
+        shared, trajs = _make_synthetic_pilot_data()
         with tempfile.TemporaryDirectory() as tmp:
             run_root = Path(tmp)
-            # Try to use a traversal pilot_id
             result = evidence.build_pilot_evidence(
                 run_root, "../../evil", shared, trajs,
             )
             self.assertFalse(result.packet_valid)
-            # Verify no files were created outside the temp dir
             for f in run_root.rglob("*"):
                 self.assertTrue(str(f).startswith(str(run_root)))
 
     def test_symlink_escape_attempt_fails(self):
-        """Symlink-based escape attempts must fail."""
-        shared, trajs = self._make_synthetic_pilot_data()
+        shared, trajs = _make_synthetic_pilot_data()
         with tempfile.TemporaryDirectory() as tmp:
             run_root = Path(tmp)
-            # Create a symlink outside the run root
             outside = Path(tempfile.mkdtemp())
-            escape_link = run_root / "escape"
+            escape_link = run_root / "pilot-test" / "shared_sources" / "clean"
+            escape_link.parent.mkdir(parents=True, exist_ok=True)
             try:
                 escape_link.symlink_to(outside, target_is_directory=True)
-                # Now try to use a condition name that would traverse via symlink
-                shared["escape"] = _make_synthetic_receipt("escape", "escape")
                 result = evidence.build_pilot_evidence(
                     run_root, "pilot-test", shared, trajs,
                 )
@@ -1019,8 +966,7 @@ class TestEvidencePacket(unittest.TestCase):
                     escape_link.unlink()
 
     def test_complete_synthetic_packet_reconstructs_successfully(self):
-        """A complete synthetic packet must reconstruct successfully."""
-        shared, trajs = self._make_synthetic_pilot_data()
+        shared, trajs = _make_synthetic_pilot_data()
         with tempfile.TemporaryDirectory() as tmp:
             result = evidence.build_pilot_evidence(
                 Path(tmp), "pilot-test", shared, trajs,
@@ -1033,19 +979,212 @@ class TestEvidencePacket(unittest.TestCase):
             self.assertEqual(result.trajectory_count, 6)
             self.assertEqual(result.reference_count, 6)
 
-            # Verify the directory structure
             pilot_dir = Path(tmp) / "pilot-test"
-            self.assertTrue((pilot_dir / "shared_sources" / "clean" / "provider_call_receipt.json").exists())
-            self.assertTrue((pilot_dir / "shared_sources" / "drift" / "provider_call_receipt.json").exists())
+
+            for fname in evidence.REQUIRED_PILOT_FILES:
+                self.assertTrue(
+                    (pilot_dir / fname).exists(),
+                    f"Missing pilot file: {fname}"
+                )
+
+            for cond in ("clean", "drift"):
+                cond_dir = pilot_dir / "shared_sources" / cond
+                self.assertTrue(cond_dir.exists(), f"Missing shared source dir: {cond}")
+                for fname in evidence.REQUIRED_SHARED_SOURCE_FILES:
+                    self.assertTrue(
+                        (cond_dir / fname).exists(),
+                        f"Missing shared source file: {cond}/{fname}"
+                    )
+                for dname in evidence.REQUIRED_SHARED_SOURCE_DIRS:
+                    self.assertTrue(
+                        (cond_dir / dname).exists(),
+                        f"Missing shared source dir: {cond}/{dname}"
+                    )
+
             for arch in ("stateless", "summary", "verified_state"):
                 for cond in ("clean", "drift"):
                     tid = f"A-{cond}-{arch}"
-                    self.assertTrue((pilot_dir / "trajectories" / tid).exists())
-                    self.assertTrue((pilot_dir / "trajectories" / tid / "worker_A_shared_source_ref.json").exists())
-                    for w in ("B", "C", "D"):
+                    tdir = pilot_dir / "trajectories" / tid
+                    self.assertTrue(tdir.exists(), f"Missing trajectory dir: {tid}")
+                    for fname in evidence.REQUIRED_TRAJECTORY_FILES:
                         self.assertTrue(
-                            (pilot_dir / "trajectories" / tid / f"worker_{w}" / "provider_call_receipt.json").exists()
+                            (tdir / fname).exists(),
+                            f"Missing trajectory file: {tid}/{fname}"
                         )
+                    for dname in evidence.REQUIRED_TRAJECTORY_DIRS:
+                        wdir = tdir / dname
+                        self.assertTrue(wdir.exists(), f"Missing trajectory dir: {tid}/{dname}")
+                        for wfname in evidence.REQUIRED_WORKER_FILES:
+                            self.assertTrue(
+                                (wdir / wfname).exists(),
+                                f"Missing worker file: {tid}/{dname}/{wfname}"
+                            )
+                        for wdname in evidence.REQUIRED_WORKER_DIRS:
+                            self.assertTrue(
+                                (wdir / wdname).exists(),
+                                f"Missing worker dir: {tid}/{dname}/{wdname}"
+                            )
+
+    def test_missing_each_required_file_type_individually(self):
+        shared, trajs = _make_synthetic_pilot_data()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            shared_minus = dict(shared)
+            del shared_minus["clean"]
+            result = evidence.build_pilot_evidence(
+                Path(tmp), "pilot-test", shared_minus, trajs,
+            )
+            self.assertFalse(result.packet_valid)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            trajs_minus = dict(trajs)
+            del trajs_minus["A-clean-stateless"]
+            result = evidence.build_pilot_evidence(
+                Path(tmp), "pilot-test", shared, trajs_minus,
+            )
+            self.assertFalse(result.packet_valid)
+
+    def test_reference_mandatory_fields_absent(self):
+        shared, trajs = _make_synthetic_pilot_data()
+        mandatory_fields = [
+            "shared_source_id", "provider_invocation_id", "provider_receipt_id",
+            "checkpoint_receipt_id", "condition", "allocated_shared_source_cost",
+        ]
+        for field in mandatory_fields:
+            with tempfile.TemporaryDirectory() as tmp:
+                trajs_copy = {k: dict(v) for k, v in trajs.items()}
+                ref = dict(trajs_copy["A-clean-stateless"]["worker_a_shared_source_ref"])
+                del ref[field]
+                ref_content = {k: v for k, v in ref.items() if k != "reference_hash"}
+                ref["reference_hash"] = g1_hashing.compute_sha256(
+                    serialization.canonical_json(ref_content)
+                )
+                trajs_copy["A-clean-stateless"]["worker_a_shared_source_ref"] = ref
+                result = evidence.build_pilot_evidence(
+                    Path(tmp), "pilot-test", shared, trajs_copy,
+                )
+                self.assertFalse(
+                    result.packet_valid,
+                    f"Should fail with missing field: {field}"
+                )
+
+    def test_mismatched_provider_invocation_id_fails(self):
+        shared, trajs = _make_synthetic_pilot_data()
+        ref = dict(trajs["A-clean-stateless"]["worker_a_shared_source_ref"])
+        ref["provider_invocation_id"] = "wrong-invocation-id"
+        ref_content = {k: v for k, v in ref.items() if k != "reference_hash"}
+        ref["reference_hash"] = g1_hashing.compute_sha256(serialization.canonical_json(ref_content))
+        trajs["A-clean-stateless"]["worker_a_shared_source_ref"] = ref
+        with tempfile.TemporaryDirectory() as tmp:
+            result = evidence.build_pilot_evidence(
+                Path(tmp), "pilot-test", shared, trajs,
+            )
+            self.assertFalse(result.packet_valid)
+
+    def test_mismatched_provider_receipt_id_fails(self):
+        shared, trajs = _make_synthetic_pilot_data()
+        ref = dict(trajs["A-clean-stateless"]["worker_a_shared_source_ref"])
+        ref["provider_receipt_id"] = "wrong-receipt-id"
+        ref_content = {k: v for k, v in ref.items() if k != "reference_hash"}
+        ref["reference_hash"] = g1_hashing.compute_sha256(serialization.canonical_json(ref_content))
+        trajs["A-clean-stateless"]["worker_a_shared_source_ref"] = ref
+        with tempfile.TemporaryDirectory() as tmp:
+            result = evidence.build_pilot_evidence(
+                Path(tmp), "pilot-test", shared, trajs,
+            )
+            self.assertFalse(result.packet_valid)
+
+    def test_mismatched_checkpoint_receipt_id_fails(self):
+        shared, trajs = _make_synthetic_pilot_data()
+        ref = dict(trajs["A-clean-stateless"]["worker_a_shared_source_ref"])
+        ref["checkpoint_receipt_id"] = "wrong-checkpoint-id"
+        ref_content = {k: v for k, v in ref.items() if k != "reference_hash"}
+        ref["reference_hash"] = g1_hashing.compute_sha256(serialization.canonical_json(ref_content))
+        trajs["A-clean-stateless"]["worker_a_shared_source_ref"] = ref
+        with tempfile.TemporaryDirectory() as tmp:
+            result = evidence.build_pilot_evidence(
+                Path(tmp), "pilot-test", shared, trajs,
+            )
+            self.assertFalse(result.packet_valid)
+
+    def test_mismatched_condition_fails(self):
+        shared, trajs = _make_synthetic_pilot_data()
+        ref = dict(trajs["A-clean-stateless"]["worker_a_shared_source_ref"])
+        ref["condition"] = "drift"
+        ref_content = {k: v for k, v in ref.items() if k != "reference_hash"}
+        ref["reference_hash"] = g1_hashing.compute_sha256(serialization.canonical_json(ref_content))
+        trajs["A-clean-stateless"]["worker_a_shared_source_ref"] = ref
+        with tempfile.TemporaryDirectory() as tmp:
+            result = evidence.build_pilot_evidence(
+                Path(tmp), "pilot-test", shared, trajs,
+            )
+            self.assertFalse(result.packet_valid)
+
+    def test_mismatched_shared_source_id_fails(self):
+        shared, trajs = _make_synthetic_pilot_data()
+        ref = dict(trajs["A-clean-stateless"]["worker_a_shared_source_ref"])
+        ref["shared_source_id"] = "wrong-shared-source"
+        ref_content = {k: v for k, v in ref.items() if k != "reference_hash"}
+        ref["reference_hash"] = g1_hashing.compute_sha256(serialization.canonical_json(ref_content))
+        trajs["A-clean-stateless"]["worker_a_shared_source_ref"] = ref
+        with tempfile.TemporaryDirectory() as tmp:
+            result = evidence.build_pilot_evidence(
+                Path(tmp), "pilot-test", shared, trajs,
+            )
+            self.assertFalse(result.packet_valid)
+
+    def test_preflight_rejects_existing_files(self):
+        shared, trajs = _make_synthetic_pilot_data()
+        with tempfile.TemporaryDirectory() as tmp:
+            pilot_dir = Path(tmp) / "pilot-test"
+            pilot_dir.mkdir(parents=True, exist_ok=True)
+            (pilot_dir / "pilot_config.json").write_text("{}")
+            result = evidence.build_pilot_evidence(
+                Path(tmp), "pilot-test", shared, trajs,
+            )
+            self.assertFalse(result.packet_valid)
+            self.assertTrue(any("already exists" in e for e in result.errors))
+
+    def test_preflight_rejects_existing_dirs(self):
+        shared, trajs = _make_synthetic_pilot_data()
+        with tempfile.TemporaryDirectory() as tmp:
+            cond_dir = Path(tmp) / "pilot-test" / "shared_sources" / "clean"
+            cond_dir.mkdir(parents=True, exist_ok=True)
+            result = evidence.build_pilot_evidence(
+                Path(tmp), "pilot-test", shared, trajs,
+            )
+            self.assertFalse(result.packet_valid)
+            self.assertTrue(any("already exists" in e for e in result.errors))
+
+    def test_preflight_leaves_destination_unchanged_after_failure(self):
+        shared, trajs = _make_synthetic_pilot_data()
+        with tempfile.TemporaryDirectory() as tmp:
+            pilot_dir = Path(tmp) / "pilot-test"
+            pilot_dir.mkdir(parents=True, exist_ok=True)
+            (pilot_dir / "pilot_config.json").write_text("original")
+            result = evidence.build_pilot_evidence(
+                Path(tmp), "pilot-test", shared, trajs,
+            )
+            self.assertFalse(result.packet_valid)
+            self.assertTrue((pilot_dir / "pilot_config.json").exists())
+            self.assertEqual(
+                (pilot_dir / "pilot_config.json").read_text(),
+                "original"
+            )
+
+    def test_sibling_path_sharing_prefix_rejected(self):
+        shared, trajs = _make_synthetic_pilot_data()
+        with tempfile.TemporaryDirectory() as tmp:
+            run_root = Path(tmp)
+            sibling = run_root.parent / f"{run_root.name}-sibling"
+            sibling.mkdir(exist_ok=True)
+            try:
+                result = evidence.build_pilot_evidence(
+                    run_root, "../sibling", shared, trajs,
+                )
+                self.assertFalse(result.packet_valid)
+            finally:
+                sibling.rmdir()
 
 
 # ── 8. Network-denial tests ───────────────────────────────────────────
@@ -1067,7 +1206,6 @@ class TestNetworkDenial(unittest.TestCase):
                     self.fail(f"{py_file.name} imports {mod}")
 
     def test_active_network_denial(self):
-        """Patch socket and exercise all G1-B modules."""
         _original_create = socket.create_connection
         _original_connect = socket.socket.connect
         calls = []
@@ -1080,51 +1218,31 @@ class TestNetworkDenial(unittest.TestCase):
         socket.socket.connect = _deny
 
         try:
-            # Ceiling division
             self.assertEqual(accounting.ceiling_div(100, 1_000_000), 1)
 
-            # Cost calculation
             result = accounting.calculate_call_cost(
                 500, 100, 150, PRICES_INCLUDED, True,
             )
             self.assertTrue(result.call_accounting_valid)
 
-            # Shared allocation
             alloc = accounting.allocate_shared_cost("src", 60)
             self.assertTrue(alloc.allocation_valid)
 
-            # Physical accounting
             calls_list = [_make_call("a", 500, 100, 150)]
             phys = accounting.compute_physical_accounting(calls_list)
             self.assertTrue(phys.deduplication_valid)
 
-            # Logical trajectory
             ta = accounting.compute_logical_trajectory_accounting(
                 "tid", ["a", "b", "c"], {"a": 100, "b": 200, "c": 150}, 50,
             )
             self.assertTrue(ta.trajectory_accounting_valid)
 
-            # Invariants
             inv = accounting.compute_accounting_invariants(
                 phys, [ta], [alloc],
             )
             self.assertIsNotNone(inv)
 
-            # Evidence packet
-            shared = {"clean": _make_synthetic_receipt("s1", "s1")}
-            trajs = {"A-clean-stateless": {
-                "worker_B_receipt": _make_synthetic_receipt("b1", "b1", worker_label="B"),
-                "worker_C_receipt": _make_synthetic_receipt("c1", "c1", worker_label="C"),
-                "worker_D_receipt": _make_synthetic_receipt("d1", "d1", worker_label="D"),
-                "worker_a_shared_source_ref": {
-                    "shared_source_id": "s1",
-                    "provider_invocation_id": "s1",
-                    "provider_receipt_id": "s1",
-                    "checkpoint_receipt_id": "chk-001",
-                    "condition": "clean",
-                    "reference_hash": "a" * 64,
-                },
-            }}
+            shared, trajs = _make_synthetic_pilot_data()
             with tempfile.TemporaryDirectory() as tmp:
                 ep = evidence.build_pilot_evidence(
                     Path(tmp), "pilot-test", shared, trajs,
@@ -1147,58 +1265,23 @@ class TestAccountingEdgeCases(unittest.TestCase):
     """Additional edge cases for accounting."""
 
     def test_all_price_categories_exercised(self):
-        """Exercise every price category."""
         for cat in ("uncached_input", "cached_input", "output"):
             self.assertIn(cat, PRICES_INCLUDED)
 
     def test_both_cached_mappings(self):
-        """Test both cached-included and cached-excluded mappings."""
         included = _make_call("inc", 500, 100, 150, cached_included=True)
         excluded = _make_call("exc", 500, 100, 150, cached_included=False)
         self.assertEqual(included.uncached_input_tokens, 400)
         self.assertEqual(excluded.uncached_input_tokens, 500)
 
     def test_hash_failure_detection(self):
-        """Evidence packet must detect hash mismatches."""
-        shared, trajs = self._make_synthetic_pilot_data()
-        # Corrupt a reference hash
+        shared, trajs = _make_synthetic_pilot_data()
         trajs["A-clean-stateless"]["worker_a_shared_source_ref"]["reference_hash"] = "x" * 64
         with tempfile.TemporaryDirectory() as tmp:
             result = evidence.build_pilot_evidence(
                 Path(tmp), "pilot-test", shared, trajs,
             )
             self.assertFalse(result.packet_valid)
-
-    def _make_synthetic_pilot_data(self):
-        shared = {
-            "clean": _make_synthetic_receipt("s-clean", "s-clean"),
-            "drift": _make_synthetic_receipt("s-drift", "s-drift"),
-        }
-        trajs = {}
-        for arch in ("stateless", "summary", "verified_state"):
-            for cond in ("clean", "drift"):
-                tid = f"A-{cond}-{arch}"
-                trajs[tid] = {
-                    f"worker_{w}_receipt": _make_synthetic_receipt(
-                        f"r-{arch}-{cond}-{w}",
-                        f"{arch}-{cond}-{w}",
-                        worker_label=w,
-                    )
-                    for w in ("B", "C", "D")
-                }
-                ref_content = {
-                    "shared_source_id": f"s-{cond}",
-                    "provider_invocation_id": f"s-{cond}",
-                    "provider_receipt_id": f"s-{cond}",
-                    "checkpoint_receipt_id": f"chk-{cond}",
-                    "condition": cond,
-                }
-                ref_hash = g1_hashing.compute_sha256(
-                    serialization.canonical_json(ref_content)
-                )
-                ref_content["reference_hash"] = ref_hash
-                trajs[tid]["worker_a_shared_source_ref"] = ref_content
-        return shared, trajs
 
 
 if __name__ == "__main__":
