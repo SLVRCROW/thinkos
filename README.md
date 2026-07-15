@@ -224,11 +224,17 @@ pip install pytest
 # Run tests
 python -m pytest tests/ -v --tb=short
 
+# Run benchmark tests
+python -m pytest benchmarks/context_efficiency_v0/tests/ -q
+
 # Compile check
-python -m compileall -q thinkos/
+python -m compileall -q thinkos/ benchmarks/context_efficiency_v0/
+
+# Run the G0 benchmark dry-run (no network or model calls)
+python -m benchmarks.context_efficiency_v0
 ```
 
-**CI:** GitHub Actions runs tests and compile checks on every push to `main` and every pull request. The latest run is passing.
+**CI:** GitHub Actions runs product tests, benchmark tests, and compile checks on every push to `main` and every pull request. See [`benchmarks/context_efficiency_v0/README.md`](benchmarks/context_efficiency_v0/README.md) for the benchmark specification.
 
 ## Status
 
@@ -255,12 +261,14 @@ python -m compileall -q thinkos/
 - **Trusted Agent Authentication (TAA) v0** — Process-bound trusted handoff boundary for bounded local same-store multi-agent handoff. One process gets one immutable identity bundle at startup. Evidence transfers; authority does not. See [`docs/SUCCESSION_DOGFOOD.md`](docs/SUCCESSION_DOGFOOD.md) for the cold two-process handoff proof.
 - **ConfirmGate** — Interactive write approval gate with automatic read passes.
 - **HandoffRecord** with `expires_at`, `evidence_policy: "evidence_only"`, and `authority_transfer: "none"`.
+- **G0 Context-Efficiency Benchmark** — Deterministic measurement chassis for context-efficiency evaluation across architecture regimes. Standard-library-only. No model, API, or network calls. See [`benchmarks/context_efficiency_v0/README.md`](benchmarks/context_efficiency_v0/README.md).
 
 **Planned:**
 - Additional tool types
 - Additional gate types
 - PyPI publication
 - Public release
+- **G1 (model-backed evaluation)** — Not implemented. Parked pending separately verified contract and authorization. No provider selected. No model-backed pilot has run.
 
 **Explicit non-claims (TAA-v0 does not provide):**
 - Cryptographic attestation
@@ -269,6 +277,17 @@ python -m compileall -q thinkos/
 - Compromised-harness resistance
 - Production release
 - Turnkey public installation
+
+**Explicit non-claims (G0 benchmark does not provide):**
+- G0 does not select a winning architecture.
+- G0 does not call any model, provider, API, or network endpoint.
+- G0 does not measure real model performance — it validates the measurement chassis.
+- G0 does not implement G1. G1 (model-backed evaluation) is not implemented and remains parked.
+
+### Verified Milestones
+
+- **Succession Dogfood v0** — Cold two-process handoff proof via TAA-v0. 9 tests pass. Evidence transfers; authority does not. See [`docs/SUCCESSION_DOGFOOD.md`](docs/SUCCESSION_DOGFOOD.md).
+- **G0 Context-Efficiency Benchmark** — Deterministic chassis. 14/14 gates pass. 70 benchmark tests + 6 subtests pass. Zero product-source changes. Standard-library-only. See [`benchmarks/context_efficiency_v0/README.md`](benchmarks/context_efficiency_v0/README.md).
 
 **Known limitations:**
 - The `confirm` gate's interactive prompt is incompatible with pipe/JSON-Lines mode. Use `always_allow` override for automated workflows.
