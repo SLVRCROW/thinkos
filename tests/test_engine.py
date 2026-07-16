@@ -1606,81 +1606,87 @@ class TestRealTwoProcessPersistence:
         import subprocess
         import sys
 
-        db_path = os.path.join(tempfile.mkdtemp(), "test_tp.sqlite")
-        config_path = os.path.join(os.path.dirname(db_path), "thinkos.json")
-        config = {
-            "gates": {"default": "always_allow",
-                      "overrides": {"read_file": "always_allow", "write_file": "always_allow"}},
-            "store": {"path": db_path},
-            "tools": {"allowed_root": None},
-        }
-        with open(config_path, "w") as f:
-            json.dump(config, f)
+        tmpdir = tempfile.mkdtemp()
+        try:
+            db_path = os.path.join(tmpdir, "test_tp.sqlite")
+            config_path = os.path.join(tmpdir, "thinkos.json")
+            config = {
+                "gates": {"default": "always_allow",
+                          "overrides": {"read_file": "always_allow", "write_file": "always_allow"}},
+                "store": {"path": db_path},
+                "tools": {"allowed_root": None},
+            }
+            with open(config_path, "w") as f:
+                json.dump(config, f)
 
-        # Process 1: write a file
-        msg1 = {
-            "type": "agent_message", "message_id": "msg_p1",
-            "session_id": "sess_tp", "timestamp": "2026-07-16T00:00:00Z",
-            "sender": "agent1",
-            "content": {"text": "write", "tool_calls": [
-                {"tool": "write_file", "params": {"path": "/tmp/tp_a.txt", "content": "alpha"},
-                 "call_id": "c1"}
-            ], "context_refs": []},
-        }
-        input_bytes = (json.dumps(msg1, separators=(",", ":")) + "\n").encode()
-        env = os.environ.copy()
-        env["PYTHONDONTWRITEBYTECODE"] = "1"
-        proc1 = subprocess.run(
-            [sys.executable, "-m", "thinkos"],
-            input=input_bytes, capture_output=True, timeout=15,
-            cwd=os.path.dirname(config_path), env=env,
-        )
-        assert proc1.returncode == 0, f"Process 1 failed: {proc1.stderr.decode()}"
-        resp1 = json.loads(proc1.stdout.decode().strip())
-        assert resp1["content"]["tool_results"][0]["status"] == "ok"
+            # Output files go inside tmpdir so cleanup is guaranteed
+            out_a = os.path.join(tmpdir, "tp_a.txt")
+            out_b = os.path.join(tmpdir, "tp_b.txt")
 
-        # Process 2: rehydrate + write
-        msg2 = {
-            "type": "agent_message", "message_id": "msg_p2",
-            "session_id": "sess_tp", "timestamp": "2026-07-16T00:01:00Z",
-            "sender": "agent2",
-            "content": {"text": "resume", "rehydrate": True, "tool_calls": [
-                {"tool": "write_file", "params": {"path": "/tmp/tp_b.txt", "content": "beta"},
-                 "call_id": "c2"}
-            ], "context_refs": []},
-        }
-        input_bytes = (json.dumps(msg2, separators=(",", ":")) + "\n").encode()
-        proc2 = subprocess.run(
-            [sys.executable, "-m", "thinkos"],
-            input=input_bytes, capture_output=True, timeout=15,
-            cwd=os.path.dirname(config_path), env=env,
-        )
-        assert proc2.returncode == 0, f"Process 2 failed: {proc2.stderr.decode()}"
-        resp2 = json.loads(proc2.stdout.decode().strip())
+            # Process 1: write a file
+            msg1 = {
+                "type": "agent_message", "message_id": "msg_p1",
+                "session_id": "sess_tp", "timestamp": "2026-07-16T00:00:00Z",
+                "sender": "agent1",
+                "content": {"text": "write", "tool_calls": [
+                    {"tool": "write_file", "params": {"path": out_a, "content": "alpha"},
+                     "call_id": "c1"}
+                ], "context_refs": []},
+            }
+            input_bytes = (json.dumps(msg1, separators=(",", ":")) + "\n").encode()
+            env = os.environ.copy()
+            env["PYTHONDONTWRITEBYTECODE"] = "1"
+            # PYTHONPATH = repository root (two levels up from tests/test_engine.py)
+            env["PYTHONPATH"] = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+            proc1 = subprocess.run(
+                [sys.executable, "-m", "thinkos"],
+                input=input_bytes, capture_output=True, timeout=15,
+                cwd=tmpdir, env=env,
+            )
+            assert proc1.returncode == 0, f"Process 1 failed: {proc1.stderr.decode()}"
+            resp1 = json.loads(proc1.stdout.decode().strip())
+            assert resp1["content"]["tool_results"][0]["status"] == "ok"
 
-        # Assert rehydration recovered the prior packet
-        rehydrated = resp2["content"].get("rehydrated", {})
-        assert rehydrated.get("packet_count", 0) >= 1, "No packets recovered"
-        assert rehydrated.get("receipt_count", 0) >= 1, "No receipts recovered"
+            # Process 2: rehydrate + write
+            msg2 = {
+                "type": "agent_message", "message_id": "msg_p2",
+                "session_id": "sess_tp", "timestamp": "2026-07-16T00:01:00Z",
+                "sender": "agent2",
+                "content": {"text": "resume", "rehydrate": True, "tool_calls": [
+                    {"tool": "write_file", "params": {"path": out_b, "content": "beta"},
+                     "call_id": "c2"}
+                ], "context_refs": []},
+            }
+            input_bytes = (json.dumps(msg2, separators=(",", ":")) + "\n").encode()
+            proc2 = subprocess.run(
+                [sys.executable, "-m", "thinkos"],
+                input=input_bytes, capture_output=True, timeout=15,
+                cwd=tmpdir, env=env,
+            )
+            assert proc2.returncode == 0, f"Process 2 failed: {proc2.stderr.decode()}"
+            resp2 = json.loads(proc2.stdout.decode().strip())
 
-        # Assert the successor action produced a packet
-        pids = resp2["content"]["context_packets"]
-        assert len(pids) == 1, "Successor should produce one packet"
+            # Assert rehydration recovered the prior packet
+            rehydrated = resp2["content"].get("rehydrated", {})
+            assert rehydrated.get("packet_count", 0) >= 1, "No packets recovered"
+            assert rehydrated.get("receipt_count", 0) >= 1, "No receipts recovered"
 
-        # Assert lineage: successor packet links to recovered packet
-        # We need to read from the store directly to verify parent_id
-        store = SQLiteStore(db_path)
-        p = store.read_packet(pids[0])
-        assert p is not None
-        assert p.parent_id is not None, "Successor packet should have a parent"
-        parent = store.read_packet(p.parent_id)
-        assert parent is not None
-        assert parent.content.get("structured", {}).get("params", {}).get("content") == "alpha"
-        store._conn.close()
+            # Assert the successor action produced a packet
+            pids = resp2["content"]["context_packets"]
+            assert len(pids) == 1, "Successor should produce one packet"
 
-        # Cleanup
-        import shutil
-        shutil.rmtree(os.path.dirname(db_path), ignore_errors=True)
+            # Assert lineage: successor packet links to recovered packet
+            store = SQLiteStore(db_path)
+            p = store.read_packet(pids[0])
+            assert p is not None
+            assert p.parent_id is not None, "Successor packet should have a parent"
+            parent = store.read_packet(p.parent_id)
+            assert parent is not None
+            assert parent.content.get("structured", {}).get("params", {}).get("content") == "alpha"
+            store._conn.close()
+        finally:
+            import shutil
+            shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 # ── Post-receipt-insert rollback ─────────────────────────────────────
@@ -1778,13 +1784,15 @@ class TestNonTTYConfirmGate:
             input_bytes = (json.dumps(msg, separators=(",", ":")) + "\n").encode()
             env = os.environ.copy()
             env["PYTHONDONTWRITEBYTECODE"] = "1"
-            # Make /dev/tty unavailable by running in a sandboxed environment
-            # We use a subprocess with /dev/tty pointing to a broken pipe
+            # PYTHONPATH = repository root (two levels up from tests/test_engine.py)
+            env["PYTHONPATH"] = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+            # start_new_session=True detaches the subprocess from the parent's
+            # controlling terminal, making /dev/tty deterministically unavailable.
             proc = subprocess.run(
                 [sys.executable, "-m", "thinkos"],
                 input=input_bytes, capture_output=True, timeout=15,
                 cwd=tmpdir, env=env,
-                # No stdin pipe for TTY — /dev/tty will fail to open
+                start_new_session=True,
             )
             assert proc.returncode == 0, f"Process failed: {proc.stderr.decode()}"
             resp = json.loads(proc.stdout.decode().strip())
