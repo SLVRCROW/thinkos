@@ -146,7 +146,7 @@ class TestIntegration:
         """Path traversal should be rejected by tools."""
         from thinkos.tools.read_file import ReadFileAdapter
         adapter = ReadFileAdapter()
-        result = adapter.execute({"path": "../../etc/passwd", "call_id": "call_001"}, {"allowed_root": None})
+        result = adapter.execute({"path": "../../etc/passwd", "call_id": "call_001"}, {"allowed_root": "/tmp"})
         assert result["status"] == "error"
 
 

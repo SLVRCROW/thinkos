@@ -6,7 +6,6 @@ initialize ThinkOS for a project and verify that the installation is healthy.
 
 import json
 import os
-import shutil
 import sqlite3
 import sys
 import tempfile
@@ -32,7 +31,7 @@ DEFAULT_CONFIG = {
         "allowed_root": None,  # resolved at init time to the project root
     },
     "store": {
-        "path": STORE_FILENAME,
+        "path": ".thinkos/thinkos.sqlite",
     },
     "limits": {
         "max_line_bytes": 1048576,
@@ -106,17 +105,37 @@ def _load_config_file(config_path: str) -> dict | None:
         return None
 
 
-def _configs_equal(a: dict, b: dict) -> bool:
-    """Deep equality check for config dicts, ignoring allowed_root resolution."""
+def _canonicalize_path(p: str) -> str:
+    """Resolve a path to its canonical real form, following symlinks."""
+    return str(Path(p).resolve())
+
+
+def _configs_equal(a: dict, b: dict, expected_allowed_root: str | None = None) -> bool:
+    """Deep equality check for config dicts.
+
+    When expected_allowed_root is provided, allowed_root must match it
+    exactly (after canonicalization). A null allowed_root is always
+    considered different from a non-null expected_allowed_root.
+    """
     a_clean = {k: v for k, v in a.items() if k != "tools"}
     b_clean = {k: v for k, v in b.items() if k != "tools"}
     if a_clean != b_clean:
         return False
-    # Compare tools key carefully — allowed_root may differ by resolution
+    # Compare tools key carefully
     a_tools = a.get("tools", {})
     b_tools = b.get("tools", {})
     for k in set(a_tools) | set(b_tools):
         if k == "allowed_root":
+            if expected_allowed_root is not None:
+                a_root = a_tools.get("allowed_root")
+                b_root = b_tools.get("allowed_root")
+                # A null allowed_root never matches a non-null expected root
+                if a_root is None or b_root is None:
+                    return False
+                if _canonicalize_path(a_root) != _canonicalize_path(expected_allowed_root):
+                    return False
+                if _canonicalize_path(b_root) != _canonicalize_path(expected_allowed_root):
+                    return False
             continue
         if a_tools.get(k) != b_tools.get(k):
             return False
@@ -206,7 +225,7 @@ def init(
         existing_config = _load_config_file(cfg_path)
         if existing_config is not None:
             expected = _build_init_config(resolved)
-            if _configs_equal(existing_config, expected):
+            if _configs_equal(existing_config, expected, expected_allowed_root=resolved):
                 return _init_result(
                     True,
                     f"ThinkOS is already initialised for '{resolved}'.",
@@ -242,7 +261,6 @@ def init(
         )
 
     # ── Path-escape check ─────────────────────────────────────────────
-    # Ensure the resolved path doesn't escape via symlinks in parent chain
     try:
         resolved_real = Path(resolved).resolve()
     except (OSError, RuntimeError):
@@ -266,7 +284,6 @@ def init(
     try:
         _atomic_write_json(cfg_path, config)
     except OSError as e:
-        # Clean up partial .thinkos/ if it was just created
         _cleanup_failed_init(thinkos_dir_path, cfg_path, gitignore_path, store_db_path)
         return _init_result(
             False,
@@ -319,22 +336,29 @@ def _init_result(
     json_output: bool,
     already_initialized: bool = False,
 ) -> dict:
-    """Format the init result."""
-    result = {
-        "status": "already_initialized" if already_initialized else ("ok" if success else "error"),
-        "message": message,
-    }
-    if json_output:
-        if already_initialized:
-            print(json.dumps({"status": "already_initialized", "message": message}))
-        elif success:
-            print(json.dumps({"status": "ok", "message": message}))
-        else:
-            print(json.dumps({"status": "error", "message": message}))
+    """Format the init result.
+
+    already_initialized → exit 0.
+    error → exit 1 (both human and JSON modes).
+    """
+    if already_initialized:
+        status = "already_initialized"
+    elif success:
+        status = "ok"
     else:
-        prefix = "✓" if success else "✗"
+        status = "error"
+
+    result = {"status": status, "message": message}
+
+    if json_output:
+        print(json.dumps(result))
+    else:
         if already_initialized:
             prefix = "✓"
+        elif success:
+            prefix = "✓"
+        else:
+            prefix = "✗"
         print(f"{prefix} {message}")
 
     return result
@@ -356,7 +380,6 @@ def _cleanup_failed_init(
             pass
     try:
         if os.path.isdir(thinkos_dir_path):
-            # Only remove if empty (should be, but be safe)
             if not os.listdir(thinkos_dir_path):
                 os.rmdir(thinkos_dir_path)
     except OSError:
@@ -364,6 +387,16 @@ def _cleanup_failed_init(
 
 
 # ── Doctor ──────────────────────────────────────────────────────────────────
+
+
+def _resolve_actual_store_path(config: dict, project_root: str) -> str | None:
+    """Resolve the actual store path from a loaded config, relative to project root."""
+    store_path_val = config.get("store", {}).get("path")
+    if store_path_val is None:
+        return None
+    if os.path.isabs(store_path_val):
+        return store_path_val
+    return os.path.join(project_root, store_path_val)
 
 
 def doctor(
@@ -378,7 +411,6 @@ def doctor(
     resolved = _resolve_project_path(project_path)
     thinkos_dir_path = _thinkos_dir(resolved)
     cfg_path = _config_path(resolved)
-    store_db_path = _store_path(resolved)
 
     findings: list[dict] = []
     all_healthy = True
@@ -410,7 +442,7 @@ def doctor(
         "detail": f"thinkos {tk_version}",
     })
 
-    # ── 3. Config presence and validity ──────────────────────────────
+    # ── 3. Config presence ────────────────────────────────────────────
     if not os.path.isdir(thinkos_dir_path):
         all_healthy = False
         findings.append({
@@ -418,116 +450,164 @@ def doctor(
             "status": "unhealthy",
             "detail": f"'.thinkos/' directory not found at '{resolved}'",
         })
-    elif not os.path.isfile(cfg_path):
+        # Cannot proceed with further checks that depend on config
+        return _doctor_output(findings, all_healthy, resolved, json_output)
+
+    if not os.path.isfile(cfg_path):
         all_healthy = False
         findings.append({
             "check": "config_presence",
             "status": "unhealthy",
             "detail": f"Config file not found at '{cfg_path}'",
         })
-    else:
-        config = _load_config_file(cfg_path)
-        if config is None:
-            all_healthy = False
-            findings.append({
-                "check": "config_validity",
-                "status": "unhealthy",
-                "detail": f"Config at '{cfg_path}' is malformed or unreadable",
-            })
-        else:
-            # Check required keys
-            missing_keys = []
-            for key in ["gates", "store", "tools"]:
-                if key not in config:
-                    missing_keys.append(key)
-            if missing_keys:
-                all_healthy = False
-                findings.append({
-                    "check": "config_validity",
-                    "status": "unhealthy",
-                    "detail": f"Config missing required keys: {', '.join(missing_keys)}",
-                })
-            else:
-                findings.append({
-                    "check": "config_presence",
-                    "status": "ok",
-                    "detail": f"Config found at '{cfg_path}'",
-                })
-                findings.append({
-                    "check": "config_validity",
-                    "status": "ok",
-                    "detail": "Config is valid JSON with required keys",
-                })
+        return _doctor_output(findings, all_healthy, resolved, json_output)
 
-    # ── 4. Sandbox status ────────────────────────────────────────────
-    config = _load_config_file(cfg_path) if os.path.isfile(cfg_path) else None
-    if config is not None:
-        allowed_root = config.get("tools", {}).get("allowed_root")
-        if allowed_root is None:
-            all_healthy = False
-            findings.append({
-                "check": "sandbox",
-                "status": "unhealthy",
-                "detail": "Sandbox is disabled (allowed_root is null). "
-                          "File access is unrestricted.",
-            })
-        else:
-            findings.append({
-                "check": "sandbox",
-                "status": "ok",
-                "detail": f"Sandbox is active (allowed_root: '{allowed_root}')",
-            })
+    findings.append({
+        "check": "config_presence",
+        "status": "ok",
+        "detail": f"Config found at '{cfg_path}'",
+    })
+
+    # ── 4. Config validity (semantic) ─────────────────────────────────
+    config = _load_config_file(cfg_path)
+    if config is None:
+        all_healthy = False
+        findings.append({
+            "check": "config_validity",
+            "status": "unhealthy",
+            "detail": f"Config at '{cfg_path}' is malformed or unreadable",
+        })
+        return _doctor_output(findings, all_healthy, resolved, json_output)
+
+    # Semantic validation
+    semantic_errors: list[str] = []
+
+    # Check gates structure
+    gates = config.get("gates")
+    if not isinstance(gates, dict):
+        semantic_errors.append("'gates' must be a dict")
     else:
+        default_gate = gates.get("default")
+        if default_gate not in ("always_allow", "confirm", "deny_all"):
+            semantic_errors.append(f"gates.default='{default_gate}' is not a recognised gate")
+        overrides = gates.get("overrides", {})
+        if not isinstance(overrides, dict):
+            semantic_errors.append("gates.overrides must be a dict")
+        else:
+            for tool_name, gate_name in overrides.items():
+                if gate_name not in ("always_allow", "confirm", "deny_all"):
+                    semantic_errors.append(f"gate '{gate_name}' (override for tool '{tool_name}') is not recognised")
+
+    # Check store structure
+    store = config.get("store")
+    if not isinstance(store, dict):
+        semantic_errors.append("'store' must be a dict")
+    else:
+        store_path_val = store.get("path")
+        if store_path_val is not None and not isinstance(store_path_val, str):
+            semantic_errors.append(f"store.path must be a string or None, got {type(store_path_val).__name__}")
+
+    # Check tools structure
+    tools = config.get("tools")
+    if not isinstance(tools, dict):
+        semantic_errors.append("'tools' must be a dict")
+
+    if semantic_errors:
+        all_healthy = False
+        findings.append({
+            "check": "config_validity",
+            "status": "unhealthy",
+            "detail": "; ".join(semantic_errors),
+        })
+    else:
+        findings.append({
+            "check": "config_validity",
+            "status": "ok",
+            "detail": "Config is valid with recognised gate names and required structure",
+        })
+
+    # ── 5. Sandbox status ────────────────────────────────────────────
+    allowed_root = config.get("tools", {}).get("allowed_root")
+    if allowed_root is None:
+        all_healthy = False
         findings.append({
             "check": "sandbox",
             "status": "unhealthy",
-            "detail": "Cannot determine sandbox status — config not available",
+            "detail": "Sandbox is disabled (allowed_root is null). "
+                      "File access is unrestricted.",
         })
-
-    # ── 5. Store configuration ───────────────────────────────────────
-    if config is not None:
-        store_path_val = config.get("store", {}).get("path")
-        if store_path_val is None:
+    else:
+        # Validate that allowed_root canonically equals the intended project root
+        try:
+            allowed_canonical = _canonicalize_path(allowed_root)
+            project_canonical = _canonicalize_path(resolved)
+            if allowed_canonical == project_canonical:
+                findings.append({
+                    "check": "sandbox",
+                    "status": "ok",
+                    "detail": f"Sandbox is active (allowed_root: '{allowed_root}')",
+                })
+            else:
+                all_healthy = False
+                findings.append({
+                    "check": "sandbox",
+                    "status": "unhealthy",
+                    "detail": f"Sandbox allowed_root '{allowed_root}' resolves to "
+                              f"'{allowed_canonical}' but project root is "
+                              f"'{project_canonical}'",
+                })
+        except (OSError, RuntimeError):
             all_healthy = False
             findings.append({
-                "check": "store_config",
+                "check": "sandbox",
                 "status": "unhealthy",
-                "detail": "Store is ephemeral (store.path is null). "
-                          "Data will not persist across sessions.",
+                "detail": f"Sandbox allowed_root '{allowed_root}' cannot be resolved",
             })
-        else:
-            findings.append({
-                "check": "store_config",
-                "status": "ok",
-                "detail": f"Store is persistent (path: '{store_path_val}')",
-            })
-    else:
+
+    # ── 6. Store configuration ───────────────────────────────────────
+    store_path_val = config.get("store", {}).get("path")
+    if store_path_val is None:
+        all_healthy = False
         findings.append({
             "check": "store_config",
             "status": "unhealthy",
-            "detail": "Cannot determine store config — config not available",
-        })
-
-    # ── 6. Store directory ───────────────────────────────────────────
-    store_dir = os.path.dirname(store_db_path)
-    if os.path.isdir(store_dir):
-        findings.append({
-            "check": "store_directory",
-            "status": "ok",
-            "detail": f"Store directory exists at '{store_dir}'",
+            "detail": "Store is ephemeral (store.path is null). "
+                      "Data will not persist across sessions.",
         })
     else:
-        all_healthy = False
+        actual_store_path = _resolve_actual_store_path(config, resolved)
         findings.append({
-            "check": "store_directory",
-            "status": "unhealthy",
-            "detail": f"Store directory does not exist at '{store_dir}'",
+            "check": "store_config",
+            "status": "ok",
+            "detail": f"Store is persistent (path: '{store_path_val}', "
+                      f"resolves to: '{actual_store_path}')",
         })
 
-    # ── 7. SQLite integrity (only if DB exists) ─────────────────────
-    if os.path.isfile(store_db_path):
+    # ── 7. Store directory ───────────────────────────────────────────
+    actual_store_path = _resolve_actual_store_path(config, resolved) if config.get("store", {}).get("path") else None
+    if actual_store_path:
+        store_dir = os.path.dirname(actual_store_path)
+        if os.path.isdir(store_dir):
+            findings.append({
+                "check": "store_directory",
+                "status": "ok",
+                "detail": f"Store directory exists at '{store_dir}'",
+            })
+        else:
+            all_healthy = False
+            findings.append({
+                "check": "store_directory",
+                "status": "unhealthy",
+                "detail": f"Store directory does not exist at '{store_dir}'",
+            })
+
+    # ── 8. SQLite integrity (read-only, only if DB exists) ──────────
+    if actual_store_path and os.path.isfile(actual_store_path):
         try:
-            conn = sqlite3.connect(store_db_path)
+            # Open read-only via URI — no journal, no WAL, no mutation
+            abs_path = str(Path(actual_store_path).resolve())
+            db_uri = Path(abs_path).as_uri()
+            conn = sqlite3.connect(db_uri + "?mode=ro", uri=True)
             cursor = conn.execute("PRAGMA integrity_check")
             integrity_result = cursor.fetchone()
             conn.close()
@@ -558,7 +638,16 @@ def doctor(
             "detail": "No existing database to check (will be created on first use)",
         })
 
-    # ── Output ───────────────────────────────────────────────────────
+    return _doctor_output(findings, all_healthy, resolved, json_output)
+
+
+def _doctor_output(
+    findings: list[dict],
+    all_healthy: bool,
+    resolved: str,
+    json_output: bool,
+) -> dict:
+    """Format and print doctor output."""
     if json_output:
         output = {
             "status": "healthy" if all_healthy else "unhealthy",
