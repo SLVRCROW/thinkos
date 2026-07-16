@@ -317,6 +317,91 @@ class SQLiteStore:
         )
         self._conn.commit()
 
+    def write_receipt_and_packet(self, receipt: Receipt, packet: ContextPacket | None):
+        """Atomically persist a receipt and its linked context packet.
+
+        Both are inserted inside a single SQLite transaction.  If *any*
+        step fails the entire transaction is rolled back — no partial pair
+        is ever committed.
+
+        Only DepthError triggers a parent-free retry (after a full rollback
+        of the original attempt).  DuplicateError and CycleError propagate
+        to the caller with no partial pair left in the database.
+
+        When *packet* is None only the receipt is written (no transaction
+        wrapping needed — the caller is writing a standalone receipt).
+        """
+        if packet is None:
+            self.write_receipt(receipt)
+            return
+
+        # --- receipt validation (must pass before we touch the DB) ---
+        if self._conn.execute(
+            "SELECT 1 FROM receipts WHERE receipt_id = ?", (receipt.receipt_id,)
+        ).fetchone():
+            raise DuplicateError(f"receipt_id '{receipt.receipt_id}' already exists")
+
+        # --- packet validation (must pass before we touch the DB) ---
+        if self._conn.execute(
+            "SELECT 1 FROM packets WHERE packet_id = ?", (packet.packet_id,)
+        ).fetchone():
+            raise DuplicateError(f"packet_id '{packet.packet_id}' already exists")
+
+        if self._check_cycle(packet):
+            raise CycleError("Writing this packet would create a cycle")
+
+        depth = self._get_parent_depth(packet.parent_id) if packet.parent_id else 0
+        if depth >= 5:
+            raise DepthError(f"DAG depth exceeds maximum of 5")
+
+        # --- serialise once ---
+        action_params = json.dumps(receipt.action.params) if receipt.action.params else None
+        packet_ids = json.dumps(receipt.result.packet_ids) if receipt.result.packet_ids else None
+        content_structured = json.dumps(packet.content.get("structured")) if packet.content.get("structured") else None
+        p_tags = json.dumps(packet.tags) if packet.tags else None
+        p_refs = json.dumps(packet.refs) if packet.refs else None
+        p_metadata = json.dumps(packet.metadata) if packet.metadata else None
+
+        # --- transaction: insert receipt then packet, roll back on any failure ---
+        try:
+            self._conn.execute("BEGIN IMMEDIATE")
+            self._conn.execute(
+                """INSERT INTO receipts
+                   (receipt_id, schema_version, session_id, sequence, timestamp,
+                    action_type, action_tool, action_params, action_agent,
+                    result_status, result_summary, result_packet_ids, result_error,
+                    gate_name, gate_decision, gate_reason, supersedes)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (receipt.receipt_id, receipt.schema_version, receipt.session_id,
+                 receipt.sequence, receipt.timestamp,
+                 receipt.action.type, receipt.action.tool, action_params,
+                 receipt.action.agent,
+                 receipt.result.status, receipt.result.summary, packet_ids,
+                 receipt.result.error,
+                 receipt.gate.gate_name if receipt.gate else None,
+                 receipt.gate.decision if receipt.gate else None,
+                 receipt.gate.reason if receipt.gate else None,
+                 receipt.supersedes)
+            )
+            self._conn.execute(
+                """INSERT INTO packets
+                   (packet_id, schema_version, session_id, parent_id, timestamp,
+                    kind, source, content_text, content_structured, tags, refs, metadata)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (packet.packet_id, packet.schema_version, packet.session_id,
+                 packet.parent_id, packet.timestamp,
+                 packet.kind, packet.source,
+                 packet.content.get("text", ""), content_structured,
+                 p_tags, p_refs, p_metadata)
+            )
+            self._conn.commit()
+        except (DuplicateError, CycleError, DepthError):
+            self._conn.rollback()
+            raise
+        except Exception:
+            self._conn.rollback()
+            raise
+
     def read_receipt(self, receipt_id: str) -> Receipt | None:
         row = self._conn.execute(
             "SELECT * FROM receipts WHERE receipt_id = ?", (receipt_id,)

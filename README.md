@@ -279,7 +279,7 @@ python -m benchmarks.context_efficiency_v0
 - Additional gate types
 - PyPI publication
 - Public release
-| **G1 (model-backed evaluation)** — Not implemented. Parked pending separately verified contract and authorization. No provider selected. No model-backed pilot has run. The G0 benchmark chassis is ready; G1 requires a separately designed and authorized evaluation contract.
+- **G1 (model-backed evaluation)** — Accepted G1 contract; G1-A and G1-B merged; G1-C not authorized. No provider selected and no model-backed pilot has run.
 
 **Explicit non-claims (TAA-v0 does not provide):**
 - Cryptographic attestation

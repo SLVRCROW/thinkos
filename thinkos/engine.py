@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 from thinkos.schema.context_packet import ContextPacket, validate as validate_packet, serialize as serialize_packet
 from thinkos.schema.receipt import Receipt, Action, Result, GateInfo, validate as validate_receipt, serialize as serialize_receipt
 from thinkos.config import resolve_gate, get_allowed_root
-from thinkos.store.sqlite_store import CycleError, DepthError, DuplicateError
+from thinkos.store.sqlite_store import DepthError
 
 
 def _build_summary(packets: list[ContextPacket], receipts: list[Receipt],
@@ -413,20 +413,23 @@ class Engine:
                         # Link receipt -> packet
                         receipt.result.packet_ids = [packet.packet_id]
 
-                    # Persist pair atomically: write receipt first, then packet.
-                    # If packet write fails (cycle/depth/duplicate), the receipt
-                    # still exists with empty packet_ids — no dangling reference.
-                    self.store.write_receipt(receipt)
+                    # Persist pair atomically via store.write_receipt_and_packet.
+                    # Only DepthError triggers a parent-free retry (after the
+                    # original transaction has fully rolled back).
+                    # DuplicateError and CycleError fail closed — no partial pair.
                     if packet is not None:
                         try:
-                            self.store.write_packet(packet)
-                        except (CycleError, DepthError, DuplicateError):
-                            # Depth limit reached — retry without parent link
+                            self.store.write_receipt_and_packet(receipt, packet)
+                        except DepthError:
+                            # Full rollback already happened inside the store.
+                            # Retry without parent link.
                             packet.parent_id = None
                             packet.refs = [receipt.receipt_id]
-                            self.store.write_packet(packet)
+                            self.store.write_receipt_and_packet(receipt, packet)
                         self._last_packet_id[session_id] = packet.packet_id
                         context_packets.append(packet.packet_id)
+                    else:
+                        self.store.write_receipt(receipt)
 
                     tool_results.append({
                         "tool": tool_name,
