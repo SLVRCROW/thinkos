@@ -2,7 +2,7 @@
 
 import uuid
 import pytest
-from thinkos.store.sqlite_store import SQLiteStore
+from thinkos.store.sqlite_store import SQLiteStore, CycleError, DepthError, DuplicateError
 from thinkos.connector.stdin import StdinConnector
 from thinkos.engine import Engine
 from thinkos.tools import TOOL_REGISTRY, register_tool
@@ -13,6 +13,8 @@ from thinkos.gates.always_allow import AlwaysAllowGate
 from thinkos.gates.confirm import ConfirmGate
 from thinkos.gates.deny_all import DenyAllGate
 from thinkos.config import load_config
+from thinkos.schema.context_packet import ContextPacket
+from thinkos.schema.receipt import Receipt, Action, Result, GateInfo
 
 
 # ── Helpers ─────────────────────────────────────────────────────────
@@ -1239,3 +1241,579 @@ class TestCompaction:
         rehydrated = resp["content"]["rehydrated"]
         assert len(rehydrated["receipts"]) == 3
         assert len(rehydrated["packets"]) == 3
+
+
+# ── Alpha Door P0 repair regression tests ──────────────────────────
+
+
+class TestReceiptPacketAtomicity:
+    """Prove that write_receipt_and_packet is genuinely atomic."""
+
+    def test_successful_reciprocal_linkage(self):
+        """A successful write produces a receipt with packet_ids and a packet with refs."""
+        store = SQLiteStore(":memory:")
+        receipt = Receipt(
+            receipt_id="rct_atomic_001",
+            schema_version=1,
+            session_id="sess_atomic",
+            sequence=1,
+            timestamp="2026-07-16T00:00:00Z",
+            action=Action(type="tool_call", tool="write_file",
+                          params={"path": "/tmp/t.txt", "content": "hello"}, agent="test"),
+            result=Result(status="ok", summary="Wrote 5 bytes", packet_ids=["pkt_atomic_001"]),
+            gate=GateInfo(gate_name="always_allow", decision="allow", reason="test"),
+        )
+        packet = ContextPacket(
+            packet_id="pkt_atomic_001",
+            session_id="sess_atomic",
+            timestamp="2026-07-16T00:00:00Z",
+            kind="tool_result",
+            source="thinkos",
+            content={"text": "Tool 'write_file' completed: Wrote 5 bytes", "structured": None},
+            tags=["write_file"],
+            refs=["rct_atomic_001"],
+        )
+        store.write_receipt_and_packet(receipt, packet)
+
+        # Read back and verify reciprocal linkage
+        r = store.read_receipt("rct_atomic_001")
+        assert r is not None
+        assert r.result.packet_ids == ["pkt_atomic_001"]
+
+        p = store.read_packet("pkt_atomic_001")
+        assert p is not None
+        assert "rct_atomic_001" in p.refs
+
+    def test_duplicate_failure_leaves_no_pair(self):
+        """A duplicate packet_id raises DuplicateError and leaves no receipt or packet."""
+        store = SQLiteStore(":memory:")
+        receipt = Receipt(
+            receipt_id="rct_dup_001",
+            schema_version=1,
+            session_id="sess_dup",
+            sequence=1,
+            timestamp="2026-07-16T00:00:00Z",
+            action=Action(type="tool_call", tool="write_file",
+                          params={"path": "/tmp/t.txt", "content": "hello"}, agent="test"),
+            result=Result(status="ok", summary="Wrote 5 bytes", packet_ids=["pkt_dup_001"]),
+            gate=GateInfo(gate_name="always_allow", decision="allow", reason="test"),
+        )
+        packet = ContextPacket(
+            packet_id="pkt_dup_001",
+            session_id="sess_dup",
+            timestamp="2026-07-16T00:00:00Z",
+            kind="tool_result",
+            source="thinkos",
+            content={"text": "Tool 'write_file' completed", "structured": None},
+            tags=["write_file"],
+            refs=["rct_dup_001"],
+        )
+        # First write succeeds
+        store.write_receipt_and_packet(receipt, packet)
+
+        # Second write with same packet_id must fail
+        receipt2 = Receipt(
+            receipt_id="rct_dup_002",
+            schema_version=1,
+            session_id="sess_dup",
+            sequence=2,
+            timestamp="2026-07-16T00:00:00Z",
+            action=Action(type="tool_call", tool="write_file",
+                          params={"path": "/tmp/t.txt", "content": "hello"}, agent="test"),
+            result=Result(status="ok", summary="Wrote 5 bytes", packet_ids=["pkt_dup_001"]),
+            gate=GateInfo(gate_name="always_allow", decision="allow", reason="test"),
+        )
+        with pytest.raises(DuplicateError):
+            store.write_receipt_and_packet(receipt2, packet)
+
+        # Neither the second receipt nor a duplicate packet should exist
+        assert store.read_receipt("rct_dup_002") is None
+        # The original packet is still intact
+        assert store.read_packet("pkt_dup_001") is not None
+
+    def test_cycle_failure_leaves_no_pair(self):
+        """A cycle in the packet DAG raises CycleError and leaves no receipt or packet."""
+        store = SQLiteStore(":memory:")
+        # Write a root packet
+        root = ContextPacket(
+            packet_id="pkt_cycle_root",
+            session_id="sess_cycle",
+            timestamp="2026-07-16T00:00:00Z",
+            kind="tool_result",
+            source="thinkos",
+            content={"text": "root", "structured": None},
+            tags=["write_file"],
+            refs=[],
+        )
+        store.write_packet(root)
+
+        # Try to write a packet that points to itself (direct cycle)
+        receipt = Receipt(
+            receipt_id="rct_cycle_001",
+            schema_version=1,
+            session_id="sess_cycle",
+            sequence=1,
+            timestamp="2026-07-16T00:00:00Z",
+            action=Action(type="tool_call", tool="write_file",
+                          params={"path": "/tmp/t.txt", "content": "x"}, agent="test"),
+            result=Result(status="ok", summary="Wrote 1 byte", packet_ids=["pkt_cycle_self"]),
+            gate=GateInfo(gate_name="always_allow", decision="allow", reason="test"),
+        )
+        packet = ContextPacket(
+            packet_id="pkt_cycle_self",
+            session_id="sess_cycle",
+            parent_id="pkt_cycle_self",  # points to itself = cycle
+            timestamp="2026-07-16T00:00:00Z",
+            kind="tool_result",
+            source="thinkos",
+            content={"text": "self-cycle", "structured": None},
+            tags=["write_file"],
+            refs=["rct_cycle_001"],
+        )
+        with pytest.raises(CycleError):
+            store.write_receipt_and_packet(receipt, packet)
+
+        # Neither the receipt nor the cycle packet should exist
+        assert store.read_receipt("rct_cycle_001") is None
+        assert store.read_packet("pkt_cycle_self") is None
+
+    def test_depth_failure_retry_leaves_one_pair(self):
+        """DepthError triggers a retry without parent; exactly one receipt+packet pair exists."""
+        store = SQLiteStore(":memory:")
+        # Write 5 packets to reach depth limit
+        for i in range(5):
+            pid = f"pkt_depth_{i}"
+            p = ContextPacket(
+                packet_id=pid,
+                session_id="sess_depth",
+                parent_id=f"pkt_depth_{i - 1}" if i > 0 else None,
+                timestamp="2026-07-16T00:00:00Z",
+                kind="tool_result",
+                source="thinkos",
+                content={"text": f"depth {i}", "structured": None},
+                tags=["write_file"],
+                refs=[],
+            )
+            store.write_packet(p)
+
+        # Now try to write a 6th packet — should trigger DepthError then retry
+        receipt = Receipt(
+            receipt_id="rct_depth_retry",
+            schema_version=1,
+            session_id="sess_depth",
+            sequence=6,
+            timestamp="2026-07-16T00:00:00Z",
+            action=Action(type="tool_call", tool="write_file",
+                          params={"path": "/tmp/t.txt", "content": "x"}, agent="test"),
+            result=Result(status="ok", summary="Wrote 1 byte", packet_ids=["pkt_depth_retry"]),
+            gate=GateInfo(gate_name="always_allow", decision="allow", reason="test"),
+        )
+        packet = ContextPacket(
+            packet_id="pkt_depth_retry",
+            session_id="sess_depth",
+            parent_id="pkt_depth_4",
+            timestamp="2026-07-16T00:00:00Z",
+            kind="tool_result",
+            source="thinkos",
+            content={"text": "depth retry", "structured": None},
+            tags=["write_file"],
+            refs=["rct_depth_retry"],
+        )
+
+        # Simulate the engine's retry logic
+        try:
+            store.write_receipt_and_packet(receipt, packet)
+        except DepthError:
+            packet.parent_id = None
+            packet.refs = ["rct_depth_retry"]
+            store.write_receipt_and_packet(receipt, packet)
+
+        # Exactly one receipt and one packet should exist
+        r = store.read_receipt("rct_depth_retry")
+        assert r is not None
+        assert r.result.packet_ids == ["pkt_depth_retry"]
+        p = store.read_packet("pkt_depth_retry")
+        assert p is not None
+        assert p.parent_id is None  # retry wrote without parent
+        assert "rct_depth_retry" in p.refs
+
+
+class TestSuccessorRehydration:
+    """Prove that a fresh process recovers prior state and continues lineage."""
+
+    def test_fresh_process_rehydrates_packets(self):
+        """A second engine instance with the same store recovers prior packets."""
+        store = SQLiteStore(":memory:")
+        connector1 = _TestConnector([
+            _make_msg([_make_tc("write_file", params={"path": "/tmp/a.txt", "content": "alpha"})])
+        ])
+        _run_engine_raw(store, connector1,
+                        config_overrides={"gates": {"default": "always_allow"},
+                                          "tools": {"allowed_root": None}})
+
+        # Fresh connector, same store — rehydrate
+        connector2 = _TestConnector([
+            {**_make_msg([], msg_id="msg_rehydrate"), "content": {"text": "resume", "rehydrate": True, "tool_calls": [], "context_refs": []}}
+        ])
+        _run_engine_raw(store, connector2,
+                        config_overrides={"gates": {"default": "always_allow"},
+                                          "tools": {"allowed_root": None}})
+
+        resp = connector2.responses[0]
+        rehydrated = resp["content"].get("rehydrated", {})
+        assert rehydrated.get("packet_count", 0) >= 1
+        assert rehydrated.get("receipt_count", 0) >= 1
+
+    def test_successor_continues_lineage(self):
+        """A successor action after rehydration links to the recovered packet."""
+        store = SQLiteStore(":memory:")
+        connector1 = _TestConnector([
+            _make_msg([_make_tc("write_file", params={"path": "/tmp/a.txt", "content": "alpha"})])
+        ])
+        _run_engine_raw(store, connector1,
+                        config_overrides={"gates": {"default": "always_allow"},
+                                          "tools": {"allowed_root": None}})
+
+        # Successor: rehydrate + write in one message
+        connector2 = _TestConnector([
+            {**_make_msg([_make_tc("write_file", params={"path": "/tmp/b.txt", "content": "beta"})],
+                         msg_id="msg_succ"),
+             "content": {"text": "resume", "rehydrate": True,
+                         "tool_calls": [_make_tc("write_file", params={"path": "/tmp/b.txt", "content": "beta"})],
+                         "context_refs": []}}
+        ])
+        _run_engine_raw(store, connector2,
+                        config_overrides={"gates": {"default": "always_allow"},
+                                          "tools": {"allowed_root": None}})
+
+        resp = connector2.responses[0]
+        pids = resp["content"]["context_packets"]
+        assert len(pids) == 1
+        p = store.read_packet(pids[0])
+        assert p is not None
+        # The successor's packet should link to the first packet (lineage restored)
+        assert p.parent_id is not None
+        first_packet = store.read_packet(p.parent_id)
+        assert first_packet is not None
+        # The content is in structured.params.content, not the summary text
+        assert first_packet.content.get("structured", {}).get("params", {}).get("content") == "alpha"
+
+
+class TestDenialExplanation:
+    """Prove that denied actions expose a human-readable reason and do not execute."""
+
+    def test_denial_reason_is_visible(self):
+        """A denied tool call returns the gate's reason in tool_result.output."""
+        store = SQLiteStore(":memory:")
+        connector = _TestConnector([
+            _make_msg([_make_tc("write_file", params={"path": "/tmp/deny.txt", "content": "x"})])
+        ])
+        _run_engine_raw(store, connector,
+                        config_overrides={
+                            "gates": {"default": "deny_all"},
+                            "tools": {"allowed_root": None},
+                        })
+        resp = connector.responses[0]
+        tr = resp["content"]["tool_results"][0]
+        assert tr["status"] == "denied"
+        assert len(tr["output"]) > 0  # human-readable reason
+
+    def test_denied_tool_does_not_execute(self):
+        """A denied write_file does not create the target file."""
+        import tempfile
+        import os
+        store = SQLiteStore(":memory:")
+        tmpdir = tempfile.mkdtemp()
+        try:
+            target = os.path.join(tmpdir, "should_not_exist.txt")
+            connector = _TestConnector([
+                _make_msg([_make_tc("write_file", params={"path": target, "content": "x"})])
+            ])
+            _run_engine_raw(store, connector,
+                            config_overrides={
+                                "gates": {"default": "deny_all"},
+                                "tools": {"allowed_root": None},
+                            })
+            assert not os.path.exists(target)
+        finally:
+            import shutil
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+class TestCLIAffordances:
+    """Prove that --help and --version produce output without engine init."""
+
+    def test_help_does_not_initialize_engine(self):
+        """thinkos --help prints usage and exits without starting the engine."""
+        import subprocess
+        import sys
+        result = subprocess.run(
+            [sys.executable, "-m", "thinkos", "--help"],
+            capture_output=True, text=True, timeout=10,
+        )
+        assert result.returncode == 0
+        assert "ThinkOS" in result.stdout
+        assert "Usage" in result.stdout
+
+    def test_version_does_not_initialize_engine(self):
+        """thinkos --version prints version and exits without starting the engine."""
+        import subprocess
+        import sys
+        result = subprocess.run(
+            [sys.executable, "-m", "thinkos", "--version"],
+            capture_output=True, text=True, timeout=10,
+        )
+        assert result.returncode == 0
+        assert "thinkos" in result.stdout
+        assert "." in result.stdout
+
+
+# ── Helpers for the new test classes ────────────────────────────────
+
+
+def _run_engine_raw(store, connector, config_overrides=None):
+    """Run the engine with a pre-created store and connector."""
+    from thinkos.config import load_config
+    tool_registry = {
+        "read_file": ReadFileAdapter(),
+        "write_file": WriteFileAdapter(),
+    }
+    gate_registry = {
+        "always_allow": AlwaysAllowGate(),
+        "confirm": ConfirmGate(),
+        "deny_all": DenyAllGate(),
+    }
+    config = load_config("/nonexistent/path.json")
+    if config_overrides:
+        config.update(config_overrides)
+    eng = Engine(store, connector, tool_registry, gate_registry, config)
+    eng.run()
+    return store, connector
+
+
+# ── Real two-process persistence ────────────────────────────────────
+
+
+class TestRealTwoProcessPersistence:
+    """Prove that a real file-backed store survives process boundaries."""
+
+    def test_two_process_rehydration_and_lineage(self):
+        """Process 1 writes, exits. Process 2 opens same store, rehydrates,
+        recovers linked packet+receipt, and continues the lineage."""
+        import tempfile
+        import os
+        import json
+        import subprocess
+        import sys
+
+        tmpdir = tempfile.mkdtemp()
+        try:
+            db_path = os.path.join(tmpdir, "test_tp.sqlite")
+            config_path = os.path.join(tmpdir, "thinkos.json")
+            config = {
+                "gates": {"default": "always_allow",
+                          "overrides": {"read_file": "always_allow", "write_file": "always_allow"}},
+                "store": {"path": db_path},
+                "tools": {"allowed_root": None},
+            }
+            with open(config_path, "w") as f:
+                json.dump(config, f)
+
+            # Output files go inside tmpdir so cleanup is guaranteed
+            out_a = os.path.join(tmpdir, "tp_a.txt")
+            out_b = os.path.join(tmpdir, "tp_b.txt")
+
+            # Process 1: write a file
+            msg1 = {
+                "type": "agent_message", "message_id": "msg_p1",
+                "session_id": "sess_tp", "timestamp": "2026-07-16T00:00:00Z",
+                "sender": "agent1",
+                "content": {"text": "write", "tool_calls": [
+                    {"tool": "write_file", "params": {"path": out_a, "content": "alpha"},
+                     "call_id": "c1"}
+                ], "context_refs": []},
+            }
+            input_bytes = (json.dumps(msg1, separators=(",", ":")) + "\n").encode()
+            env = os.environ.copy()
+            env["PYTHONDONTWRITEBYTECODE"] = "1"
+            # PYTHONPATH = repository root (tests/ is one level below root)
+            from pathlib import Path
+            repo_root = Path(__file__).resolve().parents[1]
+            existing = env.get("PYTHONPATH")
+            env["PYTHONPATH"] = (
+                str(repo_root)
+                if not existing
+                else str(repo_root) + os.pathsep + existing
+            )
+            proc1 = subprocess.run(
+                [sys.executable, "-m", "thinkos"],
+                input=input_bytes, capture_output=True, timeout=15,
+                cwd=tmpdir, env=env,
+            )
+            assert proc1.returncode == 0, f"Process 1 failed: {proc1.stderr.decode()}"
+            resp1 = json.loads(proc1.stdout.decode().strip())
+            assert resp1["content"]["tool_results"][0]["status"] == "ok"
+
+            # Process 2: rehydrate + write
+            msg2 = {
+                "type": "agent_message", "message_id": "msg_p2",
+                "session_id": "sess_tp", "timestamp": "2026-07-16T00:01:00Z",
+                "sender": "agent2",
+                "content": {"text": "resume", "rehydrate": True, "tool_calls": [
+                    {"tool": "write_file", "params": {"path": out_b, "content": "beta"},
+                     "call_id": "c2"}
+                ], "context_refs": []},
+            }
+            input_bytes = (json.dumps(msg2, separators=(",", ":")) + "\n").encode()
+            proc2 = subprocess.run(
+                [sys.executable, "-m", "thinkos"],
+                input=input_bytes, capture_output=True, timeout=15,
+                cwd=tmpdir, env=env,
+            )
+            assert proc2.returncode == 0, f"Process 2 failed: {proc2.stderr.decode()}"
+            resp2 = json.loads(proc2.stdout.decode().strip())
+
+            # Assert rehydration recovered the prior packet
+            rehydrated = resp2["content"].get("rehydrated", {})
+            assert rehydrated.get("packet_count", 0) >= 1, "No packets recovered"
+            assert rehydrated.get("receipt_count", 0) >= 1, "No receipts recovered"
+
+            # Assert the successor action produced a packet
+            pids = resp2["content"]["context_packets"]
+            assert len(pids) == 1, "Successor should produce one packet"
+
+            # Assert lineage: successor packet links to recovered packet
+            store = SQLiteStore(db_path)
+            p = store.read_packet(pids[0])
+            assert p is not None
+            assert p.parent_id is not None, "Successor packet should have a parent"
+            parent = store.read_packet(p.parent_id)
+            assert parent is not None
+            assert parent.content.get("structured", {}).get("params", {}).get("content") == "alpha"
+            store._conn.close()
+        finally:
+            import shutil
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+# ── Post-receipt-insert rollback ─────────────────────────────────────
+
+
+class TestPostReceiptRollback:
+    """Prove that a packet-insert failure after receipt INSERT rolls back both."""
+
+    def test_injected_packet_failure_rolls_back_pair(self):
+        """A SQLite trigger that aborts the packet INSERT causes the entire
+        transaction to roll back — neither receipt nor packet remains."""
+        store = SQLiteStore(":memory:")
+
+        # Install a trigger that fires on packet INSERT and aborts
+        store._conn.execute("""
+            CREATE TRIGGER IF NOT EXISTS trg_abort_packet
+            BEFORE INSERT ON packets
+            BEGIN
+                SELECT RAISE(ABORT, 'SIMULATED_PACKET_INSERT_FAILURE');
+            END;
+        """)
+        store._conn.commit()
+
+        receipt = Receipt(
+            receipt_id="rct_rollback_001",
+            schema_version=1,
+            session_id="sess_rb",
+            sequence=1,
+            timestamp="2026-07-16T00:00:00Z",
+            action=Action(type="tool_call", tool="write_file",
+                          params={"path": "/tmp/rb.txt", "content": "x"}, agent="test"),
+            result=Result(status="ok", summary="Wrote 1 byte", packet_ids=["pkt_rollback_001"]),
+            gate=GateInfo(gate_name="always_allow", decision="allow", reason="test"),
+        )
+        packet = ContextPacket(
+            packet_id="pkt_rollback_001",
+            session_id="sess_rb",
+            timestamp="2026-07-16T00:00:00Z",
+            kind="tool_result",
+            source="thinkos",
+            content={"text": "Tool 'write_file' completed", "structured": None},
+            tags=["write_file"],
+            refs=["rct_rollback_001"],
+        )
+
+        with pytest.raises(Exception):
+            store.write_receipt_and_packet(receipt, packet)
+
+        # Neither receipt nor packet should exist
+        assert store.read_receipt("rct_rollback_001") is None
+        assert store.read_packet("pkt_rollback_001") is None
+
+        # Clean up the trigger so it doesn't affect other tests
+        store._conn.execute("DROP TRIGGER IF EXISTS trg_abort_packet")
+        store._conn.commit()
+
+
+# ── Non-TTY ConfirmGate ─────────────────────────────────────────────
+
+
+class TestNonTTYConfirmGate:
+    """Prove that ConfirmGate denies writes when /dev/tty is unavailable."""
+
+    def test_non_tty_denial_reason_and_no_write(self):
+        """When /dev/tty is unavailable, ConfirmGate returns the exact
+        human-readable reason and does not execute the write."""
+        import tempfile
+        import os
+        import json
+        import subprocess
+        import sys
+
+        tmpdir = tempfile.mkdtemp()
+        try:
+            config_path = os.path.join(tmpdir, "thinkos.json")
+            config = {
+                "gates": {"default": "confirm",
+                          "overrides": {"read_file": "always_allow", "write_file": "confirm"}},
+                "store": {"path": ":memory:"},
+                "tools": {"allowed_root": None},
+            }
+            with open(config_path, "w") as f:
+                json.dump(config, f)
+
+            target = os.path.join(tmpdir, "should_not_exist.txt")
+            msg = {
+                "type": "agent_message", "message_id": "msg_deny",
+                "session_id": "sess_deny", "timestamp": "2026-07-16T00:00:00Z",
+                "sender": "test",
+                "content": {"text": "write", "tool_calls": [
+                    {"tool": "write_file", "params": {"path": target, "content": "x"},
+                     "call_id": "c1"}
+                ], "context_refs": []},
+            }
+            input_bytes = (json.dumps(msg, separators=(",", ":")) + "\n").encode()
+            env = os.environ.copy()
+            env["PYTHONDONTWRITEBYTECODE"] = "1"
+            # PYTHONPATH = repository root (tests/ is one level below root)
+            from pathlib import Path
+            repo_root = Path(__file__).resolve().parents[1]
+            existing = env.get("PYTHONPATH")
+            env["PYTHONPATH"] = (
+                str(repo_root)
+                if not existing
+                else str(repo_root) + os.pathsep + existing
+            )
+            # start_new_session=True detaches the subprocess from the parent's
+            # controlling terminal, making /dev/tty deterministically unavailable.
+            proc = subprocess.run(
+                [sys.executable, "-m", "thinkos"],
+                input=input_bytes, capture_output=True, timeout=15,
+                cwd=tmpdir, env=env,
+                start_new_session=True,
+            )
+            assert proc.returncode == 0, f"Process failed: {proc.stderr.decode()}"
+            resp = json.loads(proc.stdout.decode().strip())
+            tr = resp["content"]["tool_results"][0]
+            assert tr["status"] == "denied"
+            assert tr["output"] == "Non-interactive mode: write approval unavailable"
+            assert not os.path.exists(target)
+        finally:
+            import shutil
+            shutil.rmtree(tmpdir, ignore_errors=True)

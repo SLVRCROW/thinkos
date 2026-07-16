@@ -350,14 +350,15 @@ class Engine:
                     gate_decision = gate.evaluate(tool_name, params)
 
                     if gate_decision["action"] == "deny":
+                        reason = gate_decision.get("reason", "Denied by gate")
                         receipt = self._make_receipt(
                             session_id, "tool_call", tool_name, params, sender,
-                            "denied", gate_decision.get("reason", "Denied by gate"), [],
-                            gate_decision.get("reason"), gate.name, "deny", gate_decision.get("reason")
+                            "denied", reason, [],
+                            reason, gate.name, "deny", reason
                         )
                         self.store.write_receipt(receipt)
                         tool_results.append({"tool": tool_name, "call_id": call_id,
-                                             "status": "denied", "output": "", "receipt_id": receipt.receipt_id})
+                                             "status": "denied", "output": reason, "receipt_id": receipt.receipt_id})
                         receipt_ids.append(receipt.receipt_id)
                         continue
 
@@ -379,15 +380,16 @@ class Engine:
                     }
                     result = tool_adapter.execute(params, context)
 
+                    # Build receipt first (with packet_ids placeholder)
                     receipt = self._make_receipt(
                         session_id, "tool_call", tool_name, params, sender,
                         result.get("status", "ok"), result.get("output", "")[:200],
                         [], result.get("error"), gate.name, "allow",
                         gate_decision.get("reason", "Allowed by gate")
                     )
-                    self.store.write_receipt(receipt)
 
                     # Create a context packet for every successful tool result
+                    packet = None
                     if result.get("status") == "ok":
                         last_pid = self._last_packet_id.get(session_id)
                         packet = ContextPacket(
@@ -408,14 +410,26 @@ class Engine:
                             tags=[tool_name],
                             refs=[receipt.receipt_id],
                         )
+                        # Link receipt -> packet
+                        receipt.result.packet_ids = [packet.packet_id]
+
+                    # Persist pair atomically via store.write_receipt_and_packet.
+                    # Only DepthError triggers a parent-free retry (after the
+                    # original transaction has fully rolled back).
+                    # DuplicateError and CycleError fail closed — no partial pair.
+                    if packet is not None:
                         try:
-                            self.store.write_packet(packet)
+                            self.store.write_receipt_and_packet(receipt, packet)
                         except DepthError:
-                            # Depth limit reached — retry without parent link
+                            # Full rollback already happened inside the store.
+                            # Retry without parent link.
                             packet.parent_id = None
-                            self.store.write_packet(packet)
+                            packet.refs = [receipt.receipt_id]
+                            self.store.write_receipt_and_packet(receipt, packet)
                         self._last_packet_id[session_id] = packet.packet_id
                         context_packets.append(packet.packet_id)
+                    else:
+                        self.store.write_receipt(receipt)
 
                     tool_results.append({
                         "tool": tool_name,
