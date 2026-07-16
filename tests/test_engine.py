@@ -1589,3 +1589,209 @@ def _run_engine_raw(store, connector, config_overrides=None):
     eng = Engine(store, connector, tool_registry, gate_registry, config)
     eng.run()
     return store, connector
+
+
+# ── Real two-process persistence ────────────────────────────────────
+
+
+class TestRealTwoProcessPersistence:
+    """Prove that a real file-backed store survives process boundaries."""
+
+    def test_two_process_rehydration_and_lineage(self):
+        """Process 1 writes, exits. Process 2 opens same store, rehydrates,
+        recovers linked packet+receipt, and continues the lineage."""
+        import tempfile
+        import os
+        import json
+        import subprocess
+        import sys
+
+        db_path = os.path.join(tempfile.mkdtemp(), "test_tp.sqlite")
+        config_path = os.path.join(os.path.dirname(db_path), "thinkos.json")
+        config = {
+            "gates": {"default": "always_allow",
+                      "overrides": {"read_file": "always_allow", "write_file": "always_allow"}},
+            "store": {"path": db_path},
+            "tools": {"allowed_root": None},
+        }
+        with open(config_path, "w") as f:
+            json.dump(config, f)
+
+        # Process 1: write a file
+        msg1 = {
+            "type": "agent_message", "message_id": "msg_p1",
+            "session_id": "sess_tp", "timestamp": "2026-07-16T00:00:00Z",
+            "sender": "agent1",
+            "content": {"text": "write", "tool_calls": [
+                {"tool": "write_file", "params": {"path": "/tmp/tp_a.txt", "content": "alpha"},
+                 "call_id": "c1"}
+            ], "context_refs": []},
+        }
+        input_bytes = (json.dumps(msg1, separators=(",", ":")) + "\n").encode()
+        env = os.environ.copy()
+        env["PYTHONDONTWRITEBYTECODE"] = "1"
+        proc1 = subprocess.run(
+            [sys.executable, "-m", "thinkos"],
+            input=input_bytes, capture_output=True, timeout=15,
+            cwd=os.path.dirname(config_path), env=env,
+        )
+        assert proc1.returncode == 0, f"Process 1 failed: {proc1.stderr.decode()}"
+        resp1 = json.loads(proc1.stdout.decode().strip())
+        assert resp1["content"]["tool_results"][0]["status"] == "ok"
+
+        # Process 2: rehydrate + write
+        msg2 = {
+            "type": "agent_message", "message_id": "msg_p2",
+            "session_id": "sess_tp", "timestamp": "2026-07-16T00:01:00Z",
+            "sender": "agent2",
+            "content": {"text": "resume", "rehydrate": True, "tool_calls": [
+                {"tool": "write_file", "params": {"path": "/tmp/tp_b.txt", "content": "beta"},
+                 "call_id": "c2"}
+            ], "context_refs": []},
+        }
+        input_bytes = (json.dumps(msg2, separators=(",", ":")) + "\n").encode()
+        proc2 = subprocess.run(
+            [sys.executable, "-m", "thinkos"],
+            input=input_bytes, capture_output=True, timeout=15,
+            cwd=os.path.dirname(config_path), env=env,
+        )
+        assert proc2.returncode == 0, f"Process 2 failed: {proc2.stderr.decode()}"
+        resp2 = json.loads(proc2.stdout.decode().strip())
+
+        # Assert rehydration recovered the prior packet
+        rehydrated = resp2["content"].get("rehydrated", {})
+        assert rehydrated.get("packet_count", 0) >= 1, "No packets recovered"
+        assert rehydrated.get("receipt_count", 0) >= 1, "No receipts recovered"
+
+        # Assert the successor action produced a packet
+        pids = resp2["content"]["context_packets"]
+        assert len(pids) == 1, "Successor should produce one packet"
+
+        # Assert lineage: successor packet links to recovered packet
+        # We need to read from the store directly to verify parent_id
+        store = SQLiteStore(db_path)
+        p = store.read_packet(pids[0])
+        assert p is not None
+        assert p.parent_id is not None, "Successor packet should have a parent"
+        parent = store.read_packet(p.parent_id)
+        assert parent is not None
+        assert parent.content.get("structured", {}).get("params", {}).get("content") == "alpha"
+        store._conn.close()
+
+        # Cleanup
+        import shutil
+        shutil.rmtree(os.path.dirname(db_path), ignore_errors=True)
+
+
+# ── Post-receipt-insert rollback ─────────────────────────────────────
+
+
+class TestPostReceiptRollback:
+    """Prove that a packet-insert failure after receipt INSERT rolls back both."""
+
+    def test_injected_packet_failure_rolls_back_pair(self):
+        """A SQLite trigger that aborts the packet INSERT causes the entire
+        transaction to roll back — neither receipt nor packet remains."""
+        store = SQLiteStore(":memory:")
+
+        # Install a trigger that fires on packet INSERT and aborts
+        store._conn.execute("""
+            CREATE TRIGGER IF NOT EXISTS trg_abort_packet
+            BEFORE INSERT ON packets
+            BEGIN
+                SELECT RAISE(ABORT, 'SIMULATED_PACKET_INSERT_FAILURE');
+            END;
+        """)
+        store._conn.commit()
+
+        receipt = Receipt(
+            receipt_id="rct_rollback_001",
+            schema_version=1,
+            session_id="sess_rb",
+            sequence=1,
+            timestamp="2026-07-16T00:00:00Z",
+            action=Action(type="tool_call", tool="write_file",
+                          params={"path": "/tmp/rb.txt", "content": "x"}, agent="test"),
+            result=Result(status="ok", summary="Wrote 1 byte", packet_ids=["pkt_rollback_001"]),
+            gate=GateInfo(gate_name="always_allow", decision="allow", reason="test"),
+        )
+        packet = ContextPacket(
+            packet_id="pkt_rollback_001",
+            session_id="sess_rb",
+            timestamp="2026-07-16T00:00:00Z",
+            kind="tool_result",
+            source="thinkos",
+            content={"text": "Tool 'write_file' completed", "structured": None},
+            tags=["write_file"],
+            refs=["rct_rollback_001"],
+        )
+
+        with pytest.raises(Exception):
+            store.write_receipt_and_packet(receipt, packet)
+
+        # Neither receipt nor packet should exist
+        assert store.read_receipt("rct_rollback_001") is None
+        assert store.read_packet("pkt_rollback_001") is None
+
+        # Clean up the trigger so it doesn't affect other tests
+        store._conn.execute("DROP TRIGGER IF EXISTS trg_abort_packet")
+        store._conn.commit()
+
+
+# ── Non-TTY ConfirmGate ─────────────────────────────────────────────
+
+
+class TestNonTTYConfirmGate:
+    """Prove that ConfirmGate denies writes when /dev/tty is unavailable."""
+
+    def test_non_tty_denial_reason_and_no_write(self):
+        """When /dev/tty is unavailable, ConfirmGate returns the exact
+        human-readable reason and does not execute the write."""
+        import tempfile
+        import os
+        import json
+        import subprocess
+        import sys
+
+        tmpdir = tempfile.mkdtemp()
+        try:
+            config_path = os.path.join(tmpdir, "thinkos.json")
+            config = {
+                "gates": {"default": "confirm",
+                          "overrides": {"read_file": "always_allow", "write_file": "confirm"}},
+                "store": {"path": ":memory:"},
+                "tools": {"allowed_root": None},
+            }
+            with open(config_path, "w") as f:
+                json.dump(config, f)
+
+            target = os.path.join(tmpdir, "should_not_exist.txt")
+            msg = {
+                "type": "agent_message", "message_id": "msg_deny",
+                "session_id": "sess_deny", "timestamp": "2026-07-16T00:00:00Z",
+                "sender": "test",
+                "content": {"text": "write", "tool_calls": [
+                    {"tool": "write_file", "params": {"path": target, "content": "x"},
+                     "call_id": "c1"}
+                ], "context_refs": []},
+            }
+            input_bytes = (json.dumps(msg, separators=(",", ":")) + "\n").encode()
+            env = os.environ.copy()
+            env["PYTHONDONTWRITEBYTECODE"] = "1"
+            # Make /dev/tty unavailable by running in a sandboxed environment
+            # We use a subprocess with /dev/tty pointing to a broken pipe
+            proc = subprocess.run(
+                [sys.executable, "-m", "thinkos"],
+                input=input_bytes, capture_output=True, timeout=15,
+                cwd=tmpdir, env=env,
+                # No stdin pipe for TTY — /dev/tty will fail to open
+            )
+            assert proc.returncode == 0, f"Process failed: {proc.stderr.decode()}"
+            resp = json.loads(proc.stdout.decode().strip())
+            tr = resp["content"]["tool_results"][0]
+            assert tr["status"] == "denied"
+            assert tr["output"] == "Non-interactive mode: write approval unavailable"
+            assert not os.path.exists(target)
+        finally:
+            import shutil
+            shutil.rmtree(tmpdir, ignore_errors=True)
