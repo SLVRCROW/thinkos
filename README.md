@@ -33,9 +33,9 @@ Expected output (formatted):
   "type": "agent_response",
   "content": {
     "tool_results": [{
-      "tool": "write_file",
+      "tool": "read_file",
       "status": "ok",
-      "output": "Wrote 15 bytes to hello.txt",
+      "output": "1|Hello, ThinkOS!\n",
       "receipt_id": "rct_..."
     }],
     "context_packets": [{
@@ -335,3 +335,4 @@ This is a private alpha project. Feedback, bug reports, and feature requests are
 ## License
 
 License: TBD
+

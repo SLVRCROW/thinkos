@@ -536,6 +536,13 @@ def doctor(
     tools = config.get("tools")
     if not isinstance(tools, dict):
         semantic_errors.append("'tools' must be a dict")
+    else:
+        allowed_root_value = tools.get("allowed_root")
+        if allowed_root_value is not None and not isinstance(allowed_root_value, str):
+            semantic_errors.append(
+                "tools.allowed_root must be a string or None, got "
+                f"{type(allowed_root_value).__name__}"
+            )
 
     if semantic_errors:
         all_healthy = False
@@ -589,7 +596,7 @@ def doctor(
                                   f"'{allowed_canonical}' but project root is "
                                   f"'{project_canonical}'",
                     })
-            except (OSError, RuntimeError):
+            except (OSError, RuntimeError, TypeError, ValueError):
                 all_healthy = False
                 findings.append({
                     "check": "sandbox",
@@ -599,6 +606,7 @@ def doctor(
 
     # ── 6. Store configuration ───────────────────────────────────────
     store_config = config.get("store", {})
+    safe_store_path = None
     if not isinstance(store_config, dict):
         all_healthy = False
         findings.append({
@@ -634,6 +642,7 @@ def doctor(
                                   f"project boundary '{project_canonical}'",
                     })
                 else:
+                    safe_store_path = store_canonical
                     findings.append({
                         "check": "store_config",
                         "status": "ok",
@@ -650,7 +659,7 @@ def doctor(
 
     # ── 7. Store directory ───────────────────────────────────────────
     if isinstance(store_config, dict):
-        store_dir_path = _resolve_actual_store_path(config, resolved) if store_config.get("path") else None
+        store_dir_path = safe_store_path
         if store_dir_path:
             store_dir = os.path.dirname(store_dir_path)
             if os.path.isdir(store_dir):
@@ -668,9 +677,7 @@ def doctor(
                 })
 
     # ── 8. SQLite integrity (read-only, only if DB exists) ──────────
-    db_path_for_check = None
-    if isinstance(store_config, dict):
-        db_path_for_check = _resolve_actual_store_path(config, resolved) if store_config.get("path") else None
+    db_path_for_check = safe_store_path
     if db_path_for_check and os.path.isfile(db_path_for_check):
         try:
             # Open read-only via URI — no journal, no WAL, no mutation
@@ -736,3 +743,4 @@ def _doctor_output(
         "status": "healthy" if all_healthy else "unhealthy",
         "findings": findings,
     }
+

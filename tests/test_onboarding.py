@@ -593,6 +593,23 @@ class TestDoctorUnhealthy:
         assert len(validity) >= 1
         assert validity[0]["status"] == "unhealthy"
 
+    def test_non_string_allowed_root_does_not_raise(self, tmp_project):
+        """A malformed allowed_root returns structured unhealthy findings."""
+        init(project_path=tmp_project)
+        cfg_path = os.path.join(tmp_project, THINKOS_DIR, CONFIG_FILENAME)
+        with open(cfg_path) as f:
+            config = json.load(f)
+        config["tools"]["allowed_root"] = []
+        with open(cfg_path, "w") as f:
+            json.dump(config, f)
+
+        result = doctor(project_path=tmp_project)
+
+        assert result["status"] == "unhealthy"
+        validity = [f for f in result["findings"] if f["check"] == "config_validity"]
+        assert len(validity) >= 1
+        assert validity[0]["status"] == "unhealthy"
+
     def test_unknown_tool_in_override_detected(self, tmp_project):
         """Unknown tool name in gate override produces unhealthy finding."""
         init(project_path=tmp_project)
@@ -609,17 +626,29 @@ class TestDoctorUnhealthy:
         assert len(validity) >= 1
         assert validity[0]["status"] == "unhealthy"
 
-    def test_store_path_escape_detected(self, tmp_project):
-        """Store path that escapes the project boundary produces unhealthy finding."""
+    def test_store_path_escape_detected(self, tmp_project, monkeypatch):
+        """An external store is rejected without opening the SQLite file."""
         init(project_path=tmp_project)
         cfg_path = os.path.join(tmp_project, THINKOS_DIR, CONFIG_FILENAME)
+        outside_store = Path(tmp_project).with_name(
+            Path(tmp_project).name + "-outside.sqlite"
+        )
+        outside_store.write_bytes(b"")
         with open(cfg_path) as f:
             config = json.load(f)
-        config["store"]["path"] = "/etc/thinkos.sqlite"
+        config["store"]["path"] = str(outside_store)
         with open(cfg_path, "w") as f:
             json.dump(config, f)
 
-        result = doctor(project_path=tmp_project)
+        def fail_if_opened(*_args, **_kwargs):
+            raise AssertionError("doctor attempted to open an external store")
+
+        monkeypatch.setattr("thinkos.onboarding.sqlite3.connect", fail_if_opened)
+        try:
+            result = doctor(project_path=tmp_project)
+        finally:
+            outside_store.unlink(missing_ok=True)
+
         assert result["status"] == "unhealthy"
         store_findings = [f for f in result["findings"] if f["check"] == "store_config"]
         assert len(store_findings) >= 1
