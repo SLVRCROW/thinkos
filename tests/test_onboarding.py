@@ -1,6 +1,6 @@
 """Tests for ThinkOS onboarding — init and doctor commands.
 
-Covers all acceptance criteria from the Alpha Door P1 integration correction.
+Covers all acceptance criteria from the Alpha Door P1 final falsification repair.
 """
 
 import json
@@ -9,7 +9,6 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
-import time
 from pathlib import Path
 
 import pytest
@@ -22,12 +21,49 @@ from thinkos.onboarding import (
     _build_init_config,
     _canonicalize_path,
     _resolve_actual_store_path,
+    _atomic_write_json,
+    _atomic_write_text,
+    _cleanup_failed_init,
     DEFAULT_CONFIG,
     THINKOS_DIR,
     CONFIG_FILENAME,
     STORE_FILENAME,
     GITIGNORE_CONTENT,
 )
+
+
+# ── Helpers ─────────────────────────────────────────────────────────────────
+
+
+def _repo_root() -> str:
+    """Derive the repository root from this test file's location."""
+    return str(Path(__file__).resolve().parents[1])
+
+
+def _thinkos_env() -> dict:
+    """Return an environment dict with PYTHONPATH set to the repo root.
+
+    Preserves any existing PYTHONPATH and prepends the repo root.
+    """
+    env = os.environ.copy()
+    repo = _repo_root()
+    existing = env.get("PYTHONPATH", "")
+    if existing:
+        env["PYTHONPATH"] = f"{repo}:{existing}"
+    else:
+        env["PYTHONPATH"] = repo
+    return env
+
+
+def _run_thinkos(*args: str, cwd: str | None = None, input_str: str = "") -> subprocess.CompletedProcess:
+    """Run `python -m thinkos` with PYTHONPATH set to the repo root."""
+    return subprocess.run(
+        [sys.executable, "-m", "thinkos", *args],
+        input=input_str,
+        capture_output=True, text=True,
+        cwd=cwd or "/tmp",
+        env=_thinkos_env(),
+    )
 
 
 # ── Fixtures ────────────────────────────────────────────────────────────────
@@ -63,8 +99,8 @@ class TestInitBasic:
         assert config["gates"]["overrides"]["read_file"] == "always_allow"
         assert config["gates"]["overrides"]["write_file"] == "confirm"
         assert config["tools"]["allowed_root"] == tmp_project
-        # Store path is relative to project root, resolves to .thinkos/thinkos.sqlite
         assert config["store"]["path"] == ".thinkos/thinkos.sqlite"
+
     def test_runtime_store_is_persistent(self, tmp_project):
         """Runtime store is persistent and sandboxed."""
         init(project_path=tmp_project)
@@ -133,7 +169,6 @@ class TestInitIdempotency:
         cfg_path = os.path.join(tmp_project, THINKOS_DIR, CONFIG_FILENAME)
         with open(cfg_path) as f:
             config = json.load(f)
-        # Change allowed_root to a different path
         config["tools"]["allowed_root"] = "/tmp/somewhere_else"
         with open(cfg_path, "w") as f:
             json.dump(config, f)
@@ -142,7 +177,6 @@ class TestInitIdempotency:
         assert result["status"] == "error"
         assert "differs" in result["message"].lower()
 
-        # Config should be preserved unchanged
         with open(cfg_path) as f:
             preserved = json.load(f)
         assert preserved["tools"]["allowed_root"] == "/tmp/somewhere_else"
@@ -219,22 +253,63 @@ class TestInitSafety:
         result = init(project_path=tmp_project)
         assert result["status"] == "error"
 
-        # Unsafe config preserved
         with open(cfg_path) as f:
             preserved = json.load(f)
         assert preserved["tools"]["allowed_root"] is None
+
+
+# ── Init: legacy-config shadowing prevention ─────────────────────────────
+
+
+class TestInitLegacyShadow:
+    def test_legacy_thinkos_json_blocks_init(self, tmp_project):
+        """If thinkos.json exists, init must not silently create .thinkos/ that shadows it."""
+        cfg_path = os.path.join(tmp_project, "thinkos.json")
+        with open(cfg_path, "w") as f:
+            json.dump({"gates": {"default": "always_allow"}}, f)
+
+        result = init(project_path=tmp_project)
+        assert result["status"] == "error"
+        assert "conflict" in result["message"].lower() or "exists" in result["message"].lower()
+
+        # .thinkos/ should not have been created
+        assert not os.path.isdir(os.path.join(tmp_project, THINKOS_DIR))
+        # Original config preserved
+        assert os.path.isfile(cfg_path)
+
+    def test_legacy_dot_thinkos_json_blocks_init(self, tmp_project):
+        """If .thinkos.json exists, init must not silently create .thinkos/ that shadows it."""
+        cfg_path = os.path.join(tmp_project, ".thinkos.json")
+        with open(cfg_path, "w") as f:
+            json.dump({"gates": {"default": "always_allow"}}, f)
+
+        result = init(project_path=tmp_project)
+        assert result["status"] == "error"
+        assert "conflict" in result["message"].lower() or "exists" in result["message"].lower()
+
+        assert not os.path.isdir(os.path.join(tmp_project, THINKOS_DIR))
+        assert os.path.isfile(cfg_path)
+
+    def test_legacy_configs_do_not_block_each_other(self, tmp_project):
+        """Both legacy configs existing blocks init with a clear message."""
+        Path(os.path.join(tmp_project, "thinkos.json")).write_text("{}")
+        Path(os.path.join(tmp_project, ".thinkos.json")).write_text("{}")
+
+        result = init(project_path=tmp_project)
+        assert result["status"] == "error"
+        assert not os.path.isdir(os.path.join(tmp_project, THINKOS_DIR))
 
 
 # ── Init: exit codes ──────────────────────────────────────────────────────
 
 
 class TestInitExitCodes:
-    def test_failed_init_exits_nonzero_human(self, tmp_project):
+    def test_failed_init_exits_nonzero_human(self):
         """Failed init exits nonzero in human mode."""
         result = init(project_path="/nonexistent/thinkos_test_xyz")
         assert result["status"] == "error"
 
-    def test_failed_init_exits_nonzero_json(self, tmp_project):
+    def test_failed_init_exits_nonzero_json(self):
         """Failed init exits nonzero in JSON mode."""
         result = init(project_path="/nonexistent/thinkos_test_xyz", json_output=True)
         assert result["status"] == "error"
@@ -246,82 +321,81 @@ class TestInitExitCodes:
         assert result["status"] == "already_initialized"
 
 
-# ── Init: atomicity ─────────────────────────────────────────────────────────
+# ── Init: atomicity via monkeypatch ───────────────────────────────────────
 
 
 class TestInitAtomicity:
-    def test_cleanup_removes_all_partial_artifacts(self, tmp_project):
-        """Cleanup function removes all partial generated artifacts."""
-        from thinkos.onboarding import _cleanup_failed_init
+    def test_config_write_failure_cleans_up(self, tmp_project, monkeypatch):
+        """Config write failure: no generated artifacts remain."""
+        def _fail_write_json(path, data):
+            raise OSError("Simulated config write failure")
+
+        monkeypatch.setattr("thinkos.onboarding._atomic_write_json", _fail_write_json)
+
+        result = init(project_path=tmp_project)
+        assert result["status"] == "error"
 
         thinkos_dir = os.path.join(tmp_project, THINKOS_DIR)
-        cfg_path = os.path.join(thinkos_dir, CONFIG_FILENAME)
-        gitignore_path = os.path.join(thinkos_dir, ".gitignore")
-        store_path = os.path.join(thinkos_dir, STORE_FILENAME)
-
-        os.makedirs(thinkos_dir, exist_ok=True)
-        Path(cfg_path).write_text("{}")
-        Path(gitignore_path).write_text("")
-        Path(store_path).write_text("")
-
-        _cleanup_failed_init(thinkos_dir, cfg_path, gitignore_path, store_path)
-
-        assert not os.path.exists(cfg_path)
-        assert not os.path.exists(gitignore_path)
-        assert not os.path.exists(store_path)
         assert not os.path.exists(thinkos_dir)
 
-    def test_failed_config_write_leaves_no_artifacts(self, tmp_project):
-        """Simulate a config write failure — no partial artifacts remain."""
-        from thinkos.onboarding import _cleanup_failed_init
+    def test_gitignore_write_failure_cleans_up(self, tmp_project, monkeypatch):
+        """Gitignore write failure: config and directory cleaned up."""
+        def _fail_gitignore(path, content):
+            raise OSError("Simulated gitignore write failure")
+
+        monkeypatch.setattr("thinkos.onboarding._atomic_write_text", _fail_gitignore)
+
+        result = init(project_path=tmp_project)
+        assert result["status"] == "error"
 
         thinkos_dir = os.path.join(tmp_project, THINKOS_DIR)
-        cfg_path = os.path.join(thinkos_dir, CONFIG_FILENAME)
-        gitignore_path = os.path.join(thinkos_dir, ".gitignore")
-        store_path = os.path.join(thinkos_dir, STORE_FILENAME)
-
-        # Create partial state as if config write failed after .thinkos/ creation
-        os.makedirs(thinkos_dir, exist_ok=True)
-        # No config written yet — simulate failure before atomic write
-
-        _cleanup_failed_init(thinkos_dir, cfg_path, gitignore_path, store_path)
         assert not os.path.exists(thinkos_dir)
 
-    def test_failed_gitignore_write_cleans_up_config(self, tmp_project):
-        """If .gitignore write fails, config is cleaned up."""
-        from thinkos.onboarding import _cleanup_failed_init
+    def test_store_creation_failure_cleans_up(self, tmp_project, monkeypatch):
+        """Store creation failure: config, gitignore, and directory cleaned up."""
+        real_write_json = _atomic_write_json
+        real_write_text = _atomic_write_text
+
+        call_count = 0
+
+        def _fail_store(path, content=None):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                return real_write_json(path, content)
+            if call_count == 2:
+                return real_write_text(path, content)
+            raise sqlite3.Error("Simulated store creation failure")
+
+        # We need to patch sqlite3.connect instead
+        original_connect = sqlite3.connect
+
+        def _fail_connect(*args, **kwargs):
+            if args[0] and "thinkos.sqlite" in str(args[0]):
+                raise sqlite3.Error("Simulated store creation failure")
+            return original_connect(*args, **kwargs)
+
+        monkeypatch.setattr("sqlite3.connect", _fail_connect)
+
+        result = init(project_path=tmp_project)
+        assert result["status"] == "error"
 
         thinkos_dir = os.path.join(tmp_project, THINKOS_DIR)
-        cfg_path = os.path.join(thinkos_dir, CONFIG_FILENAME)
-        gitignore_path = os.path.join(thinkos_dir, ".gitignore")
-        store_path = os.path.join(thinkos_dir, STORE_FILENAME)
-
-        os.makedirs(thinkos_dir, exist_ok=True)
-        Path(cfg_path).write_text("{}")
-        # gitignore not written yet — simulate failure
-
-        _cleanup_failed_init(thinkos_dir, cfg_path, gitignore_path, store_path)
-        assert not os.path.exists(cfg_path)
         assert not os.path.exists(thinkos_dir)
 
-    def test_failed_store_creation_cleans_up_all(self, tmp_project):
-        """If store creation fails, config and gitignore are cleaned up."""
-        from thinkos.onboarding import _cleanup_failed_init
+    def test_unrelated_files_preserved_on_failure(self, tmp_project, monkeypatch):
+        """Unrelated project files remain unchanged after a failed init."""
+        unrelated = os.path.join(tmp_project, "important.txt")
+        Path(unrelated).write_text("do not touch")
 
-        thinkos_dir = os.path.join(tmp_project, THINKOS_DIR)
-        cfg_path = os.path.join(thinkos_dir, CONFIG_FILENAME)
-        gitignore_path = os.path.join(thinkos_dir, ".gitignore")
-        store_path = os.path.join(thinkos_dir, STORE_FILENAME)
+        def _fail_write_json(path, data):
+            raise OSError("Simulated failure")
 
-        os.makedirs(thinkos_dir, exist_ok=True)
-        Path(cfg_path).write_text("{}")
-        Path(gitignore_path).write_text("")
-        # store not created yet — simulate failure
+        monkeypatch.setattr("thinkos.onboarding._atomic_write_json", _fail_write_json)
 
-        _cleanup_failed_init(thinkos_dir, cfg_path, gitignore_path, store_path)
-        assert not os.path.exists(cfg_path)
-        assert not os.path.exists(gitignore_path)
-        assert not os.path.exists(thinkos_dir)
+        init(project_path=tmp_project)
+
+        assert Path(unrelated).read_text() == "do not touch"
 
 
 # ── Init: reject multiple paths ────────────────────────────────────────────
@@ -332,10 +406,7 @@ class TestInitRejectMultiplePaths:
         """Multiple positional project paths are rejected."""
         other = os.path.join(tmp_project, "other")
         os.makedirs(other, exist_ok=True)
-        result = subprocess.run(
-            [sys.executable, "-m", "thinkos", "init", tmp_project, other],
-            capture_output=True, text=True,
-        )
+        result = _run_thinkos("init", tmp_project, other)
         assert result.returncode != 0
         assert "extra argument" in result.stderr.lower()
 
@@ -443,7 +514,6 @@ class TestDoctorUnhealthy:
         """Corrupted existing SQLite database produces specific unhealthy finding."""
         init(project_path=tmp_project)
         store_path = os.path.join(tmp_project, THINKOS_DIR, STORE_FILENAME)
-        # Remove the valid DB and create a corrupted one
         os.unlink(store_path)
         with open(store_path, "w") as f:
             f.write("this is not a valid sqlite database")
@@ -494,6 +564,67 @@ class TestDoctorUnhealthy:
         assert len(validity_findings) >= 1
         assert validity_findings[0]["status"] == "unhealthy"
 
+    def test_malformed_nested_values_do_not_raise(self, tmp_project):
+        """Malformed nested values (tools=[], store=[], invalid overrides) return structured findings."""
+        init(project_path=tmp_project)
+        cfg_path = os.path.join(tmp_project, THINKOS_DIR, CONFIG_FILENAME)
+
+        # Test tools=[]
+        with open(cfg_path) as f:
+            config = json.load(f)
+        config["tools"] = []
+        with open(cfg_path, "w") as f:
+            json.dump(config, f)
+        result = doctor(project_path=tmp_project)
+        assert result["status"] == "unhealthy"
+        validity = [f for f in result["findings"] if f["check"] == "config_validity"]
+        assert len(validity) >= 1
+        assert validity[0]["status"] == "unhealthy"
+
+        # Test store=[]
+        with open(cfg_path) as f:
+            config = json.load(f)
+        config["store"] = []
+        with open(cfg_path, "w") as f:
+            json.dump(config, f)
+        result = doctor(project_path=tmp_project)
+        assert result["status"] == "unhealthy"
+        validity = [f for f in result["findings"] if f["check"] == "config_validity"]
+        assert len(validity) >= 1
+        assert validity[0]["status"] == "unhealthy"
+
+    def test_unknown_tool_in_override_detected(self, tmp_project):
+        """Unknown tool name in gate override produces unhealthy finding."""
+        init(project_path=tmp_project)
+        cfg_path = os.path.join(tmp_project, THINKOS_DIR, CONFIG_FILENAME)
+        with open(cfg_path) as f:
+            config = json.load(f)
+        config["gates"]["overrides"]["unknown_tool"] = "always_allow"
+        with open(cfg_path, "w") as f:
+            json.dump(config, f)
+
+        result = doctor(project_path=tmp_project)
+        assert result["status"] == "unhealthy"
+        validity = [f for f in result["findings"] if f["check"] == "config_validity"]
+        assert len(validity) >= 1
+        assert validity[0]["status"] == "unhealthy"
+
+    def test_store_path_escape_detected(self, tmp_project):
+        """Store path that escapes the project boundary produces unhealthy finding."""
+        init(project_path=tmp_project)
+        cfg_path = os.path.join(tmp_project, THINKOS_DIR, CONFIG_FILENAME)
+        with open(cfg_path) as f:
+            config = json.load(f)
+        config["store"]["path"] = "/etc/thinkos.sqlite"
+        with open(cfg_path, "w") as f:
+            json.dump(config, f)
+
+        result = doctor(project_path=tmp_project)
+        assert result["status"] == "unhealthy"
+        store_findings = [f for f in result["findings"] if f["check"] == "store_config"]
+        assert len(store_findings) >= 1
+        assert store_findings[0]["status"] == "unhealthy"
+
 
 # ── Doctor: no mutation ─────────────────────────────────────────────────────
 
@@ -519,7 +650,6 @@ class TestDoctorNoMutation:
         init(project_path=tmp_project)
         store_path = os.path.join(tmp_project, THINKOS_DIR, STORE_FILENAME)
 
-        # Write some data so the DB is non-trivial
         conn = sqlite3.connect(store_path)
         conn.execute("CREATE TABLE IF NOT EXISTS test (id INTEGER PRIMARY KEY, val TEXT)")
         conn.execute("INSERT INTO test (val) VALUES ('hello')")
@@ -530,10 +660,8 @@ class TestDoctorNoMutation:
 
         doctor(project_path=tmp_project)
 
-        # Timestamp unchanged
         assert os.path.getmtime(store_path) == mtime_before
 
-        # Data intact
         conn = sqlite3.connect(store_path)
         cursor = conn.execute("SELECT val FROM test WHERE id = 1")
         assert cursor.fetchone()[0] == "hello"
@@ -546,10 +674,7 @@ class TestDoctorNoMutation:
 class TestCLI:
     def test_help_exits_cleanly(self):
         """--help documents init and doctor."""
-        result = subprocess.run(
-            [sys.executable, "-m", "thinkos", "--help"],
-            capture_output=True, text=True, cwd="/tmp",
-        )
+        result = _run_thinkos("--help")
         assert result.returncode == 0
         assert "init" in result.stdout
         assert "doctor" in result.stdout
@@ -557,86 +682,55 @@ class TestCLI:
 
     def test_version_exits_cleanly(self):
         """--version exits cleanly."""
-        result = subprocess.run(
-            [sys.executable, "-m", "thinkos", "--version"],
-            capture_output=True, text=True, cwd="/tmp",
-        )
+        result = _run_thinkos("--version")
         assert result.returncode == 0
         assert "thinkos" in result.stdout
 
     def test_unknown_command_fails_clearly(self):
         """Unknown CLI commands fail clearly."""
-        result = subprocess.run(
-            [sys.executable, "-m", "thinkos", "unknown_cmd_xyz"],
-            capture_output=True, text=True, cwd="/tmp",
-        )
+        result = _run_thinkos("unknown_cmd_xyz")
         assert result.returncode != 0
         assert "unknown command" in result.stderr.lower()
 
     def test_unknown_option_fails_clearly(self):
         """Unknown options on init fail clearly."""
-        result = subprocess.run(
-            [sys.executable, "-m", "thinkos", "init", "--bogus"],
-            capture_output=True, text=True, cwd="/tmp",
-        )
+        result = _run_thinkos("init", "--bogus")
         assert result.returncode != 0
         assert "unknown option" in result.stderr.lower()
 
     def test_no_args_starts_engine(self):
         """No arguments preserves existing engine behavior (reads stdin)."""
-        result = subprocess.run(
-            [sys.executable, "-m", "thinkos"],
-            input="",
-            capture_output=True, text=True, cwd="/tmp",
-        )
+        result = _run_thinkos(input_str="")
         assert result.returncode == 0
 
     def test_init_does_not_initialize_engine(self, tmp_project):
         """Init command must not initialize the engine."""
-        result = subprocess.run(
-            [sys.executable, "-m", "thinkos", "init", tmp_project],
-            capture_output=True, text=True,
-        )
+        result = _run_thinkos("init", tmp_project)
         assert result.returncode == 0
         assert "✓" in result.stdout or "ok" in result.stdout.lower()
 
     def test_doctor_does_not_initialize_engine(self, tmp_project):
         """Doctor command must not initialize the engine."""
-        subprocess.run(
-            [sys.executable, "-m", "thinkos", "init", tmp_project],
-            capture_output=True, text=True,
-        )
-        result = subprocess.run(
-            [sys.executable, "-m", "thinkos", "doctor", tmp_project],
-            capture_output=True, text=True,
-        )
+        _run_thinkos("init", tmp_project)
+        result = _run_thinkos("doctor", tmp_project)
         assert result.returncode == 0
         assert "All checks passed" in result.stdout or "healthy" in result.stdout.lower()
 
     def test_init_failure_exit_code(self):
         """Init failure exits nonzero via CLI."""
-        result = subprocess.run(
-            [sys.executable, "-m", "thinkos", "init", "/nonexistent/thinkos_test_xyz"],
-            capture_output=True, text=True,
-        )
+        result = _run_thinkos("init", "/nonexistent/thinkos_test_xyz")
         assert result.returncode != 0
 
     def test_init_failure_json_exit_code(self):
         """Init failure exits nonzero via CLI with --json."""
-        result = subprocess.run(
-            [sys.executable, "-m", "thinkos", "init", "/nonexistent/thinkos_test_xyz", "--json"],
-            capture_output=True, text=True,
-        )
+        result = _run_thinkos("init", "/nonexistent/thinkos_test_xyz", "--json")
         assert result.returncode != 0
 
     def test_multiple_paths_rejected(self, tmp_project):
         """Multiple positional project paths are rejected."""
         other = os.path.join(tmp_project, "other")
         os.makedirs(other, exist_ok=True)
-        result = subprocess.run(
-            [sys.executable, "-m", "thinkos", "init", tmp_project, other],
-            capture_output=True, text=True,
-        )
+        result = _run_thinkos("init", tmp_project, other)
         assert result.returncode != 0
         assert "extra argument" in result.stderr.lower()
 
@@ -647,10 +741,7 @@ class TestCLI:
 class TestJSONOutput:
     def test_init_json_output(self, tmp_project):
         """Init --json produces stable, structured JSON."""
-        result = subprocess.run(
-            [sys.executable, "-m", "thinkos", "init", tmp_project, "--json"],
-            capture_output=True, text=True,
-        )
+        result = _run_thinkos("init", tmp_project, "--json")
         assert result.returncode == 0
         data = json.loads(result.stdout)
         assert "status" in data
@@ -659,38 +750,23 @@ class TestJSONOutput:
 
     def test_init_already_initialized_json(self, tmp_project):
         """Init --json on already-initialized project."""
-        subprocess.run(
-            [sys.executable, "-m", "thinkos", "init", tmp_project],
-            capture_output=True, text=True,
-        )
-        result = subprocess.run(
-            [sys.executable, "-m", "thinkos", "init", tmp_project, "--json"],
-            capture_output=True, text=True,
-        )
+        _run_thinkos("init", tmp_project)
+        result = _run_thinkos("init", tmp_project, "--json")
         assert result.returncode == 0
         data = json.loads(result.stdout)
         assert data["status"] == "already_initialized"
 
     def test_init_error_json(self):
         """Init --json on invalid path produces error JSON."""
-        result = subprocess.run(
-            [sys.executable, "-m", "thinkos", "init", "/nonexistent/thinkos_test_xyz", "--json"],
-            capture_output=True, text=True,
-        )
+        result = _run_thinkos("init", "/nonexistent/thinkos_test_xyz", "--json")
         assert result.returncode != 0
         data = json.loads(result.stdout)
         assert data["status"] == "error"
 
     def test_doctor_json_output(self, tmp_project):
         """Doctor --json produces stable, structured JSON."""
-        subprocess.run(
-            [sys.executable, "-m", "thinkos", "init", tmp_project],
-            capture_output=True, text=True,
-        )
-        result = subprocess.run(
-            [sys.executable, "-m", "thinkos", "doctor", tmp_project, "--json"],
-            capture_output=True, text=True,
-        )
+        _run_thinkos("init", tmp_project)
+        result = _run_thinkos("doctor", tmp_project, "--json")
         assert result.returncode == 0
         data = json.loads(result.stdout)
         assert "status" in data
@@ -699,10 +775,7 @@ class TestJSONOutput:
 
     def test_doctor_unhealthy_json_output(self, tmp_project):
         """Doctor --json on unhealthy project produces structured JSON."""
-        result = subprocess.run(
-            [sys.executable, "-m", "thinkos", "doctor", tmp_project, "--json"],
-            capture_output=True, text=True,
-        )
+        result = _run_thinkos("doctor", tmp_project, "--json")
         assert result.returncode != 0
         data = json.loads(result.stdout)
         assert data["status"] == "unhealthy"
@@ -714,19 +787,16 @@ class TestJSONOutput:
 
 class TestEndToEnd:
     def test_init_to_engine_to_rehydration(self, tmp_project):
-        """init → normal no-arg engine → persistent DB → fresh process rehydration.
+        """init -> normal no-arg engine -> persistent DB -> fresh process rehydration.
 
         Proves the installation created by thinkos init is the installation
         actually consumed by the normal no-argument ThinkOS engine.
         """
         # 1. Init
-        result = subprocess.run(
-            [sys.executable, "-m", "thinkos", "init", tmp_project],
-            capture_output=True, text=True,
-        )
+        result = _run_thinkos("init", tmp_project)
         assert result.returncode == 0
 
-        # 2. Override the write gate to always_allow for non-interactive test
+        # 2. Override write gate to always_allow for non-interactive test
         cfg_path = os.path.join(tmp_project, THINKOS_DIR, CONFIG_FILENAME)
         with open(cfg_path) as f:
             config = json.load(f)
@@ -752,13 +822,8 @@ class TestEndToEnd:
             },
         })
 
-        result = subprocess.run(
-            [sys.executable, "-m", "thinkos"],
-            input=msg + "\n",
-            capture_output=True, text=True, cwd=tmp_project,
-        )
+        result = _run_thinkos(cwd=tmp_project, input_str=msg + "\n")
         assert result.returncode == 0
-        # The tool result should be ok
         resp = json.loads(result.stdout)
         assert resp["content"]["tool_results"][0]["status"] == "ok"
 
@@ -775,10 +840,9 @@ class TestEndToEnd:
         ).fetchall()
         conn.close()
         assert len(rows) >= 1
-        # The packet stores the tool result output, not the file content
         assert any("Wrote" in row[0] for row in rows)
 
-        # 6. Fresh process rehydration — run engine again with rehydrate flag
+        # 6. Fresh process rehydration
         msg2 = json.dumps({
             "type": "agent_message",
             "message_id": "msg_e2e_2",
@@ -793,20 +857,15 @@ class TestEndToEnd:
             },
         })
 
-        result2 = subprocess.run(
-            [sys.executable, "-m", "thinkos"],
-            input=msg2 + "\n",
-            capture_output=True, text=True, cwd=tmp_project,
-        )
+        result2 = _run_thinkos(cwd=tmp_project, input_str=msg2 + "\n")
         assert result2.returncode == 0
         resp2 = json.loads(result2.stdout)
         assert "rehydrated" in resp2["content"]
 
     def test_sandbox_enforcement(self, tmp_project):
         """Runtime filesystem request outside allowed_root is denied."""
-        init(project_path=tmp_project)
+        _run_thinkos("init", tmp_project)
 
-        # Try to read /etc/hostname via the engine
         msg = json.dumps({
             "type": "agent_message",
             "message_id": "msg_sb_1",
@@ -823,18 +882,14 @@ class TestEndToEnd:
             },
         })
 
-        result = subprocess.run(
-            [sys.executable, "-m", "thinkos"],
-            input=msg + "\n",
-            capture_output=True, text=True, cwd=tmp_project,
-        )
+        result = _run_thinkos(cwd=tmp_project, input_str=msg + "\n")
         assert result.returncode == 0
-        # The engine should deny the read (sandbox enforcement)
-        assert "Access denied" in result.stdout or "error" in result.stdout.lower()
+        resp = json.loads(result.stdout)
+        # The tool result should have status error (sandbox denied)
+        assert resp["content"]["tool_results"][0]["status"] == "error"
 
     def test_uninitialized_project_engine_backward_compat(self, tmp_project):
         """No-arg engine behavior is backward compatible for uninitialized projects."""
-        # Create a thinkos.json with always_allow for non-interactive test
         cfg = {
             "gates": {
                 "default": "always_allow",
@@ -864,11 +919,7 @@ class TestEndToEnd:
             },
         })
 
-        result = subprocess.run(
-            [sys.executable, "-m", "thinkos"],
-            input=msg + "\n",
-            capture_output=True, text=True, cwd=tmp_project,
-        )
+        result = _run_thinkos(cwd=tmp_project, input_str=msg + "\n")
         assert result.returncode == 0
         resp = json.loads(result.stdout)
         assert resp["content"]["tool_results"][0]["status"] == "ok"
@@ -927,11 +978,9 @@ class TestConfigDiscovery:
         original_cwd = os.getcwd()
         try:
             os.chdir(tmp_project)
-            # Also create a root thinkos.json with different content
             cfg = {"gates": {"default": "deny_all"}}
             with open("thinkos.json", "w") as f:
                 json.dump(cfg, f)
-            # .thinkos/thinkos.json should win
             config = load_config()
             assert config["gates"]["default"] == "confirm"
             assert config["store"]["path"] == ".thinkos/thinkos.sqlite"

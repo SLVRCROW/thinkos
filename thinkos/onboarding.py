@@ -260,6 +260,22 @@ def init(
             json_output,
         )
 
+    # ── Legacy-config shadowing prevention ──────────────────────────
+    # If thinkos.json or .thinkos.json already exists in the project root,
+    # init must not silently create a higher-priority .thinkos/thinkos.json
+    # that replaces its behavior.
+    for legacy_name in ("thinkos.json", ".thinkos.json"):
+        legacy_path = os.path.join(resolved, legacy_name)
+        if os.path.isfile(legacy_path):
+            return _init_result(
+                False,
+                f"Conflict: '{legacy_name}' already exists at '{resolved}'. "
+                f"ThinkOS init would create '.thinkos/thinkos.json' which takes "
+                f"discovery priority over '{legacy_name}'. Remove or rename "
+                f"'{legacy_name}' first, or use it directly without 'thinkos init'.",
+                json_output,
+            )
+
     # ── Path-escape check ─────────────────────────────────────────────
     try:
         resolved_real = Path(resolved).resolve()
@@ -495,8 +511,17 @@ def doctor(
             semantic_errors.append("gates.overrides must be a dict")
         else:
             for tool_name, gate_name in overrides.items():
+                if not isinstance(tool_name, str):
+                    semantic_errors.append(f"gate override key must be a string, got {type(tool_name).__name__}")
+                    continue
+                if not isinstance(gate_name, str):
+                    semantic_errors.append(f"gate '{gate_name}' (override for tool '{tool_name}') must be a string, got {type(gate_name).__name__}")
+                    continue
                 if gate_name not in ("always_allow", "confirm", "deny_all"):
                     semantic_errors.append(f"gate '{gate_name}' (override for tool '{tool_name}') is not recognised")
+                # Validate tool name is known
+                if tool_name not in ("read_file", "write_file"):
+                    semantic_errors.append(f"override references unknown tool '{tool_name}'")
 
     # Check store structure
     store = config.get("store")
@@ -527,85 +552,129 @@ def doctor(
         })
 
     # ── 5. Sandbox status ────────────────────────────────────────────
-    allowed_root = config.get("tools", {}).get("allowed_root")
-    if allowed_root is None:
+    tools_config = config.get("tools", {})
+    if not isinstance(tools_config, dict):
         all_healthy = False
         findings.append({
             "check": "sandbox",
             "status": "unhealthy",
-            "detail": "Sandbox is disabled (allowed_root is null). "
-                      "File access is unrestricted.",
+            "detail": "Cannot determine sandbox status — 'tools' is not a dict",
         })
     else:
-        # Validate that allowed_root canonically equals the intended project root
-        try:
-            allowed_canonical = _canonicalize_path(allowed_root)
-            project_canonical = _canonicalize_path(resolved)
-            if allowed_canonical == project_canonical:
-                findings.append({
-                    "check": "sandbox",
-                    "status": "ok",
-                    "detail": f"Sandbox is active (allowed_root: '{allowed_root}')",
-                })
-            else:
-                all_healthy = False
-                findings.append({
-                    "check": "sandbox",
-                    "status": "unhealthy",
-                    "detail": f"Sandbox allowed_root '{allowed_root}' resolves to "
-                              f"'{allowed_canonical}' but project root is "
-                              f"'{project_canonical}'",
-                })
-        except (OSError, RuntimeError):
+        allowed_root = tools_config.get("allowed_root")
+        if allowed_root is None:
             all_healthy = False
             findings.append({
                 "check": "sandbox",
                 "status": "unhealthy",
-                "detail": f"Sandbox allowed_root '{allowed_root}' cannot be resolved",
+                "detail": "Sandbox is disabled (allowed_root is null). "
+                          "File access is unrestricted.",
             })
+        else:
+            try:
+                allowed_canonical = _canonicalize_path(allowed_root)
+                project_canonical = _canonicalize_path(resolved)
+                if allowed_canonical == project_canonical:
+                    findings.append({
+                        "check": "sandbox",
+                        "status": "ok",
+                        "detail": f"Sandbox is active (allowed_root: '{allowed_root}')",
+                    })
+                else:
+                    all_healthy = False
+                    findings.append({
+                        "check": "sandbox",
+                        "status": "unhealthy",
+                        "detail": f"Sandbox allowed_root '{allowed_root}' resolves to "
+                                  f"'{allowed_canonical}' but project root is "
+                                  f"'{project_canonical}'",
+                    })
+            except (OSError, RuntimeError):
+                all_healthy = False
+                findings.append({
+                    "check": "sandbox",
+                    "status": "unhealthy",
+                    "detail": f"Sandbox allowed_root '{allowed_root}' cannot be resolved",
+                })
 
     # ── 6. Store configuration ───────────────────────────────────────
-    store_path_val = config.get("store", {}).get("path")
-    if store_path_val is None:
+    store_config = config.get("store", {})
+    if not isinstance(store_config, dict):
         all_healthy = False
         findings.append({
             "check": "store_config",
             "status": "unhealthy",
-            "detail": "Store is ephemeral (store.path is null). "
-                      "Data will not persist across sessions.",
+            "detail": "'store' is not a dict — cannot determine store configuration",
         })
     else:
-        actual_store_path = _resolve_actual_store_path(config, resolved)
-        findings.append({
-            "check": "store_config",
-            "status": "ok",
-            "detail": f"Store is persistent (path: '{store_path_val}', "
-                      f"resolves to: '{actual_store_path}')",
-        })
-
-    # ── 7. Store directory ───────────────────────────────────────────
-    actual_store_path = _resolve_actual_store_path(config, resolved) if config.get("store", {}).get("path") else None
-    if actual_store_path:
-        store_dir = os.path.dirname(actual_store_path)
-        if os.path.isdir(store_dir):
-            findings.append({
-                "check": "store_directory",
-                "status": "ok",
-                "detail": f"Store directory exists at '{store_dir}'",
-            })
-        else:
+        store_path_val = store_config.get("path")
+        if store_path_val is None:
             all_healthy = False
             findings.append({
-                "check": "store_directory",
+                "check": "store_config",
                 "status": "unhealthy",
-                "detail": f"Store directory does not exist at '{store_dir}'",
+                "detail": "Store is ephemeral (store.path is null). "
+                          "Data will not persist across sessions.",
             })
+        else:
+            actual_store_path = _resolve_actual_store_path(config, resolved)
+            # Check if store path escapes the project boundary
+            try:
+                if actual_store_path is None:
+                    raise OSError("Store path resolved to None")
+                store_canonical = _canonicalize_path(actual_store_path)
+                project_canonical = _canonicalize_path(resolved)
+                if not store_canonical.startswith(project_canonical + "/") and store_canonical != project_canonical:
+                    all_healthy = False
+                    findings.append({
+                        "check": "store_config",
+                        "status": "unhealthy",
+                        "detail": f"Store path '{store_path_val}' resolves to "
+                                  f"'{store_canonical}' which is outside the "
+                                  f"project boundary '{project_canonical}'",
+                    })
+                else:
+                    findings.append({
+                        "check": "store_config",
+                        "status": "ok",
+                        "detail": f"Store is persistent (path: '{store_path_val}', "
+                                  f"resolves to: '{actual_store_path}')",
+                    })
+            except (OSError, RuntimeError):
+                all_healthy = False
+                findings.append({
+                    "check": "store_config",
+                    "status": "unhealthy",
+                    "detail": f"Store path '{store_path_val}' cannot be resolved",
+                })
+
+    # ── 7. Store directory ───────────────────────────────────────────
+    if isinstance(store_config, dict):
+        store_dir_path = _resolve_actual_store_path(config, resolved) if store_config.get("path") else None
+        if store_dir_path:
+            store_dir = os.path.dirname(store_dir_path)
+            if os.path.isdir(store_dir):
+                findings.append({
+                    "check": "store_directory",
+                    "status": "ok",
+                    "detail": f"Store directory exists at '{store_dir}'",
+                })
+            else:
+                all_healthy = False
+                findings.append({
+                    "check": "store_directory",
+                    "status": "unhealthy",
+                    "detail": f"Store directory does not exist at '{store_dir}'",
+                })
 
     # ── 8. SQLite integrity (read-only, only if DB exists) ──────────
-    if actual_store_path and os.path.isfile(actual_store_path):
+    db_path_for_check = None
+    if isinstance(store_config, dict):
+        db_path_for_check = _resolve_actual_store_path(config, resolved) if store_config.get("path") else None
+    if db_path_for_check and os.path.isfile(db_path_for_check):
         try:
             # Open read-only via URI — no journal, no WAL, no mutation
-            abs_path = str(Path(actual_store_path).resolve())
+            abs_path = str(Path(db_path_for_check).resolve())
             db_uri = Path(abs_path).as_uri()
             conn = sqlite3.connect(db_uri + "?mode=ro", uri=True)
             cursor = conn.execute("PRAGMA integrity_check")

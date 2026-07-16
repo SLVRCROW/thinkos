@@ -18,8 +18,10 @@ pip install .
 thinkos init my-project
 
 # Run the engine from the project root (reads JSON-Lines from stdin)
+# Under safe defaults, reads are allowed automatically
 cd my-project
-echo '{"type":"agent_message","message_id":"msg_1","session_id":"demo","timestamp":"2026-07-06T12:00:00Z","sender":"demo","content":{"text":"hello","tool_calls":[{"tool":"write_file","params":{"path":"hello.txt","content":"Hello, ThinkOS!"},"call_id":"c1"}],"context_refs":[]}}' | python -m thinkos
+echo 'Hello, ThinkOS!' > hello.txt
+echo '{"type":"agent_message","message_id":"msg_1","session_id":"demo","timestamp":"2026-07-06T12:00:00Z","sender":"demo","content":{"text":"read a file","tool_calls":[{"tool":"read_file","params":{"path":"hello.txt","call_id":"c1"}}],"context_refs":[]}}' | python -m thinkos
 
 # Check installation health
 thinkos doctor
