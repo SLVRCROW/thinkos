@@ -11,6 +11,9 @@ def _print_help():
     print("  thinkos [--help | --version]")
     print("  thinkos init [PROJECT_PATH] [--json]")
     print("  thinkos doctor [PROJECT_PATH] [--json]")
+    print("  thinkos onboard inspect [PROJECT_PATH] [--json]")
+    print("  thinkos onboard plan [PROJECT_PATH] [--json]")
+    print("  thinkos onboard apply [PROJECT_PATH] --approve-plan PLAN_ID [--json]")
     print("  python -m thinkos")
     print()
     print("Commands:")
@@ -24,6 +27,16 @@ def _print_help():
     print("           config presence and validity, sandbox status, store")
     print("           configuration, and SQLite integrity.")
     print("           Defaults to the current directory.")
+    print()
+    print("  onboard  Agent-led onboarding (P2 v0).")
+    print("    inspect  Read-only project state classification.")
+    print("    plan     Generate a deterministic onboarding plan with plan_id.")
+    print("    apply    Apply an approved plan. Requires --approve-plan PLAN_ID.")
+    print("           Safe defaults (explained, not asked):")
+    print("           - reads are automatically allowed inside the project")
+    print("           - writes require approval")
+    print("           - file access is sandboxed to the project")
+    print("           - resumable history is stored locally")
     print()
     print("Options:")
     print("  --help       Show this help message and exit.")
@@ -95,9 +108,112 @@ def _run_doctor():
         sys.exit(1)
 
 
+def _run_onboard():
+    """Dispatch onboard subcommands: inspect, plan, apply."""
+    if len(sys.argv) < 3:
+        print("thinkos: missing onboard subcommand (inspect|plan|apply)", file=sys.stderr)
+        print("Run 'thinkos --help' for usage.", file=sys.stderr)
+        sys.exit(1)
+
+    subcmd = sys.argv[2].strip().lower()
+    if subcmd not in ("inspect", "plan", "apply"):
+        print(f"thinkos: unknown onboard subcommand '{subcmd}'", file=sys.stderr)
+        print("Run 'thinkos --help' for usage.", file=sys.stderr)
+        sys.exit(1)
+
+    from thinkos.agent_onboarding import inspect as _inspect, plan as _plan, apply as _apply
+
+    # Parse remaining args
+    project_path = None
+    approved_plan_id = None
+    json_output = False
+    args = sys.argv[3:]
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a == "--json":
+            json_output = True
+        elif a == "--approve-plan":
+            i += 1
+            if i >= len(args):
+                print("thinkos: --approve-plan requires a plan_id argument", file=sys.stderr)
+                sys.exit(1)
+            approved_plan_id = args[i]
+        elif a.startswith("--"):
+            print(f"thinkos: unknown option '{a}'", file=sys.stderr)
+            sys.exit(1)
+        else:
+            if project_path is not None:
+                print(f"thinkos: unexpected extra argument '{a}'", file=sys.stderr)
+                sys.exit(1)
+            project_path = a
+        i += 1
+
+    if subcmd == "inspect":
+        result = _inspect(project_path=project_path)
+    elif subcmd == "plan":
+        result = _plan(project_path=project_path)
+    elif subcmd == "apply":
+        result = _apply(project_path=project_path, approved_plan_id=approved_plan_id,
+                        json_output=json_output)
+    else:
+        result = {"status": "error", "error": f"Unknown subcommand: {subcmd}"}
+
+    if json_output:
+        import json
+        print(json.dumps(result, indent=2))
+    else:
+        if result.get("status") == "error":
+            print(f"✗ {result.get('error', 'Unknown error')}", file=sys.stderr)
+            sys.exit(1)
+        elif result.get("status") == "blocked":
+            print(f"✗ Plan is blocked:")
+            for reason in result.get("blocked_reasons", []):
+                print(f"  - {reason}")
+            sys.exit(1)
+        elif result.get("status") == "partial":
+            print(f"⚠ {result.get('detail', 'Partial completion')}")
+            if result.get("error"):
+                print(f"  {result['error']}")
+            sys.exit(1)
+        else:
+            if subcmd == "inspect":
+                print(f"Project: {result.get('project_root', '?')}")
+                print(f"State: {result.get('state', '?')}")
+                print(f"Detail: {result.get('detail', '?')}")
+                if result.get("legacy_conflicts"):
+                    print(f"Legacy conflicts: {', '.join(result['legacy_conflicts'])}")
+                if result.get("p2_complete"):
+                    print("P2 onboarding: complete")
+                if result.get("doctor_findings"):
+                    print("Doctor findings:")
+                    for f in result["doctor_findings"]:
+                        icon = "✓" if f["status"] == "ok" else "✗"
+                        print(f"  {icon} {f['check']}: {f['detail']}")
+            elif subcmd == "plan":
+                print(f"Plan ID: {result.get('plan_id', '?')}")
+                print(f"State: {result.get('observed_state', '?')}")
+                if result.get("blocked_reasons"):
+                    print("Blocked:")
+                    for r in result["blocked_reasons"]:
+                        print(f"  - {r}")
+                else:
+                    print(f"Effects: {len(result.get('ordered_effects', []))} step(s)")
+                    for e in result.get("ordered_effects", []):
+                        print(f"  {e['order']}. {e['action']}")
+                if result.get("warnings"):
+                    for w in result["warnings"]:
+                        print(f"  ⚠ {w}")
+            elif subcmd == "apply":
+                print(f"✓ {result.get('detail', 'Applied')}")
+                for e in result.get("effects_applied", []):
+                    icon = "✓" if e.get("status") == "ok" else "✗"
+                    print(f"  {icon} {e['action']}")
+
+
 def main():
     # Quick arg scan before importing the heavy engine modules.
-    # --help, --version, init, and doctor are handled here without
+    # --help, --version, init, doctor, and onboard are handled here without
     # initialising the engine.
     if len(sys.argv) > 1:
         arg0 = sys.argv[1].strip().lower()
@@ -112,6 +228,9 @@ def main():
             return
         if arg0 == "doctor":
             _run_doctor()
+            return
+        if arg0 == "onboard":
+            _run_onboard()
             return
         # Unknown command — fail clearly rather than silently starting engine
         _print_unknown_command(arg0)
