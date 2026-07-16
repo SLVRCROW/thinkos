@@ -1636,8 +1636,15 @@ class TestRealTwoProcessPersistence:
             input_bytes = (json.dumps(msg1, separators=(",", ":")) + "\n").encode()
             env = os.environ.copy()
             env["PYTHONDONTWRITEBYTECODE"] = "1"
-            # PYTHONPATH = repository root (two levels up from tests/test_engine.py)
-            env["PYTHONPATH"] = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+            # PYTHONPATH = repository root (tests/ is one level below root)
+            from pathlib import Path
+            repo_root = Path(__file__).resolve().parents[1]
+            existing = env.get("PYTHONPATH")
+            env["PYTHONPATH"] = (
+                str(repo_root)
+                if not existing
+                else str(repo_root) + os.pathsep + existing
+            )
             proc1 = subprocess.run(
                 [sys.executable, "-m", "thinkos"],
                 input=input_bytes, capture_output=True, timeout=15,
@@ -1784,8 +1791,15 @@ class TestNonTTYConfirmGate:
             input_bytes = (json.dumps(msg, separators=(",", ":")) + "\n").encode()
             env = os.environ.copy()
             env["PYTHONDONTWRITEBYTECODE"] = "1"
-            # PYTHONPATH = repository root (two levels up from tests/test_engine.py)
-            env["PYTHONPATH"] = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+            # PYTHONPATH = repository root (tests/ is one level below root)
+            from pathlib import Path
+            repo_root = Path(__file__).resolve().parents[1]
+            existing = env.get("PYTHONPATH")
+            env["PYTHONPATH"] = (
+                str(repo_root)
+                if not existing
+                else str(repo_root) + os.pathsep + existing
+            )
             # start_new_session=True detaches the subprocess from the parent's
             # controlling terminal, making /dev/tty deterministically unavailable.
             proc = subprocess.run(
