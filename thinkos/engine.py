@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 from thinkos.schema.context_packet import ContextPacket, validate as validate_packet, serialize as serialize_packet
 from thinkos.schema.receipt import Receipt, Action, Result, GateInfo, validate as validate_receipt, serialize as serialize_receipt
 from thinkos.config import resolve_gate, get_allowed_root
-from thinkos.store.sqlite_store import DepthError
+from thinkos.store.sqlite_store import CycleError, DepthError, DuplicateError
 
 
 def _build_summary(packets: list[ContextPacket], receipts: list[Receipt],
@@ -350,14 +350,15 @@ class Engine:
                     gate_decision = gate.evaluate(tool_name, params)
 
                     if gate_decision["action"] == "deny":
+                        reason = gate_decision.get("reason", "Denied by gate")
                         receipt = self._make_receipt(
                             session_id, "tool_call", tool_name, params, sender,
-                            "denied", gate_decision.get("reason", "Denied by gate"), [],
-                            gate_decision.get("reason"), gate.name, "deny", gate_decision.get("reason")
+                            "denied", reason, [],
+                            reason, gate.name, "deny", reason
                         )
                         self.store.write_receipt(receipt)
                         tool_results.append({"tool": tool_name, "call_id": call_id,
-                                             "status": "denied", "output": "", "receipt_id": receipt.receipt_id})
+                                             "status": "denied", "output": reason, "receipt_id": receipt.receipt_id})
                         receipt_ids.append(receipt.receipt_id)
                         continue
 
@@ -379,15 +380,16 @@ class Engine:
                     }
                     result = tool_adapter.execute(params, context)
 
+                    # Build receipt first (with packet_ids placeholder)
                     receipt = self._make_receipt(
                         session_id, "tool_call", tool_name, params, sender,
                         result.get("status", "ok"), result.get("output", "")[:200],
                         [], result.get("error"), gate.name, "allow",
                         gate_decision.get("reason", "Allowed by gate")
                     )
-                    self.store.write_receipt(receipt)
 
                     # Create a context packet for every successful tool result
+                    packet = None
                     if result.get("status") == "ok":
                         last_pid = self._last_packet_id.get(session_id)
                         packet = ContextPacket(
@@ -408,11 +410,20 @@ class Engine:
                             tags=[tool_name],
                             refs=[receipt.receipt_id],
                         )
+                        # Link receipt -> packet
+                        receipt.result.packet_ids = [packet.packet_id]
+
+                    # Persist pair atomically: write receipt first, then packet.
+                    # If packet write fails (cycle/depth/duplicate), the receipt
+                    # still exists with empty packet_ids — no dangling reference.
+                    self.store.write_receipt(receipt)
+                    if packet is not None:
                         try:
                             self.store.write_packet(packet)
-                        except DepthError:
+                        except (CycleError, DepthError, DuplicateError):
                             # Depth limit reached — retry without parent link
                             packet.parent_id = None
+                            packet.refs = [receipt.receipt_id]
                             self.store.write_packet(packet)
                         self._last_packet_id[session_id] = packet.packet_id
                         context_packets.append(packet.packet_id)

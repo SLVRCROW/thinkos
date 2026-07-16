@@ -14,8 +14,19 @@ git clone https://github.com/SLVRCROW/thinkos.git
 cd thinkos
 pip install .
 
-# Create a config file
-echo '{"gates":{"default":"always_allow"}}' > thinkos.json
+# Create a config file with explicit gate overrides and persistent store
+echo '{
+  "gates": {
+    "default": "always_allow",
+    "overrides": {
+      "read_file": "always_allow",
+      "write_file": "always_allow"
+    }
+  },
+  "store": {
+    "path": "thinkos.sqlite"
+  }
+}' > thinkos.json
 
 # Run the engine (reads JSON-Lines from stdin)
 echo '{"type":"agent_message","message_id":"msg_1","session_id":"demo","timestamp":"2026-07-06T12:00:00Z","sender":"demo","content":{"text":"hello","tool_calls":[{"tool":"write_file","params":{"path":"hello.txt","content":"Hello, ThinkOS!"},"call_id":"c1"}],"context_refs":[]}}' | python -m thinkos
@@ -268,7 +279,7 @@ python -m benchmarks.context_efficiency_v0
 - Additional gate types
 - PyPI publication
 - Public release
-- **G1 (model-backed evaluation)** — Not implemented. Parked pending separately verified contract and authorization. No provider selected. No model-backed pilot has run.
+| **G1 (model-backed evaluation)** — Not implemented. Parked pending separately verified contract and authorization. No provider selected. No model-backed pilot has run. The G0 benchmark chassis is ready; G1 requires a separately designed and authorized evaluation contract.
 
 **Explicit non-claims (TAA-v0 does not provide):**
 - Cryptographic attestation
