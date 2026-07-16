@@ -679,6 +679,8 @@ class TestFalsification:
             if not is_sidecar:
                 assert before[key]["mtime"] == after[key]["mtime"], f"Mtime changed for {key}"
 
+
+
     def test_evidence_atomicity_injected_failure(self, tmp_project):
         """Inject DuplicateError during write_receipt_and_packet.
         Proves zero new receipts and zero new packets survive, P1 is preserved,
@@ -1101,3 +1103,147 @@ store.close()
             assert before[key]["size"] == after[key]["size"], f"Size changed for {key}"
             if not is_sidecar:
                 assert before[key]["mtime"] == after[key]["mtime"], f"Mtime changed for {key}"
+
+
+
+
+# ── Rehydration falsification: each forged-evidence case ──────────
+
+
+def _forge_evidence(initialized_project, receipt_kwargs=None, packet_kwargs=None):
+    """Helper: write a receipt+packet pair to the store and return store_path."""
+    from datetime import datetime, timezone
+    import uuid
+    store_path = os.path.join(initialized_project, THINKOS_DIR, STORE_FILENAME)
+    store = SQLiteStore(store_path)
+    rid = f"rct_{uuid.uuid4()}"
+    pid = f"ctx_{uuid.uuid4()}"
+    plan_id = "f" * 64
+    r_defaults = dict(
+        receipt_id=rid, session_id="p2_onboard_" + plan_id,
+        sequence=1, timestamp=datetime.now(timezone.utc).isoformat(),
+        action=Action(type="agent_message", tool=None,
+                      params={"contract_version": "p2.v0", "approved_plan_id": plan_id},
+                      agent="p2_onboarding"),
+        result=Result(status="ok", summary="test", packet_ids=[pid]),
+    )
+    if receipt_kwargs:
+        r_defaults.update(receipt_kwargs)
+    receipt = Receipt(**r_defaults)
+    p_defaults = dict(
+        packet_id=pid, session_id="p2_onboard_" + plan_id,
+        timestamp=datetime.now(timezone.utc).isoformat(),
+        kind="decision", source="p2_onboarding",
+        content={"text": "test", "structured": {
+            "contract_version": "p2.v0",
+            "plan_id": plan_id,
+        }},
+        tags=["p2_onboarding", "decision"], refs=[rid],
+    )
+    if packet_kwargs:
+        p_defaults.update(packet_kwargs)
+    packet = ContextPacket(**p_defaults)
+    store.write_receipt_and_packet(receipt, packet)
+    store.close()
+    return store_path
+
+
+class TestRehydrationFalsification:
+    def test_rehydrate_orphan_packet(self, initialized_project):
+        store_path = os.path.join(initialized_project, THINKOS_DIR, STORE_FILENAME)
+        store = SQLiteStore(store_path)
+        packet = ContextPacket(
+            packet_id="ctx_00000000-0000-0000-0000-000000000099",
+            session_id="p2_onboard_orphan",
+            timestamp="2026-07-15T12:00:00Z",
+            kind="decision", source="p2_onboarding",
+            content={"text": "orphan", "structured": {
+                "contract_version": "p2.v0",
+                "plan_id": "0" * 64,
+            }},
+            tags=["p2_onboarding", "decision"], refs=[],
+        )
+        store.write_packet(packet)
+        store.close()
+        result = rehydrate_onboarding(project_path=initialized_project)
+        assert result["status"] == "error"
+        assert len(result.get("packets", [])) == 0
+        assert len(result.get("receipts", [])) == 0
+
+    def test_rehydrate_missing_receipt(self, initialized_project):
+        store_path = os.path.join(initialized_project, THINKOS_DIR, STORE_FILENAME)
+        store = SQLiteStore(store_path)
+        packet = ContextPacket(
+            packet_id="ctx_00000000-0000-0000-0000-000000000098",
+            session_id="p2_onboard_missing",
+            timestamp="2026-07-15T12:00:00Z",
+            kind="decision", source="p2_onboarding",
+            content={"text": "missing", "structured": {
+                "contract_version": "p2.v0",
+                "plan_id": "a" * 64,
+            }},
+            tags=["p2_onboarding", "decision"],
+            refs=["rct_00000000-0000-0000-0000-000000000999"],
+        )
+        store.write_packet(packet)
+        store.close()
+        result = rehydrate_onboarding(project_path=initialized_project)
+        assert result["status"] == "error"
+        assert len(result.get("packets", [])) == 0
+        assert len(result.get("receipts", [])) == 0
+
+    def test_rehydrate_mismatched_plan_ids(self, initialized_project):
+        _forge_evidence(initialized_project,
+            receipt_kwargs={"action": Action(type="agent_message", tool=None,
+                params={"contract_version": "p2.v0", "approved_plan_id": "b" * 64},
+                agent="p2_onboarding")})
+        result = rehydrate_onboarding(project_path=initialized_project)
+        assert result["status"] == "error"
+        assert len(result.get("packets", [])) == 0
+        assert len(result.get("receipts", [])) == 0
+
+    def test_rehydrate_mismatched_sessions(self, initialized_project):
+        _forge_evidence(initialized_project,
+            receipt_kwargs={"session_id": "p2_onboard_wrong_session"})
+        result = rehydrate_onboarding(project_path=initialized_project)
+        assert result["status"] == "error"
+        assert len(result.get("packets", [])) == 0
+        assert len(result.get("receipts", [])) == 0
+
+    def test_rehydrate_receipt_not_referencing_packet(self, initialized_project):
+        _forge_evidence(initialized_project,
+            receipt_kwargs={"result": Result(status="ok", summary="no ref", packet_ids=["ctx_other"])})
+        result = rehydrate_onboarding(project_path=initialized_project)
+        assert result["status"] == "error"
+        assert len(result.get("packets", [])) == 0
+        assert len(result.get("receipts", [])) == 0
+
+    def test_rehydrate_failed_receipt_status(self, initialized_project):
+        _forge_evidence(initialized_project,
+            receipt_kwargs={"result": Result(status="error", summary="failed", packet_ids=[])})
+        result = rehydrate_onboarding(project_path=initialized_project)
+        assert result["status"] == "error"
+        assert len(result.get("packets", [])) == 0
+        assert len(result.get("receipts", [])) == 0
+
+    def test_rehydrate_malformed_contract_version(self, initialized_project):
+        _forge_evidence(initialized_project,
+            packet_kwargs={"content": {"text": "bad version", "structured": {
+                "contract_version": "p1.v0",
+                "plan_id": "f" * 64,
+            }}})
+        result = rehydrate_onboarding(project_path=initialized_project)
+        assert result["status"] == "error"
+        assert len(result.get("packets", [])) == 0
+        assert len(result.get("receipts", [])) == 0
+
+    def test_rehydrate_invalid_plan_id_format(self, initialized_project):
+        _forge_evidence(initialized_project,
+            packet_kwargs={"content": {"text": "bad plan_id", "structured": {
+                "contract_version": "p2.v0",
+                "plan_id": "not-a-valid-plan-id",
+            }}})
+        result = rehydrate_onboarding(project_path=initialized_project)
+        assert result["status"] == "error"
+        assert len(result.get("packets", [])) == 0
+        assert len(result.get("receipts", [])) == 0

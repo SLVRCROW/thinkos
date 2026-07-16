@@ -16,6 +16,7 @@ Safe defaults are explained rather than asked about:
 import hashlib
 import json
 import os
+import re
 import sqlite3
 import sys
 import uuid
@@ -44,6 +45,7 @@ from thinkos.store.sqlite_store import SQLiteStore
 # ── Constants ──────────────────────────────────────────────────────────────
 
 CONTRACT_VERSION = "p2.v0"
+_PLAN_ID_RE = re.compile(r"^[0-9a-f]{64}$")
 
 SAFE_DEFAULTS = {
     "reads": "always_allow",
@@ -55,17 +57,32 @@ SAFE_DEFAULTS = {
 # ── Read-only SQLite helpers ──────────────────────────────────────────────
 
 
-def _open_ro(store_db_path: str):
+def _open_ro(store_db_path: str, project_root: str | None = None):
     """Open a SQLite database in read-only URI mode.
 
     Returns (connection, None) on success, (None, error_message) on failure.
     Never creates WAL, SHM, tables, or temp files.
-    Rejects paths outside .thinkos/.
+
+    When project_root is provided, the store path must be inside the
+    project's .thinkos/ directory.  Without project_root, the path must
+    contain a ".thinkos" path component.
     """
     if not os.path.isfile(store_db_path):
         return None, "Store database not found"
-    if ".thinkos" not in store_db_path.replace("\\", "/").split("/"):
-        return None, "Store path is outside .thinkos/ directory"
+    if project_root is not None:
+        # Canonical boundary check: store must be inside project_root/.thinkos/
+        try:
+            store_canon = str(Path(store_db_path).resolve())
+            root_canon = str(Path(project_root).resolve())
+            expected_prefix = os.path.join(root_canon, THINKOS_DIR) + os.sep
+            if not store_canon.startswith(expected_prefix):
+                return None, "Store path is outside the project's .thinkos/ directory"
+        except (OSError, RuntimeError):
+            return None, "Cannot resolve store or project path"
+    else:
+        # Fallback: check for .thinkos path component
+        if ".thinkos" not in store_db_path.replace("\\", "/").split("/"):
+            return None, "Store path is outside .thinkos/ directory"
     try:
         abs_path = str(Path(store_db_path).resolve())
         db_uri = Path(abs_path).as_uri()
@@ -84,17 +101,20 @@ def _close_ro(conn):
             pass
 
 
-# ── Completion evidence validation ────────────────────────────────────────
+# ── Shared evidence-pair validator ─────────────────────────────────────────
 
 
-def _validate_completion_evidence(store_db_path: str) -> bool:
-    """Validate that a complete, internally consistent P2 onboarding
-    evidence pair exists in the store.
+def _fetch_validated_evidence_pairs(conn):
+    """Fetch and validate P2 onboarding evidence pairs from an open
+    read-only connection.
 
-    A decision packet alone does not count as completion.  Requires:
-    - packet kind=decision and source=p2_onboarding
+    Returns a list of dicts, each containing a fully validated
+    (packet, receipt) pair.  Every pair satisfies all consistency
+    checks:
+
+    - packet kind=decision, source=p2_onboarding
     - packet content.contract_version == p2.v0
-    - packet content.plan_id is a valid non-empty string
+    - packet content.plan_id is exactly 64 lowercase hex characters
     - session_id matches p2_onboard_{plan_id}
     - referenced receipt exists in the same session
     - receipt action.type == agent_message
@@ -102,101 +122,169 @@ def _validate_completion_evidence(store_db_path: str) -> bool:
     - receipt result.status == ok
     - receipt result.packet_ids references the packet
 
+    Orphan packets, missing receipts, mismatched sessions, mismatched
+    plan IDs, failed receipts, broken cross-references, and malformed
+    contract versions are all silently excluded.
+
+    Strictly read-only.  Never creates or modifies the database.
+    """
+    rows = conn.execute(
+        "SELECT packet_id, session_id, timestamp, kind, source, "
+        "content_text, content_structured, tags, refs "
+        "FROM packets WHERE kind = ? AND source = ? ORDER BY timestamp DESC LIMIT 10",
+        ("decision", "p2_onboarding"),
+    ).fetchall()
+
+    pairs = []
+
+    for row in rows:
+        packet_id, session_id, p_timestamp, kind, source, content_text, content_json, tags_json, refs_json = row
+
+        # Parse content_structured
+        if not content_json:
+            continue
+        try:
+            content_structured = json.loads(content_json)
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if not isinstance(content_structured, dict):
+            continue
+
+        # Check contract version
+        if content_structured.get("contract_version") != CONTRACT_VERSION:
+            continue
+
+        # Check plan_id is exactly 64 lowercase hex chars
+        plan_id = content_structured.get("plan_id", "")
+        if not isinstance(plan_id, str) or not _PLAN_ID_RE.match(plan_id):
+            continue
+
+        # Check session_id matches p2_onboard_{plan_id}
+        expected_session = f"p2_onboard_{plan_id}"
+        if session_id != expected_session:
+            continue
+
+        # Parse refs
+        if not refs_json:
+            continue
+        try:
+            refs = json.loads(refs_json)
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if not isinstance(refs, list) or not refs:
+            continue
+
+        # Check each referenced receipt
+        for receipt_id in refs:
+            if not isinstance(receipt_id, str) or not receipt_id.startswith("rct_"):
+                continue
+            rrow = conn.execute(
+                "SELECT receipt_id, session_id, timestamp, action_type, action_params, "
+                "result_status, result_packet_ids "
+                "FROM receipts WHERE receipt_id = ?", (receipt_id,)
+            ).fetchone()
+            if rrow is None:
+                continue
+
+            (r_id, r_session, r_timestamp, r_action_type,
+             r_params_json, r_status, r_packet_ids_json) = rrow
+
+            # Same session
+            if r_session != session_id:
+                continue
+
+            # action.type == agent_message
+            if r_action_type != "agent_message":
+                continue
+
+            # result.status == ok
+            if r_status != "ok":
+                continue
+
+            # result.packet_ids references this packet
+            if not r_packet_ids_json:
+                continue
+            try:
+                r_packet_ids = json.loads(r_packet_ids_json)
+            except (json.JSONDecodeError, TypeError):
+                continue
+            if not isinstance(r_packet_ids, list) or packet_id not in r_packet_ids:
+                continue
+
+            # action.params.approved_plan_id matches
+            if r_params_json:
+                try:
+                    r_params = json.loads(r_params_json)
+                except (json.JSONDecodeError, TypeError):
+                    r_params = {}
+            else:
+                r_params = {}
+            if r_params.get("approved_plan_id") != plan_id:
+                continue
+
+            # Build packet output
+            content = {"text": content_text, "structured": content_structured}
+            p_tags = []
+            if tags_json:
+                try:
+                    p_tags = json.loads(tags_json)
+                except (json.JSONDecodeError, TypeError):
+                    pass
+            p_refs = []
+            if refs_json:
+                try:
+                    p_refs = json.loads(refs_json)
+                except (json.JSONDecodeError, TypeError):
+                    pass
+
+            # Build receipt output
+            r_params_out = None
+            if r_params_json:
+                try:
+                    r_params_out = json.loads(r_params_json)
+                except (json.JSONDecodeError, TypeError):
+                    pass
+
+            pairs.append({
+                "packet": {
+                    "packet_id": packet_id,
+                    "session_id": session_id,
+                    "timestamp": p_timestamp,
+                    "kind": kind,
+                    "source": source,
+                    "content": content,
+                    "tags": p_tags,
+                    "refs": p_refs,
+                },
+                "receipt": {
+                    "receipt_id": r_id,
+                    "session_id": r_session,
+                    "timestamp": r_timestamp,
+                    "action_type": r_action_type,
+                    "action_params": r_params_out,
+                    "result_status": r_status,
+                },
+            })
+            # Only one valid receipt per packet needed
+            break
+
+    return pairs
+
+
+# ── Completion evidence check ──────────────────────────────────────────────
+
+
+def _validate_completion_evidence(store_db_path: str) -> bool:
+    """Return True if at least one fully validated evidence pair exists.
+
     Strictly read-only.  Never creates or modifies the database.
     """
     conn, err = _open_ro(store_db_path)
     if conn is None:
         return False
     try:
-        # Find candidate decision packets
-        rows = conn.execute(
-            "SELECT packet_id, session_id, content_structured, refs "
-            "FROM packets WHERE kind = ? AND source = ? ORDER BY timestamp DESC LIMIT 5",
-            ("decision", "p2_onboarding"),
-        ).fetchall()
-        if not rows:
-            return False
-
-        for row in rows:
-            packet_id, session_id, content_json, refs_json = row
-            if not content_json:
-                continue
-            try:
-                content = json.loads(content_json)
-            except (json.JSONDecodeError, TypeError):
-                continue
-
-            # Check contract version
-            if content.get("contract_version") != CONTRACT_VERSION:
-                continue
-
-            # Check plan_id is present and non-empty
-            plan_id = content.get("plan_id", "")
-            if not isinstance(plan_id, str) or not plan_id:
-                continue
-
-            # Check session_id matches p2_onboard_{plan_id}
-            expected_session = f"p2_onboard_{plan_id}"
-            if session_id != expected_session:
-                continue
-
-            # Check refs list is non-empty
-            if not refs_json:
-                continue
-            try:
-                refs = json.loads(refs_json)
-            except (json.JSONDecodeError, TypeError):
-                continue
-            if not isinstance(refs, list) or not refs:
-                continue
-
-            # Check each referenced receipt
-            for receipt_id in refs:
-                if not isinstance(receipt_id, str) or not receipt_id.startswith("rct_"):
-                    continue
-                rrow = conn.execute(
-                    "SELECT session_id, action_type, action_params, result_status, result_packet_ids "
-                    "FROM receipts WHERE receipt_id = ?", (receipt_id,)
-                ).fetchone()
-                if rrow is None:
-                    continue
-
-                r_session, r_action_type, r_params_json, r_status, r_packet_ids_json = rrow
-
-                # Same session
-                if r_session != session_id:
-                    continue
-
-                # action.type == agent_message
-                if r_action_type != "agent_message":
-                    continue
-
-                # result.status == ok
-                if r_status != "ok":
-                    continue
-
-                # result.packet_ids references this packet
-                if not r_packet_ids_json:
-                    continue
-                try:
-                    r_packet_ids = json.loads(r_packet_ids_json)
-                except (json.JSONDecodeError, TypeError):
-                    continue
-                if not isinstance(r_packet_ids, list) or packet_id not in r_packet_ids:
-                    continue
-
-                # action.params.approved_plan_id matches
-                if r_params_json:
-                    try:
-                        r_params = json.loads(r_params_json)
-                    except (json.JSONDecodeError, TypeError):
-                        r_params = {}
-                else:
-                    r_params = {}
-                if r_params.get("approved_plan_id") == plan_id:
-                    return True
-
-        return False
+        pairs = _fetch_validated_evidence_pairs(conn)
+        return len(pairs) > 0
     except (sqlite3.Error, OSError, Exception):
         return False
     finally:
@@ -328,7 +416,6 @@ def inspect(project_path: str | None = None) -> dict:
     """
     resolved = _canonicalize_path(_resolve_project_path(project_path))
 
-    # Validate the path exists and is a directory
     if not os.path.isdir(resolved):
         return {
             "status": "error",
@@ -411,7 +498,6 @@ def _compute_plan_id(payload: dict) -> str:
     Excludes timestamps and nondeterministic values.
     Repeated planning against unchanged state produces the same plan_id.
     """
-    # Create a clean copy with only deterministic fields
     clean = {
         "contract_version": payload["contract_version"],
         "project_root": payload["project_root"],
@@ -492,7 +578,6 @@ def apply(project_path: str | None = None, approved_plan_id: str | None = None,
     """
     resolved = _canonicalize_path(_resolve_project_path(project_path))
 
-    # ── Validate approval ────────────────────────────────────────────
     if not approved_plan_id:
         return {
             "status": "error",
@@ -505,7 +590,6 @@ def apply(project_path: str | None = None, approved_plan_id: str | None = None,
             "error": "Approved plan_id must be a non-empty string",
         }
 
-    # ── Reinspect and recompute plan ──────────────────────────────────
     if not os.path.isdir(resolved):
         return {
             "status": "error",
@@ -516,7 +600,6 @@ def apply(project_path: str | None = None, approved_plan_id: str | None = None,
     payload = _build_plan_payload(state_info)
     current_plan_id = _compute_plan_id(payload)
 
-    # ── Reject stale or mismatched approval ───────────────────────────
     if current_plan_id != approved_plan_id:
         return {
             "status": "error",
@@ -528,7 +611,6 @@ def apply(project_path: str | None = None, approved_plan_id: str | None = None,
             ),
         }
 
-    # ── Reject blocked plans ──────────────────────────────────────────
     if payload["blocked_reasons"]:
         return {
             "status": "blocked",
@@ -537,7 +619,6 @@ def apply(project_path: str | None = None, approved_plan_id: str | None = None,
             "plan_id": current_plan_id,
         }
 
-    # ── No-op for already-complete ────────────────────────────────────
     if payload["observed_state"] == "healthy" and state_info.get("p2_complete"):
         return {
             "status": "ok",
@@ -546,10 +627,8 @@ def apply(project_path: str | None = None, approved_plan_id: str | None = None,
             "effects_applied": [],
         }
 
-    # ── Execute effects ────────────────────────────────────────────────
     effects_applied = []
 
-    # Effect 1-4: P1 init (for empty projects)
     if payload["observed_state"] == "empty":
         init_result = _p1_init(project_path=resolved, json_output=json_output, quiet=json_output)
         if init_result["status"] == "error":
@@ -561,7 +640,6 @@ def apply(project_path: str | None = None, approved_plan_id: str | None = None,
             }
         effects_applied.append({"action": "p1_init", "status": "ok"})
 
-    # Effect: verify health via P1 doctor
     doctor_result = _p1_doctor(project_path=resolved, json_output=json_output, quiet=json_output)
     if doctor_result["status"] != "healthy":
         return {
@@ -573,10 +651,8 @@ def apply(project_path: str | None = None, approved_plan_id: str | None = None,
         }
     effects_applied.append({"action": "p1_doctor", "status": "healthy"})
 
-    # Effect: persist completion evidence
     evidence_result = _persist_completion_evidence(resolved, current_plan_id, payload)
     if evidence_result["status"] != "ok":
-        # Partial failure: P1 installation is healthy but evidence not persisted
         return {
             "status": "partial",
             "error": evidence_result.get("error", "Failed to persist completion evidence"),
@@ -607,7 +683,6 @@ def _persist_completion_evidence(project_path: str, plan_id: str, plan_payload: 
     session_id = _derive_onboarding_session_id(plan_id)
     now = datetime.now(timezone.utc).isoformat()
 
-    # Build receipt
     receipt_id = f"rct_{uuid.uuid4()}"
     receipt = Receipt(
         receipt_id=receipt_id,
@@ -631,7 +706,6 @@ def _persist_completion_evidence(project_path: str, plan_id: str, plan_payload: 
         gate=None,
     )
 
-    # Build context packet
     packet_id = f"ctx_{uuid.uuid4()}"
     packet = ContextPacket(
         packet_id=packet_id,
@@ -654,7 +728,6 @@ def _persist_completion_evidence(project_path: str, plan_id: str, plan_payload: 
         refs=[receipt_id],
     )
 
-    # Validate both objects
     receipt_errors = validate_receipt(receipt)
     if receipt_errors:
         return {"status": "error", "error": f"Receipt validation failed: {'; '.join(receipt_errors)}"}
@@ -663,10 +736,8 @@ def _persist_completion_evidence(project_path: str, plan_id: str, plan_payload: 
     if packet_errors:
         return {"status": "error", "error": f"Packet validation failed: {'; '.join(packet_errors)}"}
 
-    # Link receipt to packet
     receipt.result.packet_ids = [packet_id]
 
-    # Atomic write
     try:
         store = SQLiteStore(store_db_path)
         store.write_receipt_and_packet(receipt, packet)
@@ -691,8 +762,14 @@ def rehydrate_onboarding(project_path: str | None = None) -> dict:
     Strictly read-only. Uses SQLite URI mode=ro.
     Never creates or modifies the database.
 
-    Uses the deterministic session ID derived from the plan to find
-    the completion evidence without user protocol knowledge.
+    Uses the shared _fetch_validated_evidence_pairs validator, so only
+    fully consistent receipt+packet pairs are returned.  Orphan packets,
+    missing receipts, mismatched sessions, mismatched plan IDs, failed
+    receipts, broken cross-references, and malformed contract versions
+    are all silently excluded.
+
+    If the database contains only invalid evidence, returns an error
+    with zero packets and zero receipts.
 
     Args:
         project_path: Path to the project directory. Defaults to CWD.
@@ -703,92 +780,20 @@ def rehydrate_onboarding(project_path: str | None = None) -> dict:
     resolved = _canonicalize_path(_resolve_project_path(project_path))
     store_db_path = _store_path(resolved)
 
-    conn, err = _open_ro(store_db_path)
+    conn, err = _open_ro(store_db_path, project_root=resolved)
     if conn is None:
         return {"status": "error", "error": err or "Store database not found"}
 
     try:
-        # Find candidate decision packets
-        rows = conn.execute(
-            "SELECT packet_id, session_id, timestamp, kind, source, "
-            "content_text, content_structured, tags, refs "
-            "FROM packets WHERE kind = ? AND source = ? ORDER BY timestamp DESC LIMIT 5",
-            ("decision", "p2_onboarding"),
-        ).fetchall()
+        pairs = _fetch_validated_evidence_pairs(conn)
 
-        if not rows:
-            return {"status": "error", "error": "No P2 onboarding evidence found in store"}
-
-        packets_out = []
-        receipts_out = []
-
-        for row in rows:
-            packet_id, session_id, timestamp, kind, source, content_text, content_json, tags_json, refs_json = row
-
-            # Parse content
-            content = {"text": content_text, "structured": None}
-            if content_json:
-                try:
-                    content["structured"] = json.loads(content_json)
-                except (json.JSONDecodeError, TypeError):
-                    pass
-
-            # Parse tags
-            tags = []
-            if tags_json:
-                try:
-                    tags = json.loads(tags_json)
-                except (json.JSONDecodeError, TypeError):
-                    pass
-
-            # Parse refs
-            refs = []
-            if refs_json:
-                try:
-                    refs = json.loads(refs_json)
-                except (json.JSONDecodeError, TypeError):
-                    pass
-
-            packets_out.append({
-                "packet_id": packet_id,
-                "session_id": session_id,
-                "timestamp": timestamp,
-                "kind": kind,
-                "source": source,
-                "content": content,
-                "tags": tags,
-                "refs": refs,
-            })
-
-            # Look up referenced receipts
-            for ref in refs:
-                if not isinstance(ref, str) or not ref.startswith("rct_"):
-                    continue
-                rrow = conn.execute(
-                    "SELECT receipt_id, session_id, timestamp, action_type, action_params, result_status "
-                    "FROM receipts WHERE receipt_id = ?", (ref,)
-                ).fetchone()
-                if rrow is None:
-                    continue
-                r_params = None
-                if rrow[4]:
-                    try:
-                        r_params = json.loads(rrow[4])
-                    except (json.JSONDecodeError, TypeError):
-                        pass
-                receipts_out.append({
-                    "receipt_id": rrow[0],
-                    "session_id": rrow[1],
-                    "timestamp": rrow[2],
-                    "action_type": rrow[3],
-                    "action_params": r_params,
-                    "result_status": rrow[5],
-                })
+        if not pairs:
+            return {"status": "error", "error": "No valid P2 onboarding evidence found in store"}
 
         return {
             "status": "ok",
-            "packets": packets_out,
-            "receipts": receipts_out,
+            "packets": [p["packet"] for p in pairs],
+            "receipts": [p["receipt"] for p in pairs],
         }
     except (sqlite3.Error, OSError, Exception) as e:
         return {"status": "error", "error": f"Failed to rehydrate onboarding evidence: {e}"}
