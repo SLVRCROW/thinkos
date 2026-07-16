@@ -133,6 +133,30 @@ For backward compatibility, you can still create a `thinkos.json` or `.thinkos.j
 
 ## Usage
 
+### Agent-led onboarding (P2 v0)
+
+ThinkOS provides a provider-neutral contract through which an agent can inspect project state, generate a deterministic plan, bind approval to that plan, and delegate setup to P1 init and doctor.
+
+**Safe defaults** (explained, not asked):
+- reads are automatically allowed inside the project
+- writes require approval
+- file access is sandboxed to the project
+- resumable history is stored locally
+
+```
+thinkos onboard inspect [PROJECT_PATH] [--json]
+thinkos onboard plan [PROJECT_PATH] [--json]
+thinkos onboard apply [PROJECT_PATH] --approve-plan PLAN_ID [--json]
+```
+
+**Inspect** — Read-only project state classification. Reports `empty`, `healthy`, `unhealthy`, or `conflict`.
+
+**Plan** — Generates a deterministic plan with a SHA-256 `plan_id`. Repeated planning against unchanged state produces the same `plan_id`. Conflict or unhealthy states produce a blocked plan.
+
+**Apply** — Requires the exact `plan_id` from a prior plan. Reinspects and recomputes the plan before any mutation. Delegates initialization to P1 init and health verification to P1 doctor. Persists completion evidence as an atomic receipt + context packet pair.
+
+**Fresh-successor rehydration** — A successor process can recover onboarding evidence using the deterministic session ID derived from the plan_id, without user protocol knowledge.
+
 ### Write a file
 
 ```json
@@ -294,6 +318,7 @@ python -m benchmarks.context_efficiency_v0
 - **ConfirmGate** — Interactive write approval gate with automatic read passes.
 - **HandoffRecord** with `expires_at`, `evidence_policy: "evidence_only"`, and `authority_transfer: "none"`.
 - **G0 Context-Efficiency Benchmark** — Deterministic measurement chassis for context-efficiency evaluation across architecture regimes. Standard-library-only. No model, API, or network calls. See [`benchmarks/context_efficiency_v0/README.md`](benchmarks/context_efficiency_v0/README.md).
+- **P2 Agent-Led Onboarding v0** — Provider-neutral contract for agent-led project setup: inspect, plan, apply with SHA-256 plan binding, P1 delegation, atomic completion evidence, and fresh-process rehydration. See [`thinkos/agent_onboarding.py`](thinkos/agent_onboarding.py).
 
 **Planned:**
 - Additional tool types

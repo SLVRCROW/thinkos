@@ -196,11 +196,17 @@ def _atomic_write_text(path: str, content: str) -> None:
 def init(
     project_path: str | None = None,
     json_output: bool = False,
+    quiet: bool = False,
 ) -> dict:
     """Initialize ThinkOS for a project.
 
     Creates a safe, persistent ThinkOS configuration in .thinkos/ under the
     project directory.
+
+    Args:
+        project_path: Path to the project directory. Defaults to CWD.
+        json_output: If True, print JSON output instead of human-readable.
+        quiet: If True, suppress all print output. Overrides json_output.
 
     Returns a dict with status and message fields.
     """
@@ -219,6 +225,7 @@ def init(
                 "ThinkOS directory '.thinkos/' is a symlink. Refusing to initialise "
                 "over a symlink. Remove the symlink and retry.",
                 json_output,
+                quiet=quiet,
             )
 
         # Check if existing config matches
@@ -231,6 +238,7 @@ def init(
                     f"ThinkOS is already initialised for '{resolved}'.",
                     json_output,
                     already_initialized=True,
+                    quiet=quiet,
                 )
             else:
                 return _init_result(
@@ -239,6 +247,7 @@ def init(
                     f"default. Refusing to overwrite. Remove or rename the "
                     f"existing '.thinkos/' directory and retry.",
                     json_output,
+                    quiet=quiet,
                 )
 
         # Config exists but is malformed
@@ -249,6 +258,7 @@ def init(
                 f"unreadable. Refusing to overwrite. Remove or rename the "
                 f"existing '.thinkos/' directory and retry.",
                 json_output,
+                quiet=quiet,
             )
 
         # .thinkos/ exists but no config — unexpected state
@@ -258,6 +268,7 @@ def init(
             f"no valid configuration. Refusing to initialise over an existing "
             f"directory. Remove or rename '.thinkos/' and retry.",
             json_output,
+            quiet=quiet,
         )
 
     # ── Legacy-config shadowing prevention ──────────────────────────
@@ -274,6 +285,7 @@ def init(
                 f"discovery priority over '{legacy_name}'. Remove or rename "
                 f"'{legacy_name}' first, or use it directly without 'thinkos init'.",
                 json_output,
+                quiet=quiet,
             )
 
     # ── Path-escape check ─────────────────────────────────────────────
@@ -285,6 +297,7 @@ def init(
             f"Project path '{resolved}' cannot be resolved. Check that the "
             f"directory exists and is accessible.",
             json_output,
+            quiet=quiet,
         )
 
     if not resolved_real.is_dir():
@@ -292,6 +305,7 @@ def init(
             False,
             f"Project path '{resolved}' does not exist or is not a directory.",
             json_output,
+            quiet=quiet,
         )
 
     # ── Build and write config ───────────────────────────────────────
@@ -305,6 +319,7 @@ def init(
             False,
             f"Failed to write configuration: {e}",
             json_output,
+            quiet=quiet,
         )
 
     # ── Write .gitignore ──────────────────────────────────────────────
@@ -316,6 +331,7 @@ def init(
             False,
             f"Failed to write .gitignore: {e}",
             json_output,
+            quiet=quiet,
         )
 
     # ── Create empty SQLite database ─────────────────────────────────
@@ -330,12 +346,14 @@ def init(
             False,
             f"Failed to create persistent store: {e}",
             json_output,
+            quiet=quiet,
         )
 
     return _init_result(
         True,
         f"ThinkOS initialised for '{resolved}'.",
         json_output,
+        quiet=quiet,
     )
 
 
@@ -351,11 +369,14 @@ def _init_result(
     message: str,
     json_output: bool,
     already_initialized: bool = False,
+    quiet: bool = False,
 ) -> dict:
     """Format the init result.
 
     already_initialized → exit 0.
     error → exit 1 (both human and JSON modes).
+
+    When quiet=True, suppresses all print output.
     """
     if already_initialized:
         status = "already_initialized"
@@ -366,16 +387,17 @@ def _init_result(
 
     result = {"status": status, "message": message}
 
-    if json_output:
-        print(json.dumps(result))
-    else:
-        if already_initialized:
-            prefix = "✓"
-        elif success:
-            prefix = "✓"
+    if not quiet:
+        if json_output:
+            print(json.dumps(result))
         else:
-            prefix = "✗"
-        print(f"{prefix} {message}")
+            if already_initialized:
+                prefix = "✓"
+            elif success:
+                prefix = "✓"
+            else:
+                prefix = "✗"
+            print(f"{prefix} {message}")
 
     return result
 
@@ -418,11 +440,17 @@ def _resolve_actual_store_path(config: dict, project_root: str) -> str | None:
 def doctor(
     project_path: str | None = None,
     json_output: bool = False,
+    quiet: bool = False,
 ) -> dict:
     """Check ThinkOS installation health for a project.
 
     Read-only. Returns a findings dict and prints human or JSON output.
     Exits with code 0 only when all checks pass.
+
+    Args:
+        project_path: Path to the project directory. Defaults to CWD.
+        json_output: If True, print JSON output instead of human-readable.
+        quiet: If True, suppress all print output. Overrides json_output.
     """
     resolved = _resolve_project_path(project_path)
     thinkos_dir_path = _thinkos_dir(resolved)
@@ -467,7 +495,7 @@ def doctor(
             "detail": f"'.thinkos/' directory not found at '{resolved}'",
         })
         # Cannot proceed with further checks that depend on config
-        return _doctor_output(findings, all_healthy, resolved, json_output)
+        return _doctor_output(findings, all_healthy, resolved, json_output, quiet=quiet)
 
     if not os.path.isfile(cfg_path):
         all_healthy = False
@@ -476,7 +504,7 @@ def doctor(
             "status": "unhealthy",
             "detail": f"Config file not found at '{cfg_path}'",
         })
-        return _doctor_output(findings, all_healthy, resolved, json_output)
+        return _doctor_output(findings, all_healthy, resolved, json_output, quiet=quiet)
 
     findings.append({
         "check": "config_presence",
@@ -493,7 +521,7 @@ def doctor(
             "status": "unhealthy",
             "detail": f"Config at '{cfg_path}' is malformed or unreadable",
         })
-        return _doctor_output(findings, all_healthy, resolved, json_output)
+        return _doctor_output(findings, all_healthy, resolved, json_output, quiet=quiet)
 
     # Semantic validation
     semantic_errors: list[str] = []
@@ -714,7 +742,7 @@ def doctor(
             "detail": "No existing database to check (will be created on first use)",
         })
 
-    return _doctor_output(findings, all_healthy, resolved, json_output)
+    return _doctor_output(findings, all_healthy, resolved, json_output, quiet=quiet)
 
 
 def _doctor_output(
@@ -722,22 +750,27 @@ def _doctor_output(
     all_healthy: bool,
     resolved: str,
     json_output: bool,
+    quiet: bool = False,
 ) -> dict:
-    """Format and print doctor output."""
-    if json_output:
-        output = {
-            "status": "healthy" if all_healthy else "unhealthy",
-            "findings": findings,
-        }
-        print(json.dumps(output, indent=2))
-    else:
-        status_line = "✓ All checks passed" if all_healthy else "✗ Some checks failed"
-        print(f"ThinkOS Doctor — {resolved}")
-        print(f"Status: {status_line}")
-        print()
-        for f in findings:
-            icon = "✓" if f["status"] == "ok" else "✗"
-            print(f"  {icon} {f['check']}: {f['detail']}")
+    """Format and print doctor output.
+
+    When quiet=True, suppresses all print output.
+    """
+    if not quiet:
+        if json_output:
+            output = {
+                "status": "healthy" if all_healthy else "unhealthy",
+                "findings": findings,
+            }
+            print(json.dumps(output, indent=2))
+        else:
+            status_line = "✓ All checks passed" if all_healthy else "✗ Some checks failed"
+            print(f"ThinkOS Doctor — {resolved}")
+            print(f"Status: {status_line}")
+            print()
+            for f in findings:
+                icon = "✓" if f["status"] == "ok" else "✗"
+                print(f"  {icon} {f['check']}: {f['detail']}")
 
     return {
         "status": "healthy" if all_healthy else "unhealthy",
