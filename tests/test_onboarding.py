@@ -736,7 +736,7 @@ class TestCLI:
         """Init command must not initialize the engine."""
         result = _run_thinkos("init", tmp_project)
         assert result.returncode == 0
-        assert "✓" in result.stdout or "ok" in result.stdout.lower()
+        assert "[OK]" in result.stdout or "ok" in result.stdout.lower()
 
     def test_doctor_does_not_initialize_engine(self, tmp_project):
         """Doctor command must not initialize the engine."""
@@ -1073,7 +1073,8 @@ class TestUtilities:
         """_resolve_actual_store_path resolves relative paths against project root."""
         config = {"store": {"path": "thinkos.sqlite"}}
         result = _resolve_actual_store_path(config, "/proj")
-        assert result == "/proj/thinkos.sqlite"
+        expected = os.path.join("/proj", "thinkos.sqlite")
+        assert result == expected
 
     def test_resolve_actual_store_path_none(self):
         """_resolve_actual_store_path returns None for null path."""
