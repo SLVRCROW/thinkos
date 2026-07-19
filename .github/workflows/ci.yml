@@ -12,7 +12,12 @@ permissions:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
 
     steps:
       - uses: actions/checkout@v4
@@ -30,6 +35,10 @@ jobs:
 
       - name: Run tests
         run: python -m pytest tests/ -v --tb=short
+
+      - name: Run Windows smoke test
+        if: runner.os == 'Windows'
+        run: python -m pytest tests/test_windows_smoke.py -v --tb=short
 
       - name: Run benchmark tests
         run: python -m pytest benchmarks/context_efficiency_v0/tests/ -q

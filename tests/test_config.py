@@ -2,11 +2,24 @@
 
 import json
 import tempfile
+import ntpath
 import os
 import pytest
+
+from thinkos import config as config_module
 from thinkos.config import load_config, resolve_gate, get_allowed_root, validate_config
 from thinkos.gates.always_allow import AlwaysAllowGate
 from thinkos.gates.confirm import ConfirmGate
+
+
+class TestWindowsConfigRoot:
+    def test_thinkos_directory_uses_native_windows_parent(self):
+        result = config_module._config_root_from_path(
+            r"C:\work\project\.thinkos\thinkos.json",
+            path_module=ntpath,
+        )
+
+        assert result == r"C:\work\project"
 
 
 class TestLoadConfig:

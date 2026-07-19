@@ -39,6 +39,14 @@ DEFAULT_CONFIG = {
 }
 
 
+def _config_root_from_path(resolved_path: str, path_module=os.path) -> str:
+    """Return a config's workspace root while preserving native path syntax."""
+    config_dir = path_module.dirname(resolved_path)
+    if path_module.basename(config_dir) == ".thinkos":
+        return path_module.dirname(config_dir)
+    return config_dir
+
+
 def _resolve_default_root(config_path: str | None) -> str:
     """Determine the default allowed root from the environment.
 
@@ -47,12 +55,7 @@ def _resolve_default_root(config_path: str | None) -> str:
     """
     if config_path and os.path.isfile(config_path):
         resolved = os.path.abspath(config_path)
-        # If config is inside .thinkos/, the project root is the parent of .thinkos/
-        parts = resolved.replace("\\", "/").split("/")
-        if ".thinkos" in parts:
-            idx = parts.index(".thinkos")
-            return "/".join(parts[:idx])
-        return os.path.dirname(resolved)
+        return _config_root_from_path(resolved)
     return os.getcwd()
 
 
