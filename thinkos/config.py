@@ -125,6 +125,8 @@ def get_store_path(config: dict) -> str | None:
     path = config.get("store", {}).get("path")
     if path is None:
         return None
+    if path == ":memory:":
+        return None  # Always means in-memory, never resolve as relative path
     if os.path.isabs(path):
         return path
     # Relative path: resolve against workspace root
