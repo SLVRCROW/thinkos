@@ -38,7 +38,7 @@ class SQLiteStore:
 
     def __init__(self, db_path: str = ":memory:"):
         self._conn = sqlite3.connect(db_path)
-        self._conn.execute("PRAGMA journal_mode=WAL")
+        self._conn.execute("PRAGMA journal_mode=DELETE")
         self._init_tables()
 
     def _init_tables(self):

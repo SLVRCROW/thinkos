@@ -337,7 +337,7 @@ def init(
     # ── Create empty SQLite database ─────────────────────────────────
     try:
         conn = sqlite3.connect(store_db_path)
-        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA journal_mode=DELETE")
         conn.execute("VACUUM")
         conn.close()
     except sqlite3.Error as e:

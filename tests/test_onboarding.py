@@ -125,14 +125,14 @@ class TestInitBasic:
     def test_init_defaults_to_cwd(self):
         """Init defaults to current directory when no path given."""
         original_cwd = os.getcwd()
-        try:
-            with tempfile.TemporaryDirectory() as tmpdir:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            try:
                 os.chdir(tmpdir)
                 result = init()
                 assert result["status"] == "ok"
                 assert os.path.isdir(os.path.join(tmpdir, THINKOS_DIR))
-        finally:
-            os.chdir(original_cwd)
+            finally:
+                os.chdir(original_cwd)
 
     def test_init_with_explicit_path(self, tmp_project):
         """Init with explicit project path works."""
