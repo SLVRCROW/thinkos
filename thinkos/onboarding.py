@@ -337,9 +337,11 @@ def init(
     # ── Create empty SQLite database ─────────────────────────────────
     try:
         conn = sqlite3.connect(store_db_path)
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("VACUUM")
-        conn.close()
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("VACUUM")
+        finally:
+            conn.close()
     except sqlite3.Error as e:
         _cleanup_failed_init(thinkos_dir_path, cfg_path, gitignore_path, store_db_path)
         return _init_result(
@@ -392,11 +394,11 @@ def _init_result(
             print(json.dumps(result))
         else:
             if already_initialized:
-                prefix = "✓"
+                prefix = "[OK]"
             elif success:
-                prefix = "✓"
+                prefix = "[OK]"
             else:
-                prefix = "✗"
+                prefix = "[FAIL]"
             print(f"{prefix} {message}")
 
     return result
@@ -660,7 +662,7 @@ def doctor(
                     raise OSError("Store path resolved to None")
                 store_canonical = _canonicalize_path(actual_store_path)
                 project_canonical = _canonicalize_path(resolved)
-                if not store_canonical.startswith(project_canonical + "/") and store_canonical != project_canonical:
+                if not os.path.normcase(store_canonical).startswith(os.path.normcase(project_canonical) + os.sep) and os.path.normcase(store_canonical) != os.path.normcase(project_canonical):
                     all_healthy = False
                     findings.append({
                         "check": "store_config",
@@ -712,9 +714,11 @@ def doctor(
             abs_path = str(Path(db_path_for_check).resolve())
             db_uri = Path(abs_path).as_uri()
             conn = sqlite3.connect(db_uri + "?mode=ro", uri=True)
-            cursor = conn.execute("PRAGMA integrity_check")
-            integrity_result = cursor.fetchone()
-            conn.close()
+            try:
+                cursor = conn.execute("PRAGMA integrity_check")
+                integrity_result = cursor.fetchone()
+            finally:
+                conn.close()
             if integrity_result and integrity_result[0] == "ok":
                 findings.append({
                     "check": "sqlite_integrity",
@@ -764,12 +768,12 @@ def _doctor_output(
             }
             print(json.dumps(output, indent=2))
         else:
-            status_line = "✓ All checks passed" if all_healthy else "✗ Some checks failed"
+            status_line = "[OK] All checks passed" if all_healthy else "[FAIL] Some checks failed"
             print(f"ThinkOS Doctor — {resolved}")
             print(f"Status: {status_line}")
             print()
             for f in findings:
-                icon = "✓" if f["status"] == "ok" else "✗"
+                icon = "[OK]" if f["status"] == "ok" else "[FAIL]"
                 print(f"  {icon} {f['check']}: {f['detail']}")
 
     return {

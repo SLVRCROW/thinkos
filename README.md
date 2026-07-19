@@ -66,6 +66,23 @@ uv pip install .
 
 **Requirements:** Python 3.11 or later. No runtime dependencies. Build-time dependency: `setuptools` (installed automatically by pip).
 
+### Windows (PowerShell)
+
+ThinkOS is pure Python. No compiler, native libraries, or platform-specific runtime dependencies are required on Windows.
+
+```powershell
+git clone https://github.com/SLVRCROW/thinkos.git
+cd thinkos
+py -3.11 -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install .
+
+# Verify the CLI is available
+thinkos --help
+```
+
+For development, install pytest with `python -m pip install pytest`, then run `python -m pytest tests/ -v --tb=short`.
+
 **PyPI:** Not published yet. PyPI support is planned.
 
 ## Configuration

@@ -13,6 +13,21 @@ class SandboxError(PermissionError):
     pass
 
 
+def _is_path_within(path: str, root: str, path_module=os.path) -> bool:
+    """Return whether *path* is contained by *root* using host path rules.
+
+    Windows raises ``ValueError`` when ``commonpath`` compares different
+    drives. Treat that as outside the sandbox rather than leaking an
+    unexpected exception. ``normcase`` preserves POSIX behavior while making
+    Windows drive letters and path components case-insensitive.
+    """
+    try:
+        common = path_module.commonpath([path, root])
+    except ValueError:
+        return False
+    return path_module.normcase(common) == path_module.normcase(root)
+
+
 def resolve_path(path: str, allowed_root: str | None) -> str:
     """
     Resolve a path to its canonical form and verify containment.
@@ -43,9 +58,9 @@ def resolve_path(path: str, allowed_root: str | None) -> str:
     resolved = Path(path).resolve()
 
     # Containment via commonpath — handles prefix-matching edge cases
-    # that a simple startswith() would miss (e.g. /home/foo vs /home/foobar)
-    common = os.path.commonpath([str(resolved), str(allowed)])
-    if common != str(allowed):
+    # that a simple startswith() would miss (e.g. /home/foo vs /home/foobar).
+    # A Windows drive mismatch is outside the sandbox, not an internal error.
+    if not _is_path_within(str(resolved), str(allowed)):
         raise SandboxError(
             f"Access denied: path resolves to '{resolved}' "
             f"which is outside allowed root '{allowed}'"

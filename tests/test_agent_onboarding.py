@@ -53,7 +53,7 @@ def _thinkos_env() -> dict:
     repo = _repo_root()
     existing = env.get("PYTHONPATH", "")
     if existing:
-        env["PYTHONPATH"] = f"{repo}:{existing}"
+        env["PYTHONPATH"] = f"{repo}{os.pathsep}{existing}"
     else:
         env["PYTHONPATH"] = repo
     return env
@@ -63,7 +63,7 @@ def _run_thinkos(*args: str, cwd: str | None = None) -> subprocess.CompletedProc
     return subprocess.run(
         [sys.executable, "-m", "thinkos", *args],
         capture_output=True, text=True,
-        cwd=cwd or "/tmp",
+        cwd=cwd or tempfile.gettempdir(),
         env=_thinkos_env(),
     )
 
@@ -491,7 +491,7 @@ class TestFalsification:
             os.chdir(tmp_project)
             result = inspect(project_path="sub")
             assert result["status"] == "ok"
-            assert result["project_root"].endswith("/sub")
+            assert result["project_root"].endswith("/sub") or result["project_root"].endswith("\\sub")
         finally:
             os.chdir(original_cwd)
 

@@ -293,7 +293,10 @@ def main():
         handoff_service=handoff_service,
         identity_provider=identity_provider,
     )
-    engine.run()
+    try:
+        engine.run()
+    finally:
+        store.close()
 
 
 if __name__ == "__main__":

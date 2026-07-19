@@ -2,11 +2,56 @@
 
 import json
 import tempfile
+import ntpath
 import os
 import pytest
+
+from thinkos import config as config_module
 from thinkos.config import load_config, resolve_gate, get_allowed_root, validate_config
 from thinkos.gates.always_allow import AlwaysAllowGate
 from thinkos.gates.confirm import ConfirmGate
+
+
+class TestWindowsConfigRoot:
+    def test_thinkos_directory_uses_native_windows_parent(self):
+        result = config_module._config_root_from_path(
+            r"C:\work\project\.thinkos\thinkos.json",
+            path_module=ntpath,
+        )
+
+        assert result == r"C:\work\project"
+
+    def test_thinkos_uppercase_resolves_via_ntpath(self):
+        """Uppercase .THINKOS resolves to project parent via ntpath."""
+        result = config_module._config_root_from_path(
+            r"C:\work\project\.THINKOS\thinkos.json",
+            path_module=ntpath,
+        )
+        assert result == r"C:\work\project"
+
+    def test_thinkos_mixed_case_resolves_via_ntpath(self):
+        """Mixed-case .ThinkOS resolves to project parent via ntpath."""
+        result = config_module._config_root_from_path(
+            r"C:\work\project\.ThinkOS\thinkos.json",
+            path_module=ntpath,
+        )
+        assert result == r"C:\work\project"
+
+    def test_thinkos_lowercase_resolves_via_ntpath(self):
+        """Lowercase .thinkos resolves to project parent via ntpath."""
+        result = config_module._config_root_from_path(
+            r"C:\work\project\.thinkos\thinkos.json",
+            path_module=ntpath,
+        )
+        assert result == r"C:\work\project"
+
+    def test_non_thinkos_directory_returns_config_dir(self):
+        """A non-.thinkos directory returns the config dir itself."""
+        result = config_module._config_root_from_path(
+            r"C:\work\project\config\thinkos.json",
+            path_module=ntpath,
+        )
+        assert result == r"C:\work\project\config"
 
 
 class TestLoadConfig:
@@ -295,6 +340,8 @@ class TestMainStoreWiring:
                     def patched_init(self, db_path=":memory:"):
                         captured_paths.append(db_path)
                         original_init(self, db_path)
+                        # Close immediately to release file handle on Windows
+                        self._conn.close()
 
                     with patch("thinkos.store.sqlite_store.SQLiteStore.__init__", patched_init):
                         main()

@@ -61,7 +61,7 @@ def _run_thinkos(*args: str, cwd: str | None = None, input_str: str = "") -> sub
         [sys.executable, "-m", "thinkos", *args],
         input=input_str,
         capture_output=True, text=True,
-        cwd=cwd or "/tmp",
+        cwd=cwd or tempfile.gettempdir(),
         env=_thinkos_env(),
     )
 
@@ -125,14 +125,14 @@ class TestInitBasic:
     def test_init_defaults_to_cwd(self):
         """Init defaults to current directory when no path given."""
         original_cwd = os.getcwd()
-        try:
-            with tempfile.TemporaryDirectory() as tmpdir:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            try:
                 os.chdir(tmpdir)
                 result = init()
                 assert result["status"] == "ok"
                 assert os.path.isdir(os.path.join(tmpdir, THINKOS_DIR))
-        finally:
-            os.chdir(original_cwd)
+            finally:
+                os.chdir(original_cwd)
 
     def test_init_with_explicit_path(self, tmp_project):
         """Init with explicit project path works."""
@@ -736,7 +736,7 @@ class TestCLI:
         """Init command must not initialize the engine."""
         result = _run_thinkos("init", tmp_project)
         assert result.returncode == 0
-        assert "✓" in result.stdout or "ok" in result.stdout.lower()
+        assert "[OK]" in result.stdout or "ok" in result.stdout.lower()
 
     def test_doctor_does_not_initialize_engine(self, tmp_project):
         """Doctor command must not initialize the engine."""
@@ -1073,7 +1073,8 @@ class TestUtilities:
         """_resolve_actual_store_path resolves relative paths against project root."""
         config = {"store": {"path": "thinkos.sqlite"}}
         result = _resolve_actual_store_path(config, "/proj")
-        assert result == "/proj/thinkos.sqlite"
+        expected = os.path.join("/proj", "thinkos.sqlite")
+        assert result == expected
 
     def test_resolve_actual_store_path_none(self):
         """_resolve_actual_store_path returns None for null path."""

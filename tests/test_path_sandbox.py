@@ -4,14 +4,28 @@ These tests prove that ThinkOS denies unsafe file access by default,
 which is a mandatory requirement for a public product.
 """
 
+import ntpath
 import os
+
 import pytest
+
+from thinkos.tools import sandbox
 from thinkos.tools.sandbox import resolve_path, SandboxError
 from thinkos.tools.read_file import ReadFileAdapter
 from thinkos.tools.write_file import WriteFileAdapter
 
 
 # ── Unit: resolve_path ───────────────────────────────────────────
+
+
+class TestWindowsPathContainment:
+    def test_different_drive_is_outside_root(self):
+        assert not sandbox._is_path_within(
+            r"D:\outside\file.txt",
+            r"C:\workspace",
+            path_module=ntpath,
+        )
+
 
 class TestResolvePathSafeDefault:
     """With an allowed_root set (the default), unsafe paths are denied."""
@@ -37,10 +51,17 @@ class TestResolvePathSafeDefault:
             resolve_path(path, str(tmp_path))
 
     def test_symlink_escape_denied(self, tmp_path):
-        link = tmp_path / "escape"
-        os.symlink("/etc/hostname", link)
+        allowed = tmp_path / "allowed"
+        allowed.mkdir()
+        target = tmp_path / "outside.txt"
+        target.write_text("outside")
+        link = allowed / "escape"
+        try:
+            os.symlink(target, link)
+        except OSError as exc:
+            pytest.skip(f"symlinks unavailable on this platform: {exc}")
         with pytest.raises(SandboxError, match="Access denied"):
-            resolve_path(str(link), str(tmp_path))
+            resolve_path(str(link), str(allowed))
 
     def test_relative_path_resolves_inside_root(self, tmp_path):
         target = tmp_path / "subdir" / "file.txt"
@@ -57,15 +78,20 @@ class TestResolvePathSafeDefault:
 class TestResolvePathUnsafeOverride:
     """With allowed_root=None, all paths are allowed (developer override)."""
 
-    def test_unsafe_allows_etc_hostname(self):
-        result = resolve_path("/etc/hostname", None)
-        assert result == "/etc/hostname"
+    def test_unsafe_allows_outside_path(self, tmp_path):
+        target = tmp_path / "outside.txt"
+        target.write_text("outside")
+        result = resolve_path(str(target), None)
+        assert result == str(target.resolve())
 
     def test_unsafe_resolves_symlinks(self, tmp_path):
         target = tmp_path / "real.txt"
         target.write_text("hello")
         link = tmp_path / "link.txt"
-        os.symlink(target, link)
+        try:
+            os.symlink(target, link)
+        except OSError as exc:
+            pytest.skip(f"symlinks unavailable on this platform: {exc}")
         result = resolve_path(str(link), None)
         assert result == str(target.resolve())
 
@@ -106,10 +132,12 @@ class TestReadFileSafeDefault:
 
 
 class TestReadFileUnsafeOverride:
-    def test_unsafe_allows_etc_hostname(self):
+    def test_unsafe_allows_outside_file(self, tmp_path):
+        target = tmp_path / "outside.txt"
+        target.write_text("outside")
         adapter = ReadFileAdapter()
         result = adapter.execute(
-            {"path": "/etc/hostname", "call_id": "c4"},
+            {"path": str(target), "call_id": "c4"},
             {"allowed_root": None}
         )
         assert result["status"] == "ok"

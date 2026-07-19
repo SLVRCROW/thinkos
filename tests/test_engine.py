@@ -1,5 +1,9 @@
 """Tests for the engine dispatch loop."""
 
+import json
+import os
+import sys
+import tempfile
 import uuid
 import pytest
 from thinkos.store.sqlite_store import SQLiteStore, CycleError, DepthError, DuplicateError
@@ -15,6 +19,9 @@ from thinkos.gates.deny_all import DenyAllGate
 from thinkos.config import load_config
 from thinkos.schema.context_packet import ContextPacket
 from thinkos.schema.receipt import Receipt, Action, Result, GateInfo
+
+# Cross-platform readable path for tests (exists on both Linux and Windows)
+_READABLE_PATH = __file__
 
 
 # ── Helpers ─────────────────────────────────────────────────────────
@@ -353,9 +360,9 @@ class TestContextPacketParentId:
         """A denied call does not update _last_packet_id; the next allowed call links to the last successful packet."""
         store, connector = _run_engine(
             messages=[_make_msg([
-                _make_tc("read_file", call_id="c1", params={"path": "/etc/hostname"}),
+                _make_tc("read_file", call_id="c1", params={"path": _READABLE_PATH}),
                 _make_tc("write_file", call_id="c2", params={"path": "/tmp/x.txt", "content": "x"}),
-                _make_tc("read_file", call_id="c3", params={"path": "/etc/hostname"}),
+                _make_tc("read_file", call_id="c3", params={"path": _READABLE_PATH}),
             ])],
             config_overrides={
                 "gates": {"default": "always_allow", "overrides": {"write_file": "deny_all"}},
@@ -376,7 +383,7 @@ class TestContextPacketParentId:
         store, connector = _run_engine(
             messages=[_make_msg([
                 _make_tc("write_file", call_id="c1", params={"path": "/tmp/x.txt", "content": "x"}),
-                _make_tc("read_file", call_id="c2", params={"path": "/etc/hostname"}),
+                _make_tc("read_file", call_id="c2", params={"path": _READABLE_PATH}),
             ])],
             config_overrides={
                 "gates": {"default": "always_allow", "overrides": {"write_file": "deny_all"}},
@@ -392,7 +399,7 @@ class TestContextPacketParentId:
     def test_exactly_five_calls_chain_correctly(self):
         """Exactly 5 successful calls in a session all chain correctly with no fallback."""
         calls = [
-            _make_tc("read_file", call_id=f"c{i}", params={"path": "/etc/hostname"})
+            _make_tc("read_file", call_id=f"c{i}", params={"path": _READABLE_PATH})
             for i in range(5)
         ]
         store, connector = _run_engine(
@@ -412,7 +419,7 @@ class TestContextPacketParentId:
     def test_seven_calls_depth_fallback_then_restart(self):
         """7 calls: first 5 chain, 6th falls back to parent_id=None, 7th links to 6th."""
         calls = [
-            _make_tc("read_file", call_id=f"c{i}", params={"path": "/etc/hostname"})
+            _make_tc("read_file", call_id=f"c{i}", params={"path": _READABLE_PATH})
             for i in range(7)
         ]
         store, connector = _run_engine(
@@ -528,7 +535,7 @@ class TestToolCallLimit:
 
     def test_allows_calls_at_limit(self):
         """Message with exactly 10 calls executes normally."""
-        calls = [_make_tc(tool="read_file", params={"path": "/etc/hostname"},
+        calls = [_make_tc(tool="read_file", params={"path": _READABLE_PATH},
                           call_id=f"call_{i:03d}") for i in range(10)]
         store, connector = _run_engine(
             messages=[_make_msg(calls)],
@@ -710,7 +717,7 @@ class TestSessionRehydration:
             "content": {
                 "text": "do something",
                 "tool_calls": [
-                    {"tool": "read_file", "params": {"path": "/etc/hostname"}, "call_id": "c1"}
+                    {"tool": "read_file", "params": {"path": _READABLE_PATH}, "call_id": "c1"}
                 ],
             }
         }
@@ -815,7 +822,7 @@ class TestLineageRestoration:
         store = SQLiteStore(":memory:")
         pids = self._write_prior_data(store)
         msg = self._make_rehydrate_msg(tool_calls=[
-            {"tool": "read_file", "params": {"path": "/etc/hostname"}, "call_id": "c1"}
+            {"tool": "read_file", "params": {"path": _READABLE_PATH}, "call_id": "c1"}
         ])
         connector = _TestConnector([msg])
         eng = Engine(store, connector,
@@ -846,7 +853,7 @@ class TestLineageRestoration:
             "content": {
                 "text": "do something",
                 "tool_calls": [
-                    {"tool": "read_file", "params": {"path": "/etc/hostname"}, "call_id": "c1"}
+                    {"tool": "read_file", "params": {"path": _READABLE_PATH}, "call_id": "c1"}
                 ],
             }
         }
@@ -872,10 +879,10 @@ class TestLineageRestoration:
         pids_a = self._write_prior_data(store, session="sess_a")
         pids_b = self._write_prior_data(store, session="sess_b")
         msg_a = self._make_rehydrate_msg(session="sess_a", tool_calls=[
-            {"tool": "read_file", "params": {"path": "/etc/hostname"}, "call_id": "c1"}
+            {"tool": "read_file", "params": {"path": _READABLE_PATH}, "call_id": "c1"}
         ])
         msg_b = self._make_rehydrate_msg(session="sess_b", tool_calls=[
-            {"tool": "read_file", "params": {"path": "/etc/hostname"}, "call_id": "c1"}
+            {"tool": "read_file", "params": {"path": _READABLE_PATH}, "call_id": "c1"}
         ])
         connector = _TestConnector([msg_a, msg_b])
         eng = Engine(store, connector,
@@ -913,7 +920,7 @@ class TestLineageRestoration:
             prev = p.packet_id
         # Now rehydrate + make a new tool call — the 6th packet should hit depth limit
         msg = self._make_rehydrate_msg(session="sess_depth", tool_calls=[
-            {"tool": "read_file", "params": {"path": "/etc/hostname"}, "call_id": "c1"}
+            {"tool": "read_file", "params": {"path": _READABLE_PATH}, "call_id": "c1"}
         ])
         connector = _TestConnector([msg])
         eng = Engine(store, connector,
@@ -1172,7 +1179,7 @@ class TestCompaction:
         store = SQLiteStore(":memory:")
         self._write_n_packets(store, 10)
         msg = self._make_rehydrate_msg(tool_calls=[
-            {"tool": "read_file", "params": {"path": "/etc/hostname"}, "call_id": "c1"}
+            {"tool": "read_file", "params": {"path": _READABLE_PATH}, "call_id": "c1"}
         ])
         connector = self._run_with_config(
             store, [msg],
@@ -1817,3 +1824,80 @@ class TestNonTTYConfirmGate:
         finally:
             import shutil
             shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+class TestMainStoreClosure:
+    """Correction C: store.close() runs on exception via try/finally in main()."""
+
+    def test_store_closes_on_engine_exception(self):
+        """When engine.run() raises, store.close() is still called."""
+        import sys
+        from unittest.mock import patch
+        from thinkos.__main__ import main
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = os.path.join(tmpdir, "thinkos.json")
+            with open(config_path, "w") as f:
+                json.dump({"gates": {"default": "always_allow"}}, f)
+
+            original_cwd = os.getcwd()
+            original_argv = sys.argv
+            try:
+                os.chdir(tmpdir)
+                sys.argv = ["thinkos"]
+
+                close_called = False
+
+                def _tracking_close(self):
+                    nonlocal close_called
+                    close_called = True
+                    original_close(self)
+
+                original_close = SQLiteStore.close
+                with patch("thinkos.store.sqlite_store.SQLiteStore.close", _tracking_close):
+                    with patch("thinkos.engine.Engine.run") as mock_run:
+                        mock_run.side_effect = ValueError("Simulated engine crash")
+                        with patch("sys.stdin") as mock_stdin:
+                            mock_stdin.buffer.readline.return_value = b""
+                            with pytest.raises(ValueError, match="Simulated engine crash"):
+                                main()
+
+                assert close_called, "store.close() was NOT called after engine exception"
+            finally:
+                os.chdir(original_cwd)
+                sys.argv = original_argv
+
+    def test_store_closes_on_normal_exit(self):
+        """When engine.run() exits normally, store.close() is still called."""
+        import sys
+        from unittest.mock import patch
+        from thinkos.__main__ import main
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = os.path.join(tmpdir, "thinkos.json")
+            with open(config_path, "w") as f:
+                json.dump({"gates": {"default": "always_allow"}}, f)
+
+            original_cwd = os.getcwd()
+            original_argv = sys.argv
+            try:
+                os.chdir(tmpdir)
+                sys.argv = ["thinkos"]
+
+                close_called = False
+
+                def _tracking_close(self):
+                    nonlocal close_called
+                    close_called = True
+                    original_close(self)
+
+                original_close = SQLiteStore.close
+                with patch("thinkos.store.sqlite_store.SQLiteStore.close", _tracking_close):
+                    with patch("sys.stdin") as mock_stdin:
+                        mock_stdin.buffer.readline.return_value = b""
+                        main()
+
+                assert close_called, "store.close() was NOT called on normal exit"
+            finally:
+                os.chdir(original_cwd)
+                sys.argv = original_argv
