@@ -531,7 +531,7 @@ class TestToolCallLimit:
 
     def test_allows_calls_at_limit(self):
         """Message with exactly 10 calls executes normally."""
-        calls = [_make_tc(tool="read_file", params={"path": "/etc/hostname"},
+        calls = [_make_tc(tool="read_file", params={"path": _READABLE_PATH},
                           call_id=f"call_{i:03d}") for i in range(10)]
         store, connector = _run_engine(
             messages=[_make_msg(calls)],
@@ -713,7 +713,7 @@ class TestSessionRehydration:
             "content": {
                 "text": "do something",
                 "tool_calls": [
-                    {"tool": "read_file", "params": {"path": "/etc/hostname"}, "call_id": "c1"}
+                    {"tool": "read_file", "params": {"path": _READABLE_PATH}, "call_id": "c1"}
                 ],
             }
         }
@@ -818,7 +818,7 @@ class TestLineageRestoration:
         store = SQLiteStore(":memory:")
         pids = self._write_prior_data(store)
         msg = self._make_rehydrate_msg(tool_calls=[
-            {"tool": "read_file", "params": {"path": "/etc/hostname"}, "call_id": "c1"}
+            {"tool": "read_file", "params": {"path": _READABLE_PATH}, "call_id": "c1"}
         ])
         connector = _TestConnector([msg])
         eng = Engine(store, connector,
@@ -849,7 +849,7 @@ class TestLineageRestoration:
             "content": {
                 "text": "do something",
                 "tool_calls": [
-                    {"tool": "read_file", "params": {"path": "/etc/hostname"}, "call_id": "c1"}
+                    {"tool": "read_file", "params": {"path": _READABLE_PATH}, "call_id": "c1"}
                 ],
             }
         }
@@ -875,10 +875,10 @@ class TestLineageRestoration:
         pids_a = self._write_prior_data(store, session="sess_a")
         pids_b = self._write_prior_data(store, session="sess_b")
         msg_a = self._make_rehydrate_msg(session="sess_a", tool_calls=[
-            {"tool": "read_file", "params": {"path": "/etc/hostname"}, "call_id": "c1"}
+            {"tool": "read_file", "params": {"path": _READABLE_PATH}, "call_id": "c1"}
         ])
         msg_b = self._make_rehydrate_msg(session="sess_b", tool_calls=[
-            {"tool": "read_file", "params": {"path": "/etc/hostname"}, "call_id": "c1"}
+            {"tool": "read_file", "params": {"path": _READABLE_PATH}, "call_id": "c1"}
         ])
         connector = _TestConnector([msg_a, msg_b])
         eng = Engine(store, connector,
@@ -916,7 +916,7 @@ class TestLineageRestoration:
             prev = p.packet_id
         # Now rehydrate + make a new tool call — the 6th packet should hit depth limit
         msg = self._make_rehydrate_msg(session="sess_depth", tool_calls=[
-            {"tool": "read_file", "params": {"path": "/etc/hostname"}, "call_id": "c1"}
+            {"tool": "read_file", "params": {"path": _READABLE_PATH}, "call_id": "c1"}
         ])
         connector = _TestConnector([msg])
         eng = Engine(store, connector,
@@ -1175,7 +1175,7 @@ class TestCompaction:
         store = SQLiteStore(":memory:")
         self._write_n_packets(store, 10)
         msg = self._make_rehydrate_msg(tool_calls=[
-            {"tool": "read_file", "params": {"path": "/etc/hostname"}, "call_id": "c1"}
+            {"tool": "read_file", "params": {"path": _READABLE_PATH}, "call_id": "c1"}
         ])
         connector = self._run_with_config(
             store, [msg],
