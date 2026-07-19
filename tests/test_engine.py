@@ -16,6 +16,9 @@ from thinkos.config import load_config
 from thinkos.schema.context_packet import ContextPacket
 from thinkos.schema.receipt import Receipt, Action, Result, GateInfo
 
+# Cross-platform readable path for tests (exists on both Linux and Windows)
+_READABLE_PATH = __file__
+
 
 # ── Helpers ─────────────────────────────────────────────────────────
 
@@ -353,9 +356,9 @@ class TestContextPacketParentId:
         """A denied call does not update _last_packet_id; the next allowed call links to the last successful packet."""
         store, connector = _run_engine(
             messages=[_make_msg([
-                _make_tc("read_file", call_id="c1", params={"path": "/etc/hostname"}),
+                _make_tc("read_file", call_id="c1", params={"path": _READABLE_PATH}),
                 _make_tc("write_file", call_id="c2", params={"path": "/tmp/x.txt", "content": "x"}),
-                _make_tc("read_file", call_id="c3", params={"path": "/etc/hostname"}),
+                _make_tc("read_file", call_id="c3", params={"path": _READABLE_PATH}),
             ])],
             config_overrides={
                 "gates": {"default": "always_allow", "overrides": {"write_file": "deny_all"}},
@@ -376,7 +379,7 @@ class TestContextPacketParentId:
         store, connector = _run_engine(
             messages=[_make_msg([
                 _make_tc("write_file", call_id="c1", params={"path": "/tmp/x.txt", "content": "x"}),
-                _make_tc("read_file", call_id="c2", params={"path": "/etc/hostname"}),
+                _make_tc("read_file", call_id="c2", params={"path": _READABLE_PATH}),
             ])],
             config_overrides={
                 "gates": {"default": "always_allow", "overrides": {"write_file": "deny_all"}},
@@ -392,7 +395,7 @@ class TestContextPacketParentId:
     def test_exactly_five_calls_chain_correctly(self):
         """Exactly 5 successful calls in a session all chain correctly with no fallback."""
         calls = [
-            _make_tc("read_file", call_id=f"c{i}", params={"path": "/etc/hostname"})
+            _make_tc("read_file", call_id=f"c{i}", params={"path": _READABLE_PATH})
             for i in range(5)
         ]
         store, connector = _run_engine(
@@ -412,7 +415,7 @@ class TestContextPacketParentId:
     def test_seven_calls_depth_fallback_then_restart(self):
         """7 calls: first 5 chain, 6th falls back to parent_id=None, 7th links to 6th."""
         calls = [
-            _make_tc("read_file", call_id=f"c{i}", params={"path": "/etc/hostname"})
+            _make_tc("read_file", call_id=f"c{i}", params={"path": _READABLE_PATH})
             for i in range(7)
         ]
         store, connector = _run_engine(
