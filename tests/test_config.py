@@ -21,6 +21,38 @@ class TestWindowsConfigRoot:
 
         assert result == r"C:\work\project"
 
+    def test_thinkos_uppercase_resolves_via_ntpath(self):
+        """Uppercase .THINKOS resolves to project parent via ntpath."""
+        result = config_module._config_root_from_path(
+            r"C:\work\project\.THINKOS\thinkos.json",
+            path_module=ntpath,
+        )
+        assert result == r"C:\work\project"
+
+    def test_thinkos_mixed_case_resolves_via_ntpath(self):
+        """Mixed-case .ThinkOS resolves to project parent via ntpath."""
+        result = config_module._config_root_from_path(
+            r"C:\work\project\.ThinkOS\thinkos.json",
+            path_module=ntpath,
+        )
+        assert result == r"C:\work\project"
+
+    def test_thinkos_lowercase_resolves_via_ntpath(self):
+        """Lowercase .thinkos resolves to project parent via ntpath."""
+        result = config_module._config_root_from_path(
+            r"C:\work\project\.thinkos\thinkos.json",
+            path_module=ntpath,
+        )
+        assert result == r"C:\work\project"
+
+    def test_non_thinkos_directory_returns_config_dir(self):
+        """A non-.thinkos directory returns the config dir itself."""
+        result = config_module._config_root_from_path(
+            r"C:\work\project\config\thinkos.json",
+            path_module=ntpath,
+        )
+        assert result == r"C:\work\project\config"
+
 
 class TestLoadConfig:
     def test_default_config_has_tools_key(self):

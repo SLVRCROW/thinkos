@@ -338,7 +338,7 @@ def init(
     try:
         conn = sqlite3.connect(store_db_path)
         try:
-            conn.execute("PRAGMA journal_mode=DELETE")
+            conn.execute("PRAGMA journal_mode=WAL")
             conn.execute("VACUUM")
         finally:
             conn.close()

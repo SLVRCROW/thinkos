@@ -1,5 +1,9 @@
 """Tests for the engine dispatch loop."""
 
+import json
+import os
+import sys
+import tempfile
 import uuid
 import pytest
 from thinkos.store.sqlite_store import SQLiteStore, CycleError, DepthError, DuplicateError
@@ -1820,3 +1824,80 @@ class TestNonTTYConfirmGate:
         finally:
             import shutil
             shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+class TestMainStoreClosure:
+    """Correction C: store.close() runs on exception via try/finally in main()."""
+
+    def test_store_closes_on_engine_exception(self):
+        """When engine.run() raises, store.close() is still called."""
+        import sys
+        from unittest.mock import patch
+        from thinkos.__main__ import main
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = os.path.join(tmpdir, "thinkos.json")
+            with open(config_path, "w") as f:
+                json.dump({"gates": {"default": "always_allow"}}, f)
+
+            original_cwd = os.getcwd()
+            original_argv = sys.argv
+            try:
+                os.chdir(tmpdir)
+                sys.argv = ["thinkos"]
+
+                close_called = False
+
+                def _tracking_close(self):
+                    nonlocal close_called
+                    close_called = True
+                    original_close(self)
+
+                original_close = SQLiteStore.close
+                with patch("thinkos.store.sqlite_store.SQLiteStore.close", _tracking_close):
+                    with patch("thinkos.engine.Engine.run") as mock_run:
+                        mock_run.side_effect = ValueError("Simulated engine crash")
+                        with patch("sys.stdin") as mock_stdin:
+                            mock_stdin.buffer.readline.return_value = b""
+                            with pytest.raises(ValueError, match="Simulated engine crash"):
+                                main()
+
+                assert close_called, "store.close() was NOT called after engine exception"
+            finally:
+                os.chdir(original_cwd)
+                sys.argv = original_argv
+
+    def test_store_closes_on_normal_exit(self):
+        """When engine.run() exits normally, store.close() is still called."""
+        import sys
+        from unittest.mock import patch
+        from thinkos.__main__ import main
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = os.path.join(tmpdir, "thinkos.json")
+            with open(config_path, "w") as f:
+                json.dump({"gates": {"default": "always_allow"}}, f)
+
+            original_cwd = os.getcwd()
+            original_argv = sys.argv
+            try:
+                os.chdir(tmpdir)
+                sys.argv = ["thinkos"]
+
+                close_called = False
+
+                def _tracking_close(self):
+                    nonlocal close_called
+                    close_called = True
+                    original_close(self)
+
+                original_close = SQLiteStore.close
+                with patch("thinkos.store.sqlite_store.SQLiteStore.close", _tracking_close):
+                    with patch("sys.stdin") as mock_stdin:
+                        mock_stdin.buffer.readline.return_value = b""
+                        main()
+
+                assert close_called, "store.close() was NOT called on normal exit"
+            finally:
+                os.chdir(original_cwd)
+                sys.argv = original_argv

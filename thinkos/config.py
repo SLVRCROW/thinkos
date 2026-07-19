@@ -42,7 +42,7 @@ DEFAULT_CONFIG = {
 def _config_root_from_path(resolved_path: str, path_module=os.path) -> str:
     """Return a config's workspace root while preserving native path syntax."""
     config_dir = path_module.dirname(resolved_path)
-    if path_module.basename(config_dir) == ".thinkos":
+    if path_module.normcase(path_module.basename(config_dir)) == path_module.normcase(".thinkos"):
         return path_module.dirname(config_dir)
     return config_dir
 
