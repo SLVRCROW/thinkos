@@ -308,6 +308,8 @@ class TestMainStoreWiring:
                     def patched_init(self, db_path=":memory:"):
                         captured_paths.append(db_path)
                         original_init(self, db_path)
+                        # Close immediately to release file handle on Windows
+                        self._conn.close()
 
                     with patch("thinkos.store.sqlite_store.SQLiteStore.__init__", patched_init):
                         main()

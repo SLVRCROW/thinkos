@@ -294,6 +294,7 @@ def main():
         identity_provider=identity_provider,
     )
     engine.run()
+    store.close()
 
 
 if __name__ == "__main__":

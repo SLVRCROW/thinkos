@@ -61,7 +61,7 @@ def _run_thinkos(*args: str, cwd: str | None = None, input_str: str = "") -> sub
         [sys.executable, "-m", "thinkos", *args],
         input=input_str,
         capture_output=True, text=True,
-        cwd=cwd or "/tmp",
+        cwd=cwd or tempfile.gettempdir(),
         env=_thinkos_env(),
     )
 

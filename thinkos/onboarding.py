@@ -337,9 +337,11 @@ def init(
     # ── Create empty SQLite database ─────────────────────────────────
     try:
         conn = sqlite3.connect(store_db_path)
-        conn.execute("PRAGMA journal_mode=DELETE")
-        conn.execute("VACUUM")
-        conn.close()
+        try:
+            conn.execute("PRAGMA journal_mode=DELETE")
+            conn.execute("VACUUM")
+        finally:
+            conn.close()
     except sqlite3.Error as e:
         _cleanup_failed_init(thinkos_dir_path, cfg_path, gitignore_path, store_db_path)
         return _init_result(
@@ -712,9 +714,11 @@ def doctor(
             abs_path = str(Path(db_path_for_check).resolve())
             db_uri = Path(abs_path).as_uri()
             conn = sqlite3.connect(db_uri + "?mode=ro", uri=True)
-            cursor = conn.execute("PRAGMA integrity_check")
-            integrity_result = cursor.fetchone()
-            conn.close()
+            try:
+                cursor = conn.execute("PRAGMA integrity_check")
+                integrity_result = cursor.fetchone()
+            finally:
+                conn.close()
             if integrity_result and integrity_result[0] == "ok":
                 findings.append({
                     "check": "sqlite_integrity",
