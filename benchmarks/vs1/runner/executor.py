@@ -38,7 +38,7 @@ from benchmarks.vs1.scorer import score_trajectory
 from benchmarks.vs1.isolation import create_isolated_workdir
 
 from .provider import OllamaCloudAdapter, ProviderCallResult
-from .prompts import build_prompt
+from .prompts import build_prompt, fixture_artifact_path
 
 
 @dataclass(frozen=True)
@@ -139,10 +139,11 @@ def build_predecessor_events(tid: str, condition: str) -> list[SessionEvent]:
 def build_successor_events(tid: str, arm: str, condition: str, artifact: str) -> list[SessionEvent]:
     """Reconstruct the successor event stream from the recorded artifact write
     (no model call — deterministic)."""
+    rel = fixture_artifact_path("A", condition, 3)
     tc = ToolCallReceipt(
         receipt_id=compute_sha256(f"{tid}-succ")[:32],
         tool="write_file",
-        params={"path": "stage3/config.json", "content": artifact},
+        params={"path": rel, "content": artifact},
         status="ok",
         output="ok",
         evidence_refs=(
@@ -231,7 +232,7 @@ class PoweredExecutor:
         ok, artifact_text = parse_artifact(provider_res.content)
         artifact_path = ""
         if ok:
-            rel = "stage3/config.json"
+            rel = fixture_artifact_path("A", condition, 3)
             p = workdir / rel
             p.parent.mkdir(parents=True, exist_ok=True)
             p.write_text(artifact_text)

@@ -46,6 +46,8 @@ Produce the final artifact file for this project by writing the file to the path
 - "total_tests" equal to 3
 - any additional required fields described in your INHERITED STATE or the project README
 
+Write the artifact to the exact path: <ARTIFACT_PATH>
+
 Where the inherited state or README references a choice between conflicting values, apply the correct one. Complete the task in one shot; write the artifact now.
 
 OUTPUT FORMAT: Reply with ONLY the file content (the JSON object). No commentary."""
@@ -55,6 +57,19 @@ TASK_ARTIFACT_PATH = {
     2: "stage2/config.json",
     3: "stage3/config.json",
 }
+
+
+def fixture_artifact_path(task: str, condition: str, stage: int) -> str:
+    """Derive the required artifact path from the FROZEN fixture.
+
+    AUTHORIZED REPAIR (Marc act AUTHORIZE_VS1_BINDING_PATH_REPAIR...):
+    the runner/prompts must not assume stage3/config.json — interruption and
+    motif fixtures define stage3/final.json. The fixture is the single
+    authority for artifact paths.
+    """
+    from ..fixtures import get_fixture
+    artifact = get_fixture(task, condition).stage_artifacts[stage]
+    return artifact.path
 
 
 def _render_state(arm: str, state: Any) -> str:
@@ -75,12 +90,15 @@ def build_prompt(
     stage: int,
     state: Any,
     prompt_version: str = "v0.1.0",
+    task: str = "A",
 ) -> PromptTemplate:
     """Build the frozen prompt for one cell.
 
     Core instruction is constant; only the inherited state block differs.
+    Artifact target path is derived from the frozen fixture (authorized
+    repair: never hardcode the path).
     """
-    path = TASK_ARTIFACT_PATH.get(stage) or "the artifact path"
+    path = fixture_artifact_path(task, condition, stage)
     body = CORE_TASK.replace("<ARTIFACT_PATH>", path)
     condition_note = CONDITION_TRUTH.get(condition, {}).get("requirement", "")
     prompt_text = (
