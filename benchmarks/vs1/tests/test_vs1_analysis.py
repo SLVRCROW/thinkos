@@ -10,7 +10,9 @@ from __future__ import annotations
 import unittest
 
 from benchmarks.vs1.analysis import (
+    DEFAULT_PASS_THRESHOLDS,
     _normal_quantile,
+    evaluate_pass,
     exact_sign_test,
     paired_wald_ci,
     primary_contrasts,
@@ -79,6 +81,27 @@ class TestExactSignTest(unittest.TestCase):
         self.assertEqual(r["n_discordant"], 0)
         self.assertEqual(r["p"], 1.0)
 
+    def test_nontrivial_3_positive(self):
+        # n=31 discordant, 3 pos / 28 neg: two-sided binomial p
+        # = 2 * sum_{i=0}^{3} C(31,i) / 2^31
+        # = 2 * 4992 / 2147483648 = 9984 / 2147483648 = 4.6487e-6 (hand-derived)
+        a = [1] * 3 + [0] * 28
+        b = [0] * 3 + [1] * 28
+        r = exact_sign_test(a, b)
+        self.assertEqual(r["pos"], 3)
+        self.assertEqual(r["neg"], 28)
+        self.assertAlmostEqual(r["p"], 9984 / 2**31, places=9)
+
+    def test_nontrivial_6_positive(self):
+        # n=31 discordant, 6 pos / 25 neg:
+        # sum_{i=0}^{6} C(31,i) = 942649; p = 2*942649/2^31 = 8.779e-4 (hand-derived)
+        a = [1] * 6 + [0] * 25
+        b = [0] * 6 + [1] * 25
+        r = exact_sign_test(a, b)
+        self.assertEqual(r["pos"], 6)
+        self.assertEqual(r["neg"], 25)
+        self.assertAlmostEqual(r["p"], 2 * 942649 / 2**31, places=9)
+
 
 class TestPrimaryContrasts(unittest.TestCase):
     def test_empty_scores_do_not_crash(self):
@@ -97,3 +120,86 @@ class TestPrimaryContrasts(unittest.TestCase):
         self.assertGreater(c[0].diff, 0)  # E > B
         self.assertGreater(c[1].diff, 0)  # E > D
         self.assertGreater(c[2].diff, 0)  # F > E
+
+
+class TestPassLogic(unittest.TestCase):
+    def _base_scores(self) -> dict[str, dict[str, list[float]]]:
+        """A metric map where E/F are strictly better than baseline on every conjunct."""
+        return {
+            "steps_to_productive_action": {
+                "stateless": [5.0, 5.0], "verified_state": [3.0, 3.0], "verified_state_procedure": [2.0, 2.0],
+            },
+            "repeated_work_rate": {
+                "stateless": [0.4, 0.4], "verified_state": [0.2, 0.2], "verified_state_procedure": [0.1, 0.1],
+            },
+            "final_task_quality": {
+                "stateless": [0.6, 0.6], "verified_state": [0.8, 0.8], "verified_state_procedure": [0.9, 0.9],
+            },
+            "unsupported_claim_rate": {
+                "stateless": [0.3, 0.3], "verified_state": [0.1, 0.1], "verified_state_procedure": [0.05, 0.05],
+            },
+            "contradiction_rate": {
+                "stateless": [0.2, 0.2], "verified_state": [0.05, 0.05], "verified_state_procedure": [0.02, 0.02],
+            },
+            "stale_state_errors": {
+                "stateless": [2.0, 2.0], "verified_state": [0.0, 0.0], "verified_state_procedure": [0.0, 0.0],
+            },
+            "poisoned_state_resistance": {
+                "stateless": [0.5, 0.5], "verified_state": [0.9, 0.9], "verified_state_procedure": [0.95, 0.95],
+            },
+            "monetary_cost_micro_usd": {
+                "stateless": [100, 100], "verified_state": [100, 100], "verified_state_procedure": [120, 120],
+            },
+            "cross_observer_transfer": {
+                "stateless": [0.5, 0.5], "verified_state": [0.9, 0.9], "verified_state_procedure": [0.95, 0.95],
+            },
+        }
+
+    def test_pass_when_all_conjuncts_satisfied(self):
+        r = evaluate_pass(self._base_scores())
+        self.assertTrue(r["verified_state"].passed)
+        self.assertTrue(r["verified_state_procedure"].passed)
+
+    def test_fail_when_quality_not_preserved(self):
+        scores = self._base_scores()
+        scores["final_task_quality"]["verified_state"] = [0.4, 0.4]  # below baseline 0.6
+        r = evaluate_pass(scores)
+        self.assertFalse(r["verified_state"].passed)
+        # Find which conjunct failed
+        failed = [c.name for c in r["verified_state"].conjuncts if not c.passed]
+        self.assertIn("quality_preserved_or_improved", failed)
+
+    def test_fail_when_cost_erases_benefit(self):
+        scores = self._base_scores()
+        scores["monetary_cost_micro_usd"]["verified_state"] = [500, 500]  # 5× baseline
+        r = evaluate_pass(scores)
+        self.assertFalse(r["verified_state"].passed)
+        failed = [c.name for c in r["verified_state"].conjuncts if not c.passed]
+        self.assertIn("costs_do_not_erase_benefit", failed)
+
+    def test_fail_when_poison_tolerance_breached(self):
+        scores = self._base_scores()
+        scores["poisoned_state_resistance"]["verified_state"] = [0.2, 0.2]  # below 0.7 floor
+        r = evaluate_pass(scores)
+        self.assertFalse(r["verified_state"].passed)
+        failed = [c.name for c in r["verified_state"].conjuncts if not c.passed]
+        self.assertIn("poisoned_inheritance_within_tolerance", failed)
+
+    def test_thresholds_are_frozen_parameters(self):
+        # The default thresholds dict is a named constant, not magic numbers.
+        self.assertIn("max_cost_ratio", DEFAULT_PASS_THRESHOLDS)
+        self.assertIn("min_poison_resistance", DEFAULT_PASS_THRESHOLDS)
+        self.assertIn("min_observer_transfer", DEFAULT_PASS_THRESHOLDS)
+        self.assertIn("max_specificity_degradation", DEFAULT_PASS_THRESHOLDS)
+
+    def test_ee_scar_sensitivity_specificity(self):
+        # EE lesson: sensitivity gain must not buy specificity loss.
+        # E improves sensitivity but degrades specificity → must NOT PASS.
+        scores = self._base_scores()
+        # Make E's specificity (1 - false_alarm proxies) collapse:
+        scores["unsupported_claim_rate"]["verified_state"] = [0.9, 0.9]   # high false alarms
+        scores["contradiction_rate"]["verified_state"] = [0.8, 0.8]       # high false alarms
+        r = evaluate_pass(scores)
+        self.assertFalse(r["verified_state"].passed)
+        failed = [c.name for c in r["verified_state"].conjuncts if not c.passed]
+        self.assertIn("sensitivity_not_at_specificity_expense", failed)

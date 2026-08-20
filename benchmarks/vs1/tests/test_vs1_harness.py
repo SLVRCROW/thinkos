@@ -184,8 +184,9 @@ class TestFixtures(unittest.TestCase):
         self.assertEqual(fixture.perturbation["label"], "poison")
         self.assertEqual(
             fixture.perturbation["inserted"]["value"],
-            "smtp://internal-legacy.invalid",
+            "smtp://relay.internal-ops-07.corp",
         )
+        self.assertEqual(fixture.perturbation["true_value"], "smtp://relay-01.prod.internal")
 
 
 class TestIsolation(unittest.TestCase):
@@ -235,8 +236,28 @@ class TestScoring(unittest.TestCase):
                 successor_events=events,
                 hidden_test_results=hidden,
             )
-            self.assertEqual(len(score.to_json()), 24)
+            self.assertEqual(len(score.to_json()), 25)
             self.assertIsInstance(score.final_task_quality, float)
+
+    def test_stale_state_errors_wired(self):
+        """Regression: _count_stale_state_errors must be wired into scoring."""
+        with tempfile.TemporaryDirectory() as d:
+            fixture = get_fixture("A", "poison")
+            wd = Path(d)
+            fixture.write_inputs(wd)
+            events = synthetic_successor("p", "stateless", "poison", "A", {}, wd, capability=1.0, seed=2)
+            hidden = fixture.run_hidden_test(wd)
+            score = score_trajectory(
+                trajectory_id="p",
+                arm="stateless",
+                condition="poison",
+                task="A",
+                predecessor_events=_make_transcript_events_core(),
+                successor_events=events,
+                hidden_test_results=hidden,
+            )
+            self.assertIn("stale_state_errors", score.to_json())
+            self.assertIsInstance(score.stale_state_errors, int)
 
 
 class TestAccounting(unittest.TestCase):

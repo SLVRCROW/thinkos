@@ -245,14 +245,24 @@ class VerifiedStateAdapter(_AdapterABC):
 
     Every claim references receipt IDs. Unsupported claims are omitted or
     marked unverified. No free-text model-generated state. Output shape:
-    {"claims": [{"receipt_ids": [...], "claim_type": ...}], "constraints": [],
-     "open_questions": [], "exact_next_action": {...}}
+    {"claims": [...], "constraints": [...], "open_questions": [...],
+     "exact_next_action": {...}}
+
+    The declared manipulation (protocol §3, arm E) requires constraints,
+    open questions, and the exact next action to be present — not empty.
+    Deterministic extraction from transcript structure:
+      - constraints: from event metadata / checkpoint test_results keys
+      - open_questions: from event metadata 'open_questions'
+      - exact_next_action: derived from the last incomplete stage
     """
 
     arm = "verified_state"
 
     def transform(self, transcript: list[SessionEvent]) -> ArchitectureState:
         claims = []
+        constraints: list[dict] = []
+        open_questions: list[str] = []
+        next_stage = None
         for event in transcript:
             for tc in event.tool_calls:
                 if tc.evidence_refs:
@@ -273,12 +283,29 @@ class VerifiedStateAdapter(_AdapterABC):
                     "stage": event.checkpoint.stage_number,
                     "test_results": event.checkpoint.test_results,
                 })
+                next_stage = event.checkpoint.stage_number + 1
+            # Structured metadata → constraints / open questions
+            for c in event.metadata.get("constraints", []):
+                if isinstance(c, str) and c not in constraints:
+                    constraints.append({"constraint": c, "receipt_id": event.checkpoint.receipt_id if event.checkpoint else None})
+            for q in event.metadata.get("open_questions", []):
+                if isinstance(q, str) and q not in open_questions:
+                    open_questions.append(q)
+
+        exact_next_action = None
+        if next_stage is not None:
+            exact_next_action = {
+                "stage": next_stage,
+                "action": f"complete stage {next_stage}",
+                "status": "required",
+            }
+
         content = {
             "claims": claims,
             "verified_count": len(claims),
-            "constraints": [],
-            "open_questions": [],
-            "exact_next_action": None,
+            "constraints": constraints,
+            "open_questions": open_questions,
+            "exact_next_action": exact_next_action,
         }
         return ArchitectureState(
             arm="verified_state",

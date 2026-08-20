@@ -18,7 +18,7 @@ from typing import Any
 
 from .schemas import ARMS, CONDITIONS, SessionEvent, ToolCallReceipt, compute_sha256, json_dumps
 from .adapters import get_adapter, adapter_states, BOUNDARIES
-from .fixtures import get_fixture, all_fixtures
+from .fixtures import get_fixture, all_fixtures, inject_predecessor_state
 from .isolation import (
     CANARIES,
     create_isolated_workdir,
@@ -320,7 +320,7 @@ def _make_predecessor_events(trajectory_id: str, task: str, condition: str) -> l
         evidence_refs=(),
         timestamp=1.0,
     )
-    return [
+    base = [
         SessionEvent(
             type="agent_message",
             session_id=f"{trajectory_id}-A",
@@ -333,6 +333,9 @@ def _make_predecessor_events(trajectory_id: str, task: str, condition: str) -> l
             tool_calls=(tc,),
         )
     ]
+    # Inject condition-specific epistemic state (poison, contradiction, motif)
+    # into the INHERITED state so every arm receives it via its representation.
+    return inject_predecessor_state(condition, base)
 
 
 def run_vs1_workload() -> None:
