@@ -28,6 +28,9 @@ FROZEN_MODEL = "deepseek-v4-pro:0813"
 FROZEN_TEMP = 0.0
 FROZEN_MAX_TOKENS = 4096
 FROZEN_REPLICATES = 3
+# R3 topology (Marc act AUTHORIZE_VS1_R3...): 108 trajectories, 126 calls
+EXPECTED_TRAJECTORIES = 108
+EXPECTED_CALLS = 126
 
 
 def main() -> int:
@@ -39,10 +42,11 @@ def main() -> int:
 
     schedule = json.loads(args.schedule.read_text())
     if not validate_schedule(schedule):
-        print("FATAL: schedule invalid (must be 108 calls, 0 retries, 0 replacements)")
+        print("FATAL: schedule invalid (must be 108 trajectories, 126 calls, 0 retries, 0 replacements)")
         return 2
     expected = schedule["expected_calls"]
-    print(f"Schedule validated: {expected} calls, retries=0, replacements=0")
+    trajectories = schedule["trajectories"]
+    print(f"Schedule validated: {trajectories} trajectories, {expected} calls, retries=0, replacements=0")
 
     provider = OllamaCloudAdapter(
         model=FROZEN_MODEL,

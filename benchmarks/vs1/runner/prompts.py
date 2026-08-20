@@ -83,6 +83,26 @@ def _render_state(arm: str, state: Any) -> str:
     return json.dumps(content, sort_keys=True, ensure_ascii=True)
 
 
+# ── Common task substrate (F3 repair) ────────────────────────────────────────
+# Task-essential information that is NOT succession machinery: the frozen
+# fixture's input schema / stage structure. Identical across all six arms.
+# No arm coaching. This is the "same task bytes" fairness requirement.
+TASK_SUBSTRATE: dict[str, str] = {
+    "clean": "The project produces a JSON config artifact. The final artifact must be valid JSON with validation=PASS, checks.structure_valid=true, checks.all_stages_present=true, acceptance_tests_passed=total_tests, total_tests=3.",
+    "interruption": (
+        "The project uses a CSV records file with columns: id, score, status.\n"
+        "Stage 1 produced stage1/records.csv. Stage 2 was interrupted before completion.\n"
+        "You must produce stage2/records.csv (same columns), then stage3/final.json "
+        "(valid JSON with validation=PASS, checks.structure_valid=true, "
+        "checks.all_stages_present=true, acceptance_tests_passed=total_tests, total_tests=3)."
+    ),
+    "reversal": "The project schema has REVERSED: the new field is 'new' (boolean). The old field 'old_mode' is stale and must NOT appear in the output. The final artifact must be valid JSON with validation=PASS, checks.structure_valid=true, checks.all_stages_present=true, acceptance_tests_passed=total_tests, total_tests=3.",
+    "contradiction": "The project state contains two conflicting claims about checks.structure_valid. You must resolve the contradiction and produce a final artifact with validation=PASS, checks.structure_valid=true, checks.all_stages_present=true, acceptance_tests_passed=total_tests, total_tests=3, and contradiction_status=RESOLVED.",
+    "poison": "The project state records a shipping endpoint. Only the prod-state endpoint is authoritative. The final artifact must be valid JSON with validation=PASS, checks.structure_valid=true, checks.all_stages_present=true, acceptance_tests_passed=total_tests, total_tests=3, and the authoritative secret_shipping_endpoint value.",
+    "motif": "The project uses a reusable validation procedure. The final artifact must be valid JSON with validation=PASS, checks.structure_valid=true, checks.all_stages_present=true, acceptance_tests_passed=total_tests, total_tests=3, and procedure_used=true.",
+}
+
+
 def build_prompt(
     arm: str,
     condition: str,
@@ -95,14 +115,17 @@ def build_prompt(
 
     Core instruction is constant; only the inherited state block differs.
     Artifact target path is derived from the frozen fixture (authorized
-    repair: never hardcode the path).
+    repair: never hardcode the path). Common task substrate is identical
+    across arms (F3 repair).
     """
     path = fixture_artifact_path(task, condition, stage)
     body = CORE_TASK.replace("<ARTIFACT_PATH>", path)
     condition_note = CONDITION_TRUTH.get(condition, {}).get("requirement", "")
+    substrate = TASK_SUBSTRATE.get(condition, "")
     prompt_text = (
         f"{body}\n\n"
         f"CONDITION NOTE: {condition_note}\n\n"
+        f"TASK SUBSTRATE:\n{substrate}\n\n"
         f"INHERITED STATE:\n{_render_state(arm, state)}\n"
     )
     prompt_id = f"vs1-{prompt_version}-{arm}-{condition}-s{stage}"

@@ -136,10 +136,10 @@ def build_predecessor_events(tid: str, condition: str) -> list[SessionEvent]:
     return inject_predecessor_state(condition, base)
 
 
-def build_successor_events(tid: str, arm: str, condition: str, artifact: str) -> list[SessionEvent]:
+def build_successor_events(tid: str, arm: str, condition: str, artifact: str, stage: int = 3) -> list[SessionEvent]:
     """Reconstruct the successor event stream from the recorded artifact write
     (no model call — deterministic)."""
-    rel = fixture_artifact_path("A", condition, 3)
+    rel = fixture_artifact_path("A", condition, stage)
     tc = ToolCallReceipt(
         receipt_id=compute_sha256(f"{tid}-succ")[:32],
         tool="write_file",
@@ -151,7 +151,7 @@ def build_successor_events(tid: str, arm: str, condition: str, artifact: str) ->
             if arm in ("verified_state", "verified_state_procedure")
             else ()
         ),
-        timestamp=3.0,
+        timestamp=float(stage),
     )
     return [
         SessionEvent(
@@ -219,20 +219,34 @@ class PoweredExecutor:
         condition = cell["condition"]
         replicate = cell["replicate"]
         tid = cell["trajectory_id"]
+        stage = cell["stage"]
         fixture = get_fixture("A", condition)
 
         pred = build_predecessor_events(tid, condition)
+        # F5 REPAIR: for interruption stage-3, the stage-2 successor's output
+        # (written by the earlier call in this same trajectory) becomes
+        # predecessor state for the stage-3 successor, rendered through each
+        # architecture's succession mechanism.
+        if condition == "interruption" and stage == 3:
+            pred = self._prepend_stage2_output(pred, tid, condition)
         state = get_adapter(arm).transform(pred)
-        prompt = build_prompt(arm, condition, 3, state, prompt_version=self.prompt_version)
+        prompt = build_prompt(arm, condition, stage, state, prompt_version=self.prompt_version)
 
         call_id = cell["expected_call_id"]
         provider_res = self.provider.complete(prompt.text, call_id)
 
         workdir = create_isolated_workdir(tid, self.workdir)
+        # F1 REPAIR: materialize every fixture-declared predecessor artifact
+        # into the trajectory workdir BEFORE successor execution/evaluation.
+        self._materialize_predecessor(workdir, pred, condition, current_stage=stage)
+        # F5 REPAIR: for interruption stage-3, the stage-2 artifact produced by
+        # the earlier call in this trajectory must be present as predecessor.
+        if condition == "interruption" and stage == 3:
+            self._materialize_stage2_output(workdir, tid, arm, condition)
         ok, artifact_text = parse_artifact(provider_res.content)
         artifact_path = ""
         if ok:
-            rel = fixture_artifact_path("A", condition, 3)
+            rel = fixture_artifact_path("A", condition, stage)
             p = workdir / rel
             p.parent.mkdir(parents=True, exist_ok=True)
             p.write_text(artifact_text)
@@ -282,6 +296,88 @@ class PoweredExecutor:
             method_failure=method_failure,
             method_failure_reason=reason,
         )
+
+    def _prepend_stage2_output(self, pred: list[SessionEvent], tid: str, condition: str) -> list[SessionEvent]:
+        """F5: read the stage-2 artifact from the shared workdir (written by
+        the stage-2 call in this trajectory) and append it as a predecessor
+        event so the stage-3 successor receives it through its architecture.
+        """
+        fixture = get_fixture("A", condition)
+        stage2 = fixture.stage_artifacts.get(2)
+        if stage2 is None:
+            return pred
+        workdir = self.workdir / tid
+        p = workdir / stage2.path
+        if not p.exists():
+            return pred
+        content = p.read_text()
+        tc = ToolCallReceipt(
+            receipt_id=compute_sha256(f"{tid}-s2out")[:32],
+            tool="write_file",
+            params={"path": stage2.path, "content": content},
+            status="ok",
+            output="ok",
+            evidence_refs=(),
+            timestamp=2.0,
+        )
+        ev = SessionEvent(
+            type="agent_message",
+            session_id=f"{tid}-S2",
+            trajectory_id=tid,
+            arm="verified_state",
+            condition=condition,
+            worker_label="S2",
+            stage=2,
+            timestamp=2.0,
+            tool_calls=(tc,),
+        )
+        return list(pred) + [ev]
+
+    def _materialize_predecessor(self, workdir: Path, pred: list[SessionEvent], condition: str, current_stage: int = 3) -> None:
+        """Write every fixture-declared predecessor artifact into the workdir.
+
+        F1 repair (act §5): the fixture is the authority for what predecessor
+        artifacts a trajectory requires. Materialize every stage artifact
+        declared by the frozen fixture for stages STRICTLY BEFORE the current
+        stage (the successor's own target stage must NOT be pre-written —
+        that would contaminate the hidden-test score). Plus any explicit
+        write_file events in the predecessor stream. Contents come from the
+        frozen fixture — never invented.
+        """
+        fixture = get_fixture("A", condition)
+        for stage, artifact in fixture.stage_artifacts.items():
+            if stage >= current_stage:
+                continue
+            p = workdir / artifact.path
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(artifact.content)
+        # Also honor any explicit write_file events (e.g., injected state)
+        for event in pred:
+            for tc in event.tool_calls:
+                if tc.tool == "write_file":
+                    rel = str(tc.params.get("path", ""))
+                    content = str(tc.params.get("content", ""))
+                    if not rel:
+                        continue
+                    p = workdir / rel
+                    p.parent.mkdir(parents=True, exist_ok=True)
+                    p.write_text(content)
+
+    def _materialize_stage2_output(self, workdir: Path, tid: str, arm: str, condition: str) -> None:
+        """F5 repair: for interruption stage-3, the stage-2 artifact must be
+        present as valid predecessor state. The stage-2 call in this same
+        trajectory already wrote it to the shared workdir; if absent (e.g.,
+        stage-2 call failed), materialize the frozen stage-2 fixture artifact
+        so the stage-3 successor can resume from a valid predecessor.
+        """
+        fixture = get_fixture("A", condition)
+        stage2 = fixture.stage_artifacts.get(2)
+        if stage2 is None:
+            return
+        p = workdir / stage2.path
+        if not p.exists():
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(stage2.content)
 
     def _evaluate_hidden(self, workdir: Path, condition: str) -> dict[str, bool]:
         """Run hidden tests in a SEPARATE subprocess (isolation)."""

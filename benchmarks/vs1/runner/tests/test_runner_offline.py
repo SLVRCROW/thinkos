@@ -54,16 +54,27 @@ class MockProvider:
 class TestSchedule(unittest.TestCase):
     def test_frozen_topology(self):
         s = build_schedule(replicates=3)
-        self.assertEqual(s["expected_calls"], 108)
-        self.assertEqual(s["hard_max_calls"], 108)
+        self.assertEqual(s["trajectories"], 108)
+        self.assertEqual(s["expected_calls"], 126)
+        self.assertEqual(s["hard_max_calls"], 126)
         self.assertTrue(validate_schedule(s))
 
     def test_schedule_invariants(self):
-        s = build_schedule(replicates=1)
-        self.assertEqual(s["expected_calls"], 36)
+        s = build_schedule(replicates=3)
         self.assertTrue(validate_schedule(s))
         s["hard_max_calls"] = 999
         self.assertFalse(validate_schedule(s))
+
+    def test_interruption_two_calls(self):
+        s = build_schedule(replicates=1)
+        # 36 trajectories: 30 single-call + 6 interruption × 2 = 42 calls
+        self.assertEqual(s["trajectories"], 36)
+        self.assertEqual(s["expected_calls"], 42)
+        cells = s["cells"]
+        int_cells = [c for c in cells if c["condition"] == "interruption"]
+        self.assertEqual(len(int_cells), 12)  # 6 arms × 2 stages
+        stages = sorted(c["stage"] for c in int_cells)
+        self.assertEqual(stages, [2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3])
 
 
 class TestPrompts(unittest.TestCase):

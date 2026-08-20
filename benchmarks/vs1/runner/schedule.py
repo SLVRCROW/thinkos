@@ -49,26 +49,56 @@ def build_schedule(
     conditions: tuple[str, ...] = CONDITIONS,
     schedule_version: str = "v0.1.0",
 ) -> dict[str, Any]:
+    """Generate the schedule mechanically from experiment semantics.
+
+    F5 REPAIR (Marc act AUTHORIZE_VS1_R3...): interruption trajectories
+    contain TWO successor calls (stage-2 then stage-3) belonging to ONE
+    statistical trajectory. All other conditions: one call per trajectory.
+
+    Expected topology: 6 arms × 6 conditions × 3 replicates = 108 trajectories;
+    90 non-interruption × 1 call + 18 interruption × 2 calls = 126 provider calls.
+    """
     cells = []
     for r in range(1, replicates + 1):
         for condition in conditions:
             for arm in arms:
                 tid = f"r{r}-{condition}-{arm}"
-                cell = ScheduleCell(
-                    trajectory_id=tid,
-                    arm=arm,
-                    condition=condition,
-                    replicate=r,
-                    stage=3,  # successor produces final artifact (stage 3)
-                    prompt_id=f"vs1-{schedule_version}-{arm}-{condition}-s3",
-                    expected_call_id=f"call-{schedule_version}-{tid}",
-                )
-                cells.append(cell)
+                if condition == "interruption":
+                    # Two calls, one trajectory (F5)
+                    cells.append(ScheduleCell(
+                        trajectory_id=tid,
+                        arm=arm,
+                        condition=condition,
+                        replicate=r,
+                        stage=2,
+                        prompt_id=f"vs1-{schedule_version}-{arm}-{condition}-s2",
+                        expected_call_id=f"call-{schedule_version}-{tid}-s2",
+                    ))
+                    cells.append(ScheduleCell(
+                        trajectory_id=tid,
+                        arm=arm,
+                        condition=condition,
+                        replicate=r,
+                        stage=3,
+                        prompt_id=f"vs1-{schedule_version}-{arm}-{condition}-s3",
+                        expected_call_id=f"call-{schedule_version}-{tid}-s3",
+                    ))
+                else:
+                    cells.append(ScheduleCell(
+                        trajectory_id=tid,
+                        arm=arm,
+                        condition=condition,
+                        replicate=r,
+                        stage=3,
+                        prompt_id=f"vs1-{schedule_version}-{arm}-{condition}-s3",
+                        expected_call_id=f"call-{schedule_version}-{tid}",
+                    ))
     schedule = {
         "schedule_version": schedule_version,
         "arms": list(arms),
         "conditions": list(conditions),
         "replicates": replicates,
+        "trajectories": len({c.trajectory_id for c in cells}),
         "expected_calls": len(cells),
         "hard_max_calls": len(cells),
         "retries": 0,
@@ -93,10 +123,17 @@ def write_schedule(
 
 
 def validate_schedule(schedule: dict[str, Any]) -> bool:
-    """Validate schedule invariants."""
+    """Validate schedule invariants.
+
+    R3 topology (Marc act AUTHORIZE_VS1_R3...): 108 trajectories, 126 calls
+    (90 non-interruption × 1 + 18 interruption × 2). Assert mechanically.
+    """
     cells = schedule.get("cells", [])
     ids = [c["expected_call_id"] for c in cells]
     if len(ids) != len(set(ids)):
+        return False
+    trajectories = {c["trajectory_id"] for c in cells}
+    if len(trajectories) != schedule.get("trajectories"):
         return False
     if len(cells) != schedule.get("expected_calls"):
         return False
@@ -104,4 +141,17 @@ def validate_schedule(schedule: dict[str, Any]) -> bool:
         return False
     if schedule.get("retries") != 0 or schedule.get("replacements") != 0:
         return False
+    # R3 topology assertions: 108 trajectories, 126 calls
+    if schedule.get("trajectories") != 108:
+        return False
+    if schedule.get("expected_calls") != 126:
+        return False
+    # Every interruption trajectory must have exactly 2 calls (s2 + s3)
+    from collections import Counter
+    call_counts = Counter(c["trajectory_id"] for c in cells)
+    for tid, n in call_counts.items():
+        if tid.split("-", 2)[1] == "interruption" and n != 2:
+            return False
+        if tid.split("-", 2)[1] != "interruption" and n != 1:
+            return False
     return True

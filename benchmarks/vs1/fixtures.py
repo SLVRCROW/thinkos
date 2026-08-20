@@ -483,6 +483,9 @@ def inject_predecessor_state(condition: str, base_transcript: list[SessionEvent]
     if condition_label == "motif":
         # The predecessor performed a tested validation procedure; every arm
         # must be able to see it through its representation (Athena F7).
+        # F2 REPAIR (Marc act AUTHORIZE_VS1_R3...): preserve the original
+        # stage-1 write_file event AND add the procedure run event — the
+        # predecessor artifact must not be destroyed by the procedure event.
         first = base_transcript[0]
         proc_tc = ToolCallReceipt(
             receipt_id="rct_validation_procedure",
@@ -494,6 +497,7 @@ def inject_predecessor_state(condition: str, base_transcript: list[SessionEvent]
             timestamp=first.timestamp,
         )
         events = list(base_transcript)
+        original_writes = tuple(tc for tc in first.tool_calls if tc.tool == "write_file")
         events[0] = SessionEvent(
             type=first.type,
             session_id=first.session_id,
@@ -503,7 +507,7 @@ def inject_predecessor_state(condition: str, base_transcript: list[SessionEvent]
             worker_label=first.worker_label,
             stage=first.stage,
             timestamp=first.timestamp,
-            tool_calls=(proc_tc,),
+            tool_calls=original_writes + (proc_tc,),
             metadata={**first.metadata, "constraints": ["reuse the validation procedure"], "procedures": ["validate.py"]},
         )
         return events
