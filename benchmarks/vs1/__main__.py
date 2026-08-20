@@ -82,6 +82,11 @@ def compute_receipt_id(seed: str) -> str:
     return compute_sha256(seed)[:20]
 
 
+def _stable_seed(text: str) -> int:
+    """Deterministic seed from content (Python's hash() is per-process salted)."""
+    return int(compute_sha256(text)[:12], 16) % 10_000
+
+
 def run_vs1_dry_run(output_dir: str | Path | None = None) -> dict[str, Any]:
     """Run the VS-1 instrumentation dry-run and return results."""
     gates: dict[str, bool] = {}
@@ -167,7 +172,7 @@ def run_vs1_dry_run(output_dir: str | Path | None = None) -> dict[str, Any]:
             state = get_transformer(arm).transform(transcript)
             wd = create_isolated_workdir(tid, base_dir)
             fixture = get_fixture("A", condition)
-            succ_events = synthetic_successor(tid, arm, condition, "A", state.content, wd, capability=0.9, seed=hash(tid) % 10000)
+            succ_events = synthetic_successor(tid, arm, condition, "A", state.content, wd, capability=0.9, seed=_stable_seed(tid))
             hidden = fixture.run_hidden_test(wd)
             score = score_trajectory(
                 trajectory_id=tid,
@@ -354,7 +359,14 @@ trajectories_scores: dict[str, Any] = {}
 
 
 def main() -> int:
-    result = run_vs1_dry_run()
+    output_dir = None
+    if len(sys.argv) > 1:
+        if sys.argv[1] == "--output" and len(sys.argv) > 2:
+            output_dir = sys.argv[2]
+        elif sys.argv[1] == "--help":
+            print("Usage: python -m benchmarks.vs1 [--output DIR]")
+            return 0
+    result = run_vs1_dry_run(output_dir)
     return 0 if result.get("result") == "PASS" else 1
 
 
