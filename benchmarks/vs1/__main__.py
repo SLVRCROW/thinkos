@@ -225,6 +225,8 @@ def run_vs1_dry_run(output_dir: str | Path | None = None) -> dict[str, Any]:
                 },
                 "adapter_state": state.to_json(),
                 "receipt": make_trajectory_receipt(tid, arm, condition, score.to_json(), {}).to_json(),
+                "predecessor_events": transcript,
+                "successor_events": succ_events,
             }
             trajectories_scores[tid] = score.to_json()
             scores_by_arm[arm].append(score.final_task_quality)

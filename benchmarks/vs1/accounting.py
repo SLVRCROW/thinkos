@@ -54,7 +54,12 @@ def compute_call_cost(
     price_per_1k_cached_input: int = 0,
 ) -> dict[str, int]:
     """Micro-USD cost with ceiling division (G1 semantics: integer micro-USD)."""
-    input_tokens = call.prompt_tokens - call.cached_input_tokens
+    input_tokens = max(call.prompt_tokens - call.cached_input_tokens, 0)
+    if call.cached_input_tokens > call.prompt_tokens:
+        raise ValueError(
+            f"cached_input_tokens ({call.cached_input_tokens}) exceeds prompt_tokens "
+            f"({call.prompt_tokens}) for {call.provider_invocation_id}"
+        )
     cost = 0
     input_cost = 0
     cached_cost = 0

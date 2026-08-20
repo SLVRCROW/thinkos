@@ -108,6 +108,13 @@ def build_evidence_packet(
         (tdir / "trajectory.json").write_text(json_dumps(data.get("trajectory", {})))
         (tdir / "adapter.json").write_text(json_dumps(data.get("adapter_state", {})))
         (tdir / "receipt.json").write_text(json_dumps(data.get("receipt", {})))
+        # Daedalus F7: persist the per-trajectory event log (predecessor +
+        # successor SessionEvents) so an independent reviewer can reconstruct
+        # the exact tool-call sequence and scoring inputs.
+        event_log = []
+        for ev in data.get("predecessor_events", []) + data.get("successor_events", []):
+            event_log.append(ev.to_json() if hasattr(ev, "to_json") else ev)
+        (tdir / "events.jsonl").write_text("\n".join(json_dumps(e) for e in event_log))
         for f in tdir.iterdir():
             if f.is_file():
                 hashes[str(f.relative_to(root))] = compute_sha256(f.read_text())

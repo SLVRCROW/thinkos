@@ -278,6 +278,17 @@ class TestAccounting(unittest.TestCase):
         r = pilot_accounting(calls, {"input_per_1k": 100, "output_per_1k": 300, "cached_input_per_1k": 50}, budget_micro_usd=100)
         self.assertFalse(r["within_budget"])
 
+    def test_cached_input_validation(self):
+        """Daedalus F6: cached > prompt must raise, not silently undercharge."""
+        bad = ProviderCall("p_bad", "t", "A", 2, prompt_tokens=100, cached_input_tokens=500)
+        from benchmarks.vs1.accounting import compute_call_cost
+        with self.assertRaises(ValueError):
+            compute_call_cost(bad, 100, 300, 50)
+        good = ProviderCall("p_ok", "t", "A", 2, prompt_tokens=1000, cached_input_tokens=400)
+        r = compute_call_cost(good, 100, 300, 50)
+        # 600 uncached input @ 0.10/1k = 60; 400 cached @ 0.05/1k = 20; 0 output
+        self.assertEqual(r["micro_usd"], 80)
+
 
 class TestEvidence(unittest.TestCase):
     def test_packet_reconstruct(self):
