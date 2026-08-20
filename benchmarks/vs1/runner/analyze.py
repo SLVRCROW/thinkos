@@ -31,8 +31,14 @@ from benchmarks.vs1.runner.sealer import EvidenceSealer
 def load_outcomes(root: Path) -> list[dict]:
     if not EvidenceSealer.verify(root):
         raise RuntimeError("Evidence seal verification FAILED — refusing to analyze")
+    # R4 forensic fix: the sealer writes outcomes twice — incrementally per
+    # call (call-*.outcome.json, one per provider invocation) and at seal
+    # time under trajectory_id (which OVERWRITES for multi-call interruption
+    # trajectories, keeping only the last cell). The call-named files are
+    # the canonical per-invocation records (126, matching the ledger); the
+    # trajectory-named files are redundant and must not be read.
     outs = []
-    for p in sorted((root / "raw").glob("*.outcome.json")):
+    for p in sorted((root / "raw").glob("call-*.outcome.json")):
         outs.append(json.loads(p.read_text()))
     return outs
 
