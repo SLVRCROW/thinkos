@@ -133,7 +133,7 @@ class TestIncrementalDurability(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 ex.run()
             # Every completed call must be reconstructible from the ledger + raw files
-            ledger = (root / "CALL_LEDGER.jsonl").read_text().strip().splitlines()
+            ledger = (root / "raw" / "CALL_LEDGER.jsonl").read_text().strip().splitlines()
             self.assertEqual(len(ledger), 2)
             raw_files = sorted((root / "raw").glob("*.raw.txt"))
             self.assertEqual(len(raw_files), 2)
@@ -239,6 +239,29 @@ class TestClassification(unittest.TestCase):
         )
         self.assertEqual(cls.category, OK)
 
+    def test_classify_parsed_but_contract_violated(self):
+        """Atlas F1/F3: parse_ok=True but contract_ok=False -> SUBJECT_TASK_FAILURE."""
+        cls = classify_outcome(
+            provider_status="ok",
+            provider_error="",
+            raw_content="id,score,status\n",  # header-only CSV
+            parse_ok=True,
+            contract_ok=False,
+            target_path="stage2/records.csv",
+        )
+        self.assertEqual(cls.category, SUBJECT_TASK_FAILURE)
+
+    def test_json_brace_in_string(self):
+        """Atlas F2: braces inside string values must not break the scanner."""
+        raw = '{"key": "value {nested}", "validation": "PASS"}'
+        self.assertTrue(contract_check_json(raw, "stage3/config.json"))
+        ok, _ = parse_artifact(raw, "stage3/config.json")
+        self.assertTrue(ok)
+
+    def test_json_brace_in_string_escaped(self):
+        raw = '{"key": "value \\" {nested}", "validation": "PASS"}'
+        self.assertTrue(contract_check_json(raw, "stage3/config.json"))
+
 
 class TestMethodGate(unittest.TestCase):
     """I + J + K + L: denominator reference vectors, early failures, bursts."""
@@ -270,6 +293,16 @@ class TestMethodGate(unittest.TestCase):
         for _ in range(4):
             g.record({"category": OK, "reason": ""})
         self.assertFalse(g.halted)
+
+    def test_J_boundary_one_failure_at_min_sample_halt(self):
+        """Solomon F7: exactly MIN_SAMPLE=10 with 1 failure = 10% > 5% -> halt."""
+        g = MethodGateState()
+        g.record({"category": PROVIDER_RUNTIME_FAILURE, "reason": ""})
+        for _ in range(9):
+            g.record({"category": OK, "reason": ""})
+        self.assertTrue(g.halted)
+        self.assertEqual(g.attempted_calls, 10)
+        self.assertIn("METHOD_FAILURE_TOLERANCE_EXCEEDED", g.halt_reason)
 
     def test_K_six_of_six_infrastructure_failures_halt(self):
         g = MethodGateState()

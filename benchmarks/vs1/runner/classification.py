@@ -99,6 +99,18 @@ def classify_outcome(
         )
 
     if parse_ok:
+        # Atlas F1/F3: use the ACTUAL contract result, not a hardcoded True.
+        # If the parser accepted but the contract check says the artifact is
+        # substantively invalid (e.g., header-only CSV), that is a subject
+        # task failure, not OK.
+        if contract_ok is False:
+            return Classification(
+                category=SUBJECT_TASK_FAILURE,
+                reason=f"parsed but does not satisfy frozen contract for {target_path}",
+                raw_hash=raw_hash,
+                parse_ok=True,
+                contract_ok=False,
+            )
         return Classification(
             category=OK,
             reason="parsed successfully",
@@ -140,10 +152,16 @@ def contract_check_csv(raw_content: str, target_path: str) -> bool | None:
     Frozen contract for CSV artifacts: non-empty, has a header line with a
     comma, and at least one data row. This mirrors the parser's acceptance
     rule — a contract-valid CSV must be parseable by the frozen parser.
+    Markdown fences are stripped exactly as the parser strips them, so a
+    fenced CSV is contract-valid (consistency with parse_artifact).
     """
     if not target_path.endswith(".csv"):
         return None
+    import re
     text = raw_content.strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```[a-zA-Z]*\s*", "", text)
+        text = re.sub(r"\s*```$", "", text)
     if not text:
         return False
     lines = [ln for ln in text.splitlines() if ln.strip()]
@@ -161,18 +179,38 @@ def contract_check_json(raw_content: str, target_path: str) -> bool | None:
 
     Returns True (satisfies), False (does not), or None (cannot determine).
     Frozen contract for JSON artifacts: contains a balanced JSON object.
+    Atlas F2: brace counting must track string state so braces inside
+    string values (e.g. {"key": "value {nested}"}) are not miscounted.
+    Markdown fences are stripped exactly as the parser strips them.
     """
     if not target_path.endswith(".json"):
         return None
+    import re
     text = raw_content.strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```[a-zA-Z]*\s*", "", text)
+        text = re.sub(r"\s*```$", "", text)
     start = text.find("{")
     if start == -1:
         return False
     depth = 0
+    in_string = False
+    escape = False
     for i in range(start, len(text)):
-        if text[i] == "{":
+        ch = text[i]
+        if in_string:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+        elif ch == "{":
             depth += 1
-        elif text[i] == "}":
+        elif ch == "}":
             depth -= 1
             if depth == 0:
                 try:

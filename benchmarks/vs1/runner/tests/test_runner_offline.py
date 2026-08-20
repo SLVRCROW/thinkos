@@ -134,6 +134,17 @@ class TestParseArtifact(unittest.TestCase):
         ok, _ = parse_artifact("", "stage2/records.csv")
         self.assertFalse(ok)
 
+    def test_csv_rejects_header_only(self):
+        """Athena F1: header-only CSV (no data rows) is NOT a valid artifact."""
+        ok, _ = parse_artifact("id,score,status\n", "stage2/records.csv")
+        self.assertFalse(ok)
+
+    def test_csv_accepts_leading_blank_lines(self):
+        """Athena F2: valid CSV with leading blank lines must not be rejected."""
+        ok, text = parse_artifact("\n\nid,score,status\na1,90,ok\n", "stage2/records.csv")
+        self.assertTrue(ok)
+        self.assertIn("a1,90,ok", text)
+
 
 class TestExecutorPipeline(unittest.TestCase):
     def test_full_pipeline_mock(self):

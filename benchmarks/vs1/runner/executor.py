@@ -101,8 +101,12 @@ def parse_artifact(content: str, target_path: str = "") -> tuple[bool, str]:
         text = re.sub(r"^```[a-zA-Z]*\s*", "", text)
         text = re.sub(r"\s*```$", "", text)
     if target_path.endswith(".csv"):
-        # CSV artifact: accept raw text (must be non-empty and contain a header)
-        if not text or "," not in text.splitlines()[0]:
+        # CSV artifact: accept raw text with a header AND at least one data
+        # row (Athena F1: header-only output is NOT a valid artifact — the
+        # frozen fixture requires data rows). Skip leading blank lines
+        # (Athena F2: valid CSV with leading whitespace must not be rejected).
+        lines = [ln for ln in text.splitlines() if ln.strip()]
+        if not lines or "," not in lines[0] or len(lines) < 2:
             return False, text
         return True, text
     start = text.find("{")
@@ -260,28 +264,46 @@ class PoweredExecutor:
         call_id = cell["expected_call_id"]
         provider_res = self.provider.complete(prompt.text, call_id)
 
+        # ── R4 IMMEDIATE VALIDITY FAILURES (Daedalus F3): model identity
+        #    mismatch and evidence persistence failures halt IMMEDIATELY,
+        #    regardless of percentage — they are not gate-counted.
+        if provider_res.returned_model and provider_res.returned_model != self.model:
+            raise RuntimeError(
+                f"IMMEDIATE_VALIDITY_FAILURE: model identity mismatch — "
+                f"expected {self.model}, got {provider_res.returned_model}"
+            )
+
         # ── R4 ORDERING (act §2): PROVIDER RESPONSE → PERSIST RAW → HASH →
         #    PARSE → MATERIALIZE → EVALUATE → CLASSIFY ──────────────────────
         # 1. PERSIST RAW RESPONSE BEFORE ANY PARSING. A parser failure must
         #    NEVER erase the model output. This is the instrument's ear.
         if self.sealer is not None:
-            self.sealer.write_raw_completion(call_id, provider_res.content)
-            self.sealer.write_provider(call_id, provider_res.to_json())
-            self.sealer.append_ledger({
-                "call_id": call_id,
-                "trajectory_id": tid,
-                "arm": arm,
-                "condition": condition,
-                "stage": stage,
-                "provider_status": provider_res.status,
-                "provider_error": provider_res.error,
-                "model": provider_res.returned_model,
-                "raw_hash": compute_sha256(provider_res.content),
-                "prompt_tokens": provider_res.prompt_tokens,
-                "completion_tokens": provider_res.completion_tokens,
-                "total_tokens": provider_res.total_tokens,
-                "timestamp": provider_res.timestamp,
-            })
+            try:
+                self.sealer.write_raw_completion(call_id, provider_res.content)
+                self.sealer.write_provider(call_id, provider_res.to_json())
+                self.sealer.append_ledger({
+                    "call_id": call_id,
+                    "trajectory_id": tid,
+                    "arm": arm,
+                    "condition": condition,
+                    "stage": stage,
+                    "provider_status": provider_res.status,
+                    "provider_error": provider_res.error,
+                    "model": provider_res.returned_model,
+                    "raw_hash": compute_sha256(provider_res.content),
+                    "prompt_tokens": provider_res.prompt_tokens,
+                    "completion_tokens": provider_res.completion_tokens,
+                    "total_tokens": provider_res.total_tokens,
+                    "timestamp": provider_res.timestamp,
+                })
+            except (OSError, UnicodeEncodeError, ValueError) as e:
+                # Evidence persistence failure = immediate validity halt
+                # (Atlas F5: UnicodeEncodeError on surrogate chars is NOT an
+                # OSError — broaden the catch so a write failure can never
+                # silently lose the model output).
+                raise RuntimeError(
+                    f"IMMEDIATE_VALIDITY_FAILURE: evidence persistence failure — {e}"
+                ) from e
 
         # 2. PARSE
         target_path = fixture_artifact_path("A", condition, stage)

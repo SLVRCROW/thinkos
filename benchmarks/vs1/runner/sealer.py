@@ -22,16 +22,35 @@ class EvidenceSealer:
         self.root = evidence_root
         self.raw = evidence_root / "raw"
         self.raw.mkdir(parents=True, exist_ok=True)
-        self.ledger_path = evidence_root / "CALL_LEDGER.jsonl"
+        # Daedalus F1: ledger lives UNDER raw/ so seal() hashes it into the
+        # manifest — a tampered/truncated ledger is then detectable.
+        self.ledger_path = self.raw / "CALL_LEDGER.jsonl"
+
+    def _write_durable(self, p: Path, content: str) -> None:
+        """Write + fsync (Daedalus F2): a power loss must not leave the
+        ledger referencing an unflushed raw file."""
+        with open(p, "w", encoding="utf-8") as f:
+            f.write(content)
+            f.flush()
+            os.fsync(f.fileno())
+        # fsync parent dir so the directory entry is durable
+        try:
+            fd = os.open(p.parent, os.O_RDONLY)
+            try:
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+        except OSError:
+            pass
 
     def write_prompt(self, cell_id: str, prompt_text: str, prompt_sha: str) -> Path:
         p = self.raw / f"{cell_id}.prompt.txt"
-        p.write_text(prompt_text)
+        self._write_durable(p, prompt_text)
         return p
 
     def write_provider(self, cell_id: str, provider_json: dict) -> Path:
         p = self.raw / f"{cell_id}.provider.json"
-        p.write_text(json_dumps(provider_json))
+        self._write_durable(p, json_dumps(provider_json))
         return p
 
     def write_raw_completion(self, cell_id: str, raw_content: str) -> Path:
@@ -42,17 +61,17 @@ class EvidenceSealer:
         of parse success, evaluation, or mid-run halt.
         """
         p = self.raw / f"{cell_id}.raw.txt"
-        p.write_text(raw_content)
+        self._write_durable(p, raw_content)
         return p
 
     def write_artifact(self, cell_id: str, artifact_text: str) -> Path:
         p = self.raw / f"{cell_id}.artifact.txt"
-        p.write_text(artifact_text)
+        self._write_durable(p, artifact_text)
         return p
 
     def write_cell(self, cell_id: str, outcome_json: dict) -> Path:
         p = self.raw / f"{cell_id}.outcome.json"
-        p.write_text(json_dumps(outcome_json))
+        self._write_durable(p, json_dumps(outcome_json))
         return p
 
     def append_ledger(self, entry: dict) -> None:
