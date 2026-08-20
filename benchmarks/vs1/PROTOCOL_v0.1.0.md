@@ -55,6 +55,11 @@ unless that difference is itself the declared manipulation.** The comparison tes
 and succession machinery, not secretly unequal knowledge. All arms start from the same
 predecessor checkpoint (shared Worker-A baseline) exactly as G0/G1 do.
 
+Condition-specific epistemic state (poison item, contradictory claims, reusable procedure) is
+injected into the INHERITED predecessor transcript by `inject_predecessor_state()` so every arm
+receives it through its own representation — the manipulation is the state itself, not a
+privileged channel (Athena F2/F5/F7 resolved).
+
 ### Adapter boundary contract (each adapter must expose)
 
 ```json
@@ -170,6 +175,13 @@ deterministic and tested; every trajectory carries isolation verification.
   (EE BCa defect is institutional scar tissue; any custom primitive is validated against an
   independent implementation before the powered run)
 - No threshold selected after data
+- EE-scar analysis (frozen): per-arm sensitivity/specificity decomposition via
+  `sensitivity_specificity_report()`; PASS requires sensitivity improvement WITHOUT
+  specificity degradation beyond `max_specificity_degradation` (0.05 default). The EE 2×2
+  failure mode (E raises sensitivity but degrades specificity) is instrumented, not hidden.
+- PASS logic is executable: `evaluate_pass()` implements the protocol §5 conjunctive rule
+  with frozen `DEFAULT_PASS_THRESHOLDS`; thresholds cannot be changed after data. No arm
+  receives PASS for winning one metric.
 
 ## 9. Small pilot (instrumentation)
 
