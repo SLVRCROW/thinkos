@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import re
 import shutil
 import tempfile
 from dataclasses import dataclass, field
@@ -71,12 +72,28 @@ def build_evidence_packet(
             score.json
             events.jsonl
             receipts.json
+        MANIFEST.sha256
         pilot_receipt.json
+
+    Path containment (Codex C10): run_id and trajectory IDs are validated
+    with a strict allowlist; every resolved path is verified relative to the
+    packet base before creation or deletion.
     """
-    root = Path(pilot_dir) / f"pilot_{run_id}"
+    if not _SAFE_ID_RE.match(run_id):
+        raise ValueError(f"Unsafe run_id: {run_id!r}")
+    for tid in trajectories:
+        if not _SAFE_ID_RE.match(tid):
+            raise ValueError(f"Unsafe trajectory_id: {tid!r}")
+
+    base = Path(pilot_dir).resolve()
+    base.mkdir(parents=True, exist_ok=True)
+    root = base / f"pilot_{run_id}"
     if root.exists():
+        # Only remove if root is strictly inside base (containment guard).
+        if not _is_subpath(root, base):
+            raise ValueError("Refusing to remove a packet root outside pilot_dir")
         shutil.rmtree(root)
-    root.mkdir(parents=True)
+    root.mkdir()
 
     (root / "pilot_config.json").write_text(json_dumps(pilot_config))
     (root / "pilot_scores.json").write_text(json_dumps(scores))
@@ -87,7 +104,7 @@ def build_evidence_packet(
     hashes: dict[str, str] = {}
     for tid, data in trajectories.items():
         tdir = traj_root / f"trajectory_{tid}"
-        tdir.mkdir(parents=True)
+        tdir.mkdir()
         (tdir / "trajectory.json").write_text(json_dumps(data.get("trajectory", {})))
         (tdir / "adapter.json").write_text(json_dumps(data.get("adapter_state", {})))
         (tdir / "receipt.json").write_text(json_dumps(data.get("receipt", {})))
@@ -95,14 +112,19 @@ def build_evidence_packet(
             if f.is_file():
                 hashes[str(f.relative_to(root))] = compute_sha256(f.read_text())
 
-    (root / "MANIFEST.sha256").write_text(
-        "\n".join(f"{h}  {p}" for p, h in sorted(hashes.items())) + "\n"
-    )
+    # Hash ALL immutable packet files, including config/scores (Codex C11).
+    for f in (root / "pilot_config.json", root / "pilot_scores.json"):
+        hashes[str(f.relative_to(root))] = compute_sha256(f.read_text())
 
+    manifest_text = "\n".join(f"{h}  {p}" for p, h in sorted(hashes.items())) + "\n"
+    (root / "MANIFEST.sha256").write_text(manifest_text)
+
+    # Pilot receipt: content_hash is a SHA-256 of the canonical manifest
+    # (Codex C11: raw JSON is not a hash).
     receipt = {
         "receipt_id": f"rct_{run_id}",
         "kind": "pilot",
-        "content_hash": json_dumps(sorted(hashes.items())),
+        "content_hash": compute_sha256(manifest_text),
         "created_at": "",
         "metadata": {"run_id": run_id, "n_trajectories": len(trajectories)},
     }
@@ -110,9 +132,53 @@ def build_evidence_packet(
     return root
 
 
+_SAFE_ID_RE = re.compile(r"^[a-zA-Z0-9_-]+$")
+
+
+def _is_subpath(child: Path, parent: Path) -> bool:
+    try:
+        child.relative_to(parent)
+        return True
+    except ValueError:
+        return False
+
+
 def reconstruct_experiment(packet_root: str | Path) -> dict[str, Any]:
-    """Reconstruct the experiment from a packet (validation of completeness)."""
-    root = Path(packet_root)
+    """Reconstruct the experiment from a packet.
+
+    Fails closed (Codex C11): verifies MANIFEST.sha256 against every file,
+    refuses missing/extra/mismatched files, and verifies the pilot receipt's
+    content_hash.
+    """
+    root = Path(packet_root).resolve()
+    manifest_path = root / "MANIFEST.sha256"
+    if not manifest_path.exists():
+        raise ValueError("Evidence packet missing MANIFEST.sha256")
+    manifest: dict[str, str] = {}
+    for line in manifest_path.read_text().splitlines():
+        if not line.strip():
+            continue
+        h, _, p = line.strip().partition("  ")
+        manifest[p] = h
+    if not manifest:
+        raise ValueError("Evidence packet manifest empty")
+
+    # Verify every listed file exists and matches; refuse extra files.
+    actual = {}
+    for f in sorted(root.rglob("*")):
+        if f.is_file() and f != manifest_path and f.name != "pilot_receipt.json":
+            actual[str(f.relative_to(root))] = compute_sha256(f.read_text())
+    for p, h in manifest.items():
+        if actual.get(p) != h:
+            raise ValueError(f"Manifest mismatch for {p}: expected {h}, got {actual.get(p)}")
+    for p in actual:
+        if p not in manifest:
+            raise ValueError(f"File not in manifest: {p}")
+
+    receipt = json.loads((root / "pilot_receipt.json").read_text())
+    if receipt.get("content_hash") != compute_sha256(manifest_path.read_text()):
+        raise ValueError("pilot_receipt.content_hash does not match MANIFEST.sha256")
+
     config = json.loads((root / "pilot_config.json").read_text())
     scores = json.loads((root / "pilot_scores.json").read_text())
     traj = {}

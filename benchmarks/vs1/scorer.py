@@ -291,9 +291,28 @@ def score_trajectory(
 
     steps = 0
     for i, e in enumerate(successor_events):
-        if _has_productive_activity([e]):
-            steps = i
-            break
+        # A productive action is the first CORRECT contribution, not merely
+        # any tool call (Codex C8). Correct = a successful write whose content
+        # passes the stage's behavioral test.
+        for tc in e.tool_calls:
+            if tc.tool == "write_file" and tc.status == "ok":
+                path = str(tc.params.get("path", ""))
+                for stage, artifact in fixture.stage_artifacts.items():
+                    if path == artifact.path or path.endswith("/" + artifact.path):
+                        content = str(tc.params.get("content", ""))
+                        try:
+                            data = json.loads(content)
+                        except Exception:
+                            data = content
+                        if all(_run_test(t, data) for t in fixture.stage_tests.get(stage, [])):
+                            steps = i
+                            break
+                else:
+                    continue
+                break
+        else:
+            continue
+        break
     else:
         steps = len(successor_events)
 

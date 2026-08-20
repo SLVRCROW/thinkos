@@ -35,7 +35,14 @@ from .accounting import (
     trajectory_accounting,
     pilot_accounting,
 )
-from .analysis import primary_contrasts, paired_wald_ci, exact_sign_test, risk_difference
+from .analysis import (
+    primary_contrasts,
+    paired_wald_ci,
+    exact_sign_test,
+    risk_difference,
+    evaluate_pass,
+    sensitivity_specificity_report,
+)
 from .evidence import build_evidence_packet, reconstruct_experiment, make_trajectory_receipt
 from .baseline import synthetic_successor
 
@@ -80,6 +87,22 @@ def _make_predecessor(trajectory_id: str, task: str, condition: str) -> list[Ses
 
 def compute_receipt_id(seed: str) -> str:
     return compute_sha256(seed)[:20]
+
+
+def build_metric_map(scores: dict[str, dict]) -> dict[str, dict[str, list[float]]]:
+    """Convert flat {trajectory_id: {metric: value}} into
+    {metric_name: {arm: [values]}} for analysis functions.
+    """
+    metric_map: dict[str, dict[str, list[float]]] = {}
+    for tid, s in scores.items():
+        arm = s.get("arm", "unknown")
+        for metric, value in s.items():
+            if metric in ("trajectory_id", "arm", "condition", "task", "method_failure_reason"):
+                continue
+            if not isinstance(value, (int, float)) or isinstance(value, bool):
+                continue
+            metric_map.setdefault(metric, {}).setdefault(arm, []).append(float(value))
+    return metric_map
 
 
 def _stable_seed(text: str) -> int:
@@ -165,6 +188,7 @@ def run_vs1_dry_run(output_dir: str | Path | None = None) -> dict[str, Any]:
     print("\n=== VS-1: Deterministic scoring ===")
     scores_by_arm: dict[str, list[float]] = {arm: [] for arm in ARMS}
     all_scores: dict[str, Any] = {}
+    isolation_ok_all = True
     for condition in ("clean", "interruption", "reversal", "contradiction", "poison", "motif"):
         for arm in ARMS:
             tid = f"T-{condition}-{arm}"
@@ -172,7 +196,17 @@ def run_vs1_dry_run(output_dir: str | Path | None = None) -> dict[str, Any]:
             state = get_transformer(arm).transform(transcript)
             wd = create_isolated_workdir(tid, base_dir)
             fixture = get_fixture("A", condition)
+            # Codex C16: embed the arm's canary in the actual successor
+            # environment (the adapter-state envelope), not a toy envelope.
+            env = {"arm": arm, "canary": CANARIES[arm]}
             succ_events = synthetic_successor(tid, arm, condition, "A", state.content, wd, capability=0.9, seed=_stable_seed(tid))
+            # Persist isolation verification per trajectory (protocol §7).
+            iso_ok = verify_isolation(wd)
+            foreign = detect_foreign_canary(
+                json_dumps([e.to_json() for e in succ_events]) + json_dumps(env),
+                arm,
+            )
+            isolation_ok_all = isolation_ok_all and iso_ok and not foreign
             hidden = fixture.run_hidden_test(wd)
             score = score_trajectory(
                 trajectory_id=tid,
@@ -184,7 +218,11 @@ def run_vs1_dry_run(output_dir: str | Path | None = None) -> dict[str, Any]:
                 hidden_test_results=hidden,
             )
             trajectories[tid] = {
-                "trajectory": {"id": tid, "arm": arm, "condition": condition},
+                "trajectory": {
+                    "id": tid, "arm": arm, "condition": condition,
+                    "isolation_verified": iso_ok,
+                    "foreign_canary_detected": bool(foreign),
+                },
                 "adapter_state": state.to_json(),
                 "receipt": make_trajectory_receipt(tid, arm, condition, score.to_json(), {}).to_json(),
             }
@@ -192,7 +230,9 @@ def run_vs1_dry_run(output_dir: str | Path | None = None) -> dict[str, Any]:
             scores_by_arm[arm].append(score.final_task_quality)
             all_scores[tid] = score.to_json()
     gates["scoring"] = all(v is not None for v in all_scores.values()) and len(all_scores) == 36
-    print(f"  Result: {len(all_scores)}/36 scores — {'PASS' if gates['scoring'] else 'FAIL'}")
+    gates["isolation"] = gates["isolation"] and isolation_ok_all
+    print(f"  Result: {len(all_scores)}/36 scores, isolation={isolation_ok_all} — "
+          f"{'PASS' if gates['scoring'] else 'FAIL'}")
 
     # ── Gate 7: Accounting (sum-of-parts, budgets) ────────────────────────
     print("\n=== VS-1: Accounting ===")
@@ -259,29 +299,60 @@ def run_vs1_dry_run(output_dir: str | Path | None = None) -> dict[str, Any]:
     print(f"  Result: packet={packet.name} reconstructed={recon['n_trajectories']} — "
           f"{'PASS' if gates['evidence'] else 'FAIL'}")
 
-    # ── Gate 9: analysis reconstruction ──────────────────────────────────
+    # ── Gate 9: analysis reconstruction (full frozen contract) ────────────
     print("\n=== VS-1: Analysis (frozen primitives) ===")
     means = {arm: (sum(v) / len(v) if v else 0.0) for arm, v in scores_by_arm.items()}
+    # Codex C15: the analysis gate must exercise the full frozen analysis
+    # contract, not just means: primary contrasts, PASS logic, sensitivity/
+    # specificity, and canonical serialization of every result.
     analysis_ok = len(means) == 6
+    contrasts = []
+    try:
+        contrasts = primary_contrasts(scores_by_arm)
+        analysis_ok = analysis_ok and len(contrasts) == 3
+        # Sensitivity/specificity (EE scar)
+        ss = sensitivity_specificity_report(scores_by_metric=build_metric_map(all_scores))
+        analysis_ok = analysis_ok and all(arm in ss for arm in ARMS)
+        # Evaluate PASS on actual scorer output
+        pass_results = evaluate_pass(build_metric_map(all_scores))
+        analysis_ok = analysis_ok and all(arm in pass_results for arm in ("verified_state", "verified_state_procedure"))
+        # Canonical serialization of every analysis result (Codex C2)
+        json_dumps([c.to_json() for c in contrasts])
+        json_dumps({arm: {k: (None if v != v else v) for k, v in ss[arm].items()} for arm in ss})
+        json_dumps({arm: pr.to_json() for arm, pr in pass_results.items()})
+    except Exception as e:
+        analysis_ok = False
+        errors.append(f"analysis gate failed: {e}")
     gates["analysis"] = analysis_ok
-    print(f"  Result: means={ {k: round(v, 3) for k, v in means.items()} } — "
+    print(f"  Result: means={ {k: round(v, 3) for k, v in means.items()} } "
+          f"contrasts={len(contrasts) if analysis_ok else 'ERR'} "
+          f"pass_logic={'OK' if analysis_ok else 'ERR'} — "
           f"{'PASS' if analysis_ok else 'FAIL'}")
 
-    # ── Gate 10: No-network/no-model proof ───────────────────────────────
+    # ── Gate 10: No-network/no-model proof (AST import audit) ─────────────
     print("\n=== VS-1: No network/model calls ===")
-    import socket
-    blocked = []
-    def _block(*args, **kwargs):
-        blocked.append(True)
-        raise RuntimeError("network call attempted")
-    orig = socket.create_connection
-    socket.create_connection = _block
-    try:
-        run_vs1_workload()
-    finally:
-        socket.create_connection = orig
-    gates["no_network_calls"] = not blocked
-    print(f"  Result: {'PASS' if not blocked else 'FAIL'}")
+    import ast
+    from pathlib import Path as _P
+    pkg = _P(__file__).resolve().parent
+    forbidden = {"socket", "requests", "urllib", "http", "httpx", "aiohttp", "openai", "anthropic"}
+    banned_imports = []
+    for f in sorted(pkg.rglob("*.py")):
+        if "tests" in f.parts:
+            continue
+        tree = ast.parse(f.read_text())
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    top = alias.name.split(".")[0]
+                    if top in forbidden:
+                        banned_imports.append(f"{f.name}: import {alias.name}")
+            elif isinstance(node, ast.ImportFrom) and node.module:
+                top = node.module.split(".")[0]
+                if top in forbidden:
+                    banned_imports.append(f"{f.name}: from {node.module} import")
+    gates["no_network_calls"] = not banned_imports
+    print(f"  Result: {'PASS' if not banned_imports else 'FAIL'} "
+          f"({len(banned_imports)} forbidden imports: {banned_imports[:3]})")
 
     print("\n============================================================")
     print("VS-1 DRY RUN:", "PASS" if all(gates.values()) else "FAIL")

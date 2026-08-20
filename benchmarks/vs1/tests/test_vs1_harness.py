@@ -300,6 +300,49 @@ class TestEvidence(unittest.TestCase):
             self.assertEqual(recon["n_trajectories"], 1)
             self.assertTrue((packet / "MANIFEST.sha256").exists())
 
+    def test_traversal_rejected(self):
+        """Codex C10: run_id and trajectory IDs must be safe."""
+        with tempfile.TemporaryDirectory() as d:
+            with self.assertRaises(ValueError):
+                build_evidence_packet(
+                    run_id="../../../escaped",
+                    pilot_dir=d,
+                    trajectories={},
+                    pilot_config={},
+                    scores={},
+                )
+            with self.assertRaises(ValueError):
+                build_evidence_packet(
+                    run_id="r1",
+                    pilot_dir=d,
+                    trajectories={"../evil": {"trajectory": {}}},
+                    pilot_config={},
+                    scores={},
+                )
+
+    def test_reconstruction_fails_closed(self):
+        """Codex C11: tampered trajectory must fail reconstruction."""
+        with tempfile.TemporaryDirectory() as d:
+            traj = {
+                "t1": {
+                    "trajectory": {"id": "t1", "arm": "stateless", "condition": "clean"},
+                    "adapter_state": {"arm": "stateless", "content": {}, "token_cost": 0},
+                    "receipt": {"receipt_id": "rct_t1", "kind": "trajectory"},
+                }
+            }
+            packet = build_evidence_packet(
+                run_id="r2",
+                pilot_dir=d,
+                trajectories=traj,
+                pilot_config={"arms": list(ARMS)},
+                scores={"t1": {"final_task_quality": 0.5}},
+            )
+            # Tamper with a trajectory file
+            tampered = packet / "trajectories" / "trajectory_t1" / "trajectory.json"
+            tampered.write_text('{"id": "evil"}')
+            with self.assertRaises(ValueError):
+                reconstruct_experiment(packet)
+
 
 class TestG0IntegrityGuarantee(unittest.TestCase):
     """VS-1 must never modify G0 frozen files."""

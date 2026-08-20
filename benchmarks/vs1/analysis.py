@@ -227,10 +227,17 @@ class PassConjunctResult:
         return {
             "name": self.name,
             "passed": self.passed,
-            "value": self.value,
-            "threshold": self.threshold,
+            "value": _fin(self.value),
+            "threshold": _fin(self.threshold),
             "detail": self.detail,
         }
+
+
+def _fin(x: float) -> float | None:
+    """Serialize non-finite floats as None (canonical JSON allow_nan=False)."""
+    if isinstance(x, float) and (x != x or x in (float("inf"), float("-inf"))):
+        return None
+    return x
 
 
 DEFAULT_PASS_THRESHOLDS: dict[str, float] = {
@@ -402,6 +409,9 @@ def primary_contrasts(
         n = min(len(x), len(y))
         if n == 0:
             return (float("nan"), float("nan"), 0)
+        if n == 1:
+            # One pair: effect estimable, CI unestimable (Codex C14)
+            return (float("nan"), float("nan"), 1)
         return (*paired_wald_ci(x[:n], y[:n]), n)
 
     def _diff(x: Sequence[float], y: Sequence[float], n: int) -> float:

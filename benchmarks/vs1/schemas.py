@@ -13,7 +13,6 @@ import hashlib
 import json
 import re
 import threading
-import uuid
 from typing import Any
 
 # ── Six arms (frozen; VS-1 protocol §3) ──────────────────────────────────────
@@ -65,11 +64,17 @@ def compute_sha256(content: str) -> str:
 
 
 def make_receipt_id(prefix: str, trajectory_id: str, worker: str, stage: int, seq: int = 0) -> str:
-    """Guaranteed-unique receipt ID (UUID + monotonic counter, content-hash prefix)."""
-    unique = uuid.uuid4().hex
+    """Guaranteed-unique receipt ID.
+
+    Deterministic for dry-run/evidence purposes (Codex C12): derived from the
+    canonical input content, NOT from a per-process random UUID, so identical
+    inputs produce byte-identical packets. The powered run may reserve random
+    provider IDs where external uniqueness is required, but this package's
+    receipts are content-addressed.
+    """
     counter = _next_seq()
-    raw = f"{prefix}_{trajectory_id}_{worker}_s{stage}_{counter}_{unique}"
-    return hashlib.sha256(raw.encode()).hexdigest()[:32]
+    raw = f"{prefix}|{trajectory_id}|{worker}|s{stage}|{counter}|{seq}"
+    return compute_sha256(raw)[:32]
 
 
 def canonical_json(data: Any) -> str:

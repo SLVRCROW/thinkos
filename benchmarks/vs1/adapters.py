@@ -119,17 +119,21 @@ class TranscriptAdapter(_AdapterABC):
 
 
 class SummaryAdapter(_AdapterABC):
-    """C: deterministic compressed summary from checkpoint data.
+    """C: deterministic compressed state from the predecessor transcript.
 
-    No model call. Produces structured summary of completed stages and
-    receipt IDs. (G0 SummaryAdapter is frozen; this is the VS-1 variant
-    with richer narrative projection and stage invariants.)
+    No model call. Projects: completed stages, receipt IDs, plus the
+    condition-specific inherited content (claims, constraints, procedures)
+    so Arm C receives the same epistemic state as B/D/E/F through its own
+    representation (Codex C2; protocol §3 fairness).
     """
 
     arm = "summary"
 
     def transform(self, transcript: list[SessionEvent]) -> ArchitectureState:
         completed_stages: list[dict] = []
+        claims: list[dict] = []
+        constraints: list[dict] = []
+        procedures: list[dict] = []
         for event in transcript:
             if event.checkpoint:
                 completed_stages.append({
@@ -140,10 +144,32 @@ class SummaryAdapter(_AdapterABC):
                     "test_results": event.checkpoint.test_results,
                     "session_tokens": event.checkpoint.session_token_count,
                 })
+            for tc in event.tool_calls:
+                # Project evidence-bearing claims (poison/contradiction/procedure)
+                # so the summary carries the same inherited content.
+                for r in tc.evidence_refs:
+                    claims.append({
+                        "receipt_id": r.receipt_id,
+                        "claim_type": r.claim_type,
+                        "claim_value": r.claim_value,
+                    })
+                if tc.tool == "run" and tc.status == "ok":
+                    procedures.append({
+                        "receipt_id": tc.receipt_id,
+                        "command": tc.params.get("command", ""),
+                        "output": tc.output,
+                        "claim_type": "procedure",
+                    })
+            for c in event.metadata.get("constraints", []):
+                if isinstance(c, str):
+                    constraints.append({"constraint": c})
         content = {
             "completed_stages": completed_stages,
             "n_stages": len(completed_stages),
             "n_events": len(transcript),
+            "claims": claims,
+            "constraints": constraints,
+            "procedures": procedures,
         }
         return ArchitectureState(
             arm="summary",
@@ -262,6 +288,10 @@ class VerifiedStateAdapter(_AdapterABC):
         claims = []
         constraints: list[dict] = []
         open_questions: list[str] = []
+        decisions: list[dict] = []
+        contradictions: list[dict] = []
+        invalidations: list[dict] = []
+        provenance: dict[str, list[str]] = {}
         next_stage = None
         for event in transcript:
             for tc in event.tool_calls:
@@ -277,6 +307,19 @@ class VerifiedStateAdapter(_AdapterABC):
                             for r in tc.evidence_refs
                         ],
                     })
+                    # Track provenance: every receipt appears in the state's
+                    # provenance record (Codex C4 typed provenance).
+                    provenance.setdefault(tc.receipt_id, []).append("claim")
+                # Detect explicit contradictions in the inherited claims:
+                # two claims of the same claim_type with opposite values.
+                if event.metadata.get("contradiction_markers"):
+                    for marker in event.metadata["contradiction_markers"]:
+                        contradictions.append({
+                            "claim_a": marker.get("claim_a", ""),
+                            "claim_b": marker.get("claim_b", ""),
+                            "receipt_ids": marker.get("receipt_ids", []),
+                            "resolved": False,
+                        })
             if event.checkpoint:
                 claims.append({
                     "receipt_ids": [event.checkpoint.receipt_id],
@@ -284,13 +327,29 @@ class VerifiedStateAdapter(_AdapterABC):
                     "test_results": event.checkpoint.test_results,
                 })
                 next_stage = event.checkpoint.stage_number + 1
-            # Structured metadata → constraints / open questions
+                provenance.setdefault(event.checkpoint.receipt_id, []).append("checkpoint")
+            # Structured metadata → constraints / open questions / decisions
             for c in event.metadata.get("constraints", []):
                 if isinstance(c, str) and c not in constraints:
                     constraints.append({"constraint": c, "receipt_id": event.checkpoint.receipt_id if event.checkpoint else None})
             for q in event.metadata.get("open_questions", []):
                 if isinstance(q, str) and q not in open_questions:
                     open_questions.append(q)
+            for d in event.metadata.get("decisions", []):
+                if isinstance(d, dict):
+                    decisions.append({
+                        "decision": d.get("decision", ""),
+                        "rationale": d.get("rationale", ""),
+                        "receipt_id": d.get("receipt_id") or (event.checkpoint.receipt_id if event.checkpoint else None),
+                        "status": d.get("status", "current"),
+                    })
+            for i in event.metadata.get("invalidations", []):
+                if isinstance(i, dict):
+                    invalidations.append({
+                        "invalidated_receipt_id": i.get("invalidated_receipt_id", ""),
+                        "reason": i.get("reason", ""),
+                        "replacement_receipt_id": i.get("replacement_receipt_id"),
+                    })
 
         exact_next_action = None
         if next_stage is not None:
@@ -303,6 +362,10 @@ class VerifiedStateAdapter(_AdapterABC):
         content = {
             "claims": claims,
             "verified_count": len(claims),
+            "decisions": decisions,
+            "contradictions": contradictions,
+            "invalidations": invalidations,
+            "provenance": provenance,
             "constraints": constraints,
             "open_questions": open_questions,
             "exact_next_action": exact_next_action,
@@ -329,8 +392,10 @@ class VerifiedStateAdapter(_AdapterABC):
 class VerifiedStateProcedureAdapter(VerifiedStateAdapter):
     """F: verified state + tested reusable procedures.
 
-    Adds procedures with explicit scope, inputs, outputs, failure conditions,
-    verification, and reuse history. Deterministic extraction from transcripts.
+    Adds typed procedure records (Codex C5): every procedure carries scope,
+    inputs, outputs, failure_conditions, verification, and reuse history.
+    Only procedures with affirmative test evidence are admitted; unsupported
+    procedures are marked unverified and do not count as reusable.
     """
 
     arm = "verified_state_procedure"
@@ -340,29 +405,43 @@ class VerifiedStateProcedureAdapter(VerifiedStateAdapter):
         procedures = []
         for event in transcript:
             for tc in event.tool_calls:
-                if tc.status == "ok" and tc.tool in ("write_file", "run", "pytest", "test"):
-                    procedures.append({
-                        "receipt_id": tc.receipt_id,
-                        "tool": tc.tool,
-                        "params": tc.params,
-                        "output": tc.output,
+                # Only admit procedures with affirmative test evidence:
+                # a run/test/pytest call that produced a passing result, or a
+                # checkpoint whose test_results are all True.
+                has_pass_evidence = (
+                    (tc.tool in ("run", "pytest", "test") and tc.status == "ok")
+                    or (event.checkpoint is not None and bool(event.checkpoint.test_results))
+                )
+                if not has_pass_evidence:
+                    continue
+                procedures.append({
+                    "receipt_id": tc.receipt_id,
+                    "tool": tc.tool,
+                    "params": tc.params,
+                    "output": tc.output,
+                    "scope": event.metadata.get("procedure_scope", ""),
+                    "inputs": event.metadata.get("procedure_inputs", []),
+                    "outputs": event.metadata.get("procedure_outputs", []),
+                    "failure_conditions": event.metadata.get("procedure_failure_conditions", []),
+                    "verification": {
+                        "status": "verified",
+                        "test_results": event.checkpoint.test_results if event.checkpoint else {},
                         "evidence_refs": [
                             {"receipt_id": r.receipt_id, "claim_type": r.claim_type,
                              "claim_value": r.claim_value}
                             for r in tc.evidence_refs
                         ],
-                        "failure_conditions": [],
-                        "verification": "test_results present" if event.checkpoint else "unverified",
-                        "reuse_history": [],
-                    })
-        base.content["procedures"] = procedures
-        base = ArchitectureState(
+                    },
+                    "reuse_history": event.metadata.get("procedure_reuse_history", []),
+                })
+        base_content = base.content
+        base_content["procedures"] = procedures
+        return ArchitectureState(
             arm="verified_state_procedure",
-            content=base.content,
-            token_cost=_json_tokens_estimate(base.content),
+            content=base_content,
+            token_cost=_json_tokens_estimate(base_content),
             provenance=base.provenance,
         )
-        return base
 
     def boundary(self) -> ArmBoundary:
         return ArmBoundary(
