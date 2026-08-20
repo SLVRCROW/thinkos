@@ -103,20 +103,35 @@ class TestPrompts(unittest.TestCase):
 
 class TestParseArtifact(unittest.TestCase):
     def test_plain_json(self):
-        ok, text = parse_artifact('{"validation": "PASS"}')
+        ok, text = parse_artifact('{"validation": "PASS"}', "stage3/config.json")
         self.assertTrue(ok)
         self.assertIn("PASS", text)
 
     def test_markdown_fence(self):
-        ok, text = parse_artifact('```json\n{"validation":"PASS"}\n```')
+        ok, text = parse_artifact('```json\n{"validation":"PASS"}\n```', "stage3/config.json")
         self.assertTrue(ok)
 
     def test_commentary_wrapped(self):
-        ok, text = parse_artifact('Here is the file:\n{"validation":"PASS"}\nDone.')
+        ok, text = parse_artifact('Here is the file:\n{"validation":"PASS"}\nDone.', "stage3/config.json")
         self.assertTrue(ok)
 
     def test_not_json(self):
-        ok, _ = parse_artifact("I cannot complete this task.")
+        ok, _ = parse_artifact("I cannot complete this task.", "stage3/config.json")
+        self.assertFalse(ok)
+
+    def test_csv_artifact(self):
+        """F5: interruption stage-2 produces CSV; parser must accept it."""
+        ok, text = parse_artifact("id,score,status\na1,90,ok\na2,85,ok\n", "stage2/records.csv")
+        self.assertTrue(ok)
+        self.assertIn("a1,90,ok", text)
+
+    def test_csv_fenced(self):
+        ok, text = parse_artifact('```csv\nid,score,status\na1,90,ok\n```', "stage2/records.csv")
+        self.assertTrue(ok)
+        self.assertIn("a1,90,ok", text)
+
+    def test_csv_rejects_empty(self):
+        ok, _ = parse_artifact("", "stage2/records.csv")
         self.assertFalse(ok)
 
 

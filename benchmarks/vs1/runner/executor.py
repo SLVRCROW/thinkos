@@ -76,17 +76,25 @@ class CellOutcome:
         }
 
 
-def parse_artifact(content: str) -> tuple[bool, str]:
-    """Extract a JSON artifact from a model's response.
+def parse_artifact(content: str, target_path: str = "") -> tuple[bool, str]:
+    """Extract an artifact from a model's response.
 
-    Strips markdown fences if present, finds the first balanced JSON object.
-    Returns (parsed, canonical_json) or (False, raw_text).
+    F5 REPAIR: the target path's extension determines the expected format.
+    - .json: strip markdown fences, find first balanced JSON object.
+    - .csv: accept the raw text (the frozen interruption stage-2 fixture
+      declares CSV); strip markdown fences if present.
+    Returns (parsed, canonical_text) or (False, raw_text).
     """
     import re
     text = content.strip()
     if text.startswith("```"):
         text = re.sub(r"^```[a-zA-Z]*\s*", "", text)
         text = re.sub(r"\s*```$", "", text)
+    if target_path.endswith(".csv"):
+        # CSV artifact: accept raw text (must be non-empty and contain a header)
+        if not text or "," not in text.splitlines()[0]:
+            return False, text
+        return True, text
     start = text.find("{")
     if start == -1:
         return False, text
@@ -243,7 +251,7 @@ class PoweredExecutor:
         # the earlier call in this trajectory must be present as predecessor.
         if condition == "interruption" and stage == 3:
             self._materialize_stage2_output(workdir, tid, arm, condition)
-        ok, artifact_text = parse_artifact(provider_res.content)
+        ok, artifact_text = parse_artifact(provider_res.content, fixture_artifact_path("A", condition, stage))
         artifact_path = ""
         if ok:
             rel = fixture_artifact_path("A", condition, stage)
