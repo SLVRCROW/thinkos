@@ -30,6 +30,7 @@ class ProviderCallResult:
     status: str  # ok | error | timeout
     error: str = ""
     latency_seconds: float = 0.0
+    timestamp: str = ""  # ISO-8601 UTC; set by the adapter
 
     def to_json(self) -> dict:
         return {
@@ -43,6 +44,7 @@ class ProviderCallResult:
             "status": self.status,
             "error": self.error,
             "latency_seconds": self.latency_seconds,
+            "timestamp": self.timestamp,
         }
 
 

@@ -38,7 +38,20 @@ SAMPLE SIZE:           R = 3 replicates
 PRECISION CRITERION:   paired 95% CI width on primary effect ≈ 0.30 with
                        SD≈0.3 per cell mean → pilot-inferential, not
                        confirmatory (recorded; mirrors EE-2B PILOT_INFERENTIAL)
-FAILURE TOLERANCE:     method-failure rate ≤ 5% (frozen)
+FAILURE TOLERANCE:     method-failure rate ≤ 5% (frozen, R4 definition)
+                       DENOMINATOR (frozen R4): attempted provider calls
+                       (calls actually made), NOT planned calls.
+                       NUMERATOR: true method failures = PROVIDER_RUNTIME_FAILURE
+                       + INSTRUMENT_FAILURE + MIXED_AMBIGUOUS.
+                       SUBJECT_TASK_FAILURE is NOT a method failure (scientific
+                       outcome, scored by frozen evaluation).
+                       MIN_SAMPLE: 10 attempted calls before threshold triggers.
+                       CATASTROPHIC_BURST: 3 consecutive method failures halt
+                       immediately regardless of percentage.
+                       IMMEDIATE VALIDITY FAILURES (contamination, hidden-test
+                       leakage, evidence loss, model mismatch, scoring
+                       corruption, cross-arm leakage) halt immediately.
+                       Implemented in code: benchmarks/vs1/runner/method_gate.py
 MISSING DATA:          method failures counted as unsuccessful outcomes;
                        reported separately; never imputed
 EFFECT-SIZE REPORTING: means + paired 95% CI (Wald) per contrast

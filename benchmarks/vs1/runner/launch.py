@@ -67,16 +67,48 @@ def main() -> int:
     workdir = args.out / "work"
     workdir.mkdir(parents=True, exist_ok=True)
 
+    # R4: sealer is created BEFORE the run and wired into the executor so
+    # raw completions persist incrementally (act §2-3). A mid-run halt must
+    # leave every completed call reconstructible.
+    sealer = EvidenceSealer(args.out)
+
     executor = PoweredExecutor(
         provider=provider,
         schedule=schedule,
         workdir=workdir,
         model=FROZEN_MODEL,
+        sealer=sealer,
     )
-    run = executor.run()
+    try:
+        run = executor.run()
+    except RuntimeError as e:
+        # R4: method-gate halt or call-ceiling halt — seal the partial
+        # package from the incremental evidence (raw completions, provider
+        # receipts, ledger, outcomes are already on disk per call).
+        print(f"HALT: {e}")
+        partial = {
+            "model": FROZEN_MODEL,
+            "temperature": FROZEN_TEMP,
+            "max_tokens": FROZEN_MAX_TOKENS,
+            "replicates": FROZEN_REPLICATES,
+            "planned_calls": expected,
+            "actual_calls": len(executor.results),
+            "retries": 0,
+            "replacements": 0,
+            "halt_reason": str(e),
+            "gate": executor.gate.to_json(),
+        }
+        prompts = {o.trajectory_id: o.prompt_text for o in executor.results}
+        manifest_path = sealer.seal(
+            run_metadata=partial,
+            outcomes=[o.to_json() for o in executor.results],
+            prompts=prompts,
+            schedule=schedule,
+        )
+        print(f"PARTIAL EVIDENCE SEALED: {manifest_path}")
+        return 3
 
     # Collect raw evidence
-    sealer = EvidenceSealer(args.out)
     prompts = {}
     for o in executor.results:
         prompts[o.trajectory_id] = o.prompt_text
@@ -90,6 +122,7 @@ def main() -> int:
             "actual_calls": run["call_count"],
             "retries": 0,
             "replacements": 0,
+            "gate": run.get("gate"),
         },
         outcomes=run["outcomes"],
         prompts=prompts,

@@ -8,6 +8,7 @@ reads only from it.
 from __future__ import annotations
 
 import json
+import os
 import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -21,6 +22,7 @@ class EvidenceSealer:
         self.root = evidence_root
         self.raw = evidence_root / "raw"
         self.raw.mkdir(parents=True, exist_ok=True)
+        self.ledger_path = evidence_root / "CALL_LEDGER.jsonl"
 
     def write_prompt(self, cell_id: str, prompt_text: str, prompt_sha: str) -> Path:
         p = self.raw / f"{cell_id}.prompt.txt"
@@ -32,6 +34,17 @@ class EvidenceSealer:
         p.write_text(json_dumps(provider_json))
         return p
 
+    def write_raw_completion(self, cell_id: str, raw_content: str) -> Path:
+        """R4: persist the RAW provider content BEFORE parsing/scoring.
+
+        A parser failure must NEVER erase the model output. This is the
+        instrument's ear: what the model actually said survives regardless
+        of parse success, evaluation, or mid-run halt.
+        """
+        p = self.raw / f"{cell_id}.raw.txt"
+        p.write_text(raw_content)
+        return p
+
     def write_artifact(self, cell_id: str, artifact_text: str) -> Path:
         p = self.raw / f"{cell_id}.artifact.txt"
         p.write_text(artifact_text)
@@ -41,6 +54,16 @@ class EvidenceSealer:
         p = self.raw / f"{cell_id}.outcome.json"
         p.write_text(json_dumps(outcome_json))
         return p
+
+    def append_ledger(self, entry: dict) -> None:
+        """R4: append-only call ledger. Every provider invocation gets one
+        line, written immediately after the call returns. A mid-run halt
+        leaves every completed call reconstructible from this ledger.
+        """
+        with open(self.ledger_path, "a", encoding="utf-8") as f:
+            f.write(json_dumps(entry) + "\n")
+            f.flush()
+            os.fsync(f.fileno())
 
     def seal(
         self,

@@ -39,6 +39,14 @@ from benchmarks.vs1.isolation import create_isolated_workdir
 
 from .provider import OllamaCloudAdapter, ProviderCallResult
 from .prompts import build_prompt, fixture_artifact_path
+from .classification import (
+    INSTRUMENT_FAILURE,
+    MIXED_AMBIGUOUS,
+    PROVIDER_RUNTIME_FAILURE,
+    classify_outcome,
+    contract_check,
+)
+from .method_gate import MethodGateState
 
 
 @dataclass(frozen=True)
@@ -52,11 +60,12 @@ class CellOutcome:
     artifact_written: bool
     artifact_path: str
     hidden_tests: dict[str, bool] | None
-    score: dict[str, Any]
+    score: dict
     prompt_sha256: str
     prompt_text: str
     method_failure: bool
     method_failure_reason: str = ""
+    classification: dict | None = None
 
     def to_json(self) -> dict:
         return {
@@ -73,6 +82,7 @@ class CellOutcome:
             "prompt_sha256": self.prompt_sha256,
             "method_failure": self.method_failure,
             "method_failure_reason": self.method_failure_reason,
+            "classification": self.classification,
         }
 
 
@@ -181,11 +191,12 @@ class PoweredExecutor:
 
     def __init__(
         self,
-        provider: OllamaCloudAdapter,
+        provider: Any,
         schedule: dict[str, Any],
         workdir: Path,
         model: str,
         prompt_version: str = "v0.1.0",
+        sealer: Any = None,
     ):
         self.provider = provider
         self.schedule = schedule
@@ -193,6 +204,8 @@ class PoweredExecutor:
         self.model = model
         self.prompt_version = prompt_version
         self.results: list[CellOutcome] = []
+        self.sealer = sealer
+        self.gate = MethodGateState()
 
     def run(self) -> dict[str, Any]:
         cells = self.schedule["cells"]
@@ -213,6 +226,9 @@ class PoweredExecutor:
                 f"status={outcome.provider.status} mf={outcome.method_failure}",
                 flush=True,
             )
+            # R4: evaluate the method gate after every call
+            if self.gate.halted:
+                raise RuntimeError(f"METHOD GATE HALT: {self.gate.halt_reason}")
 
         return {
             "call_count": call_count,
@@ -220,6 +236,7 @@ class PoweredExecutor:
             "hard_max": self.schedule["hard_max_calls"],
             "model": self.model,
             "outcomes": [o.to_json() for o in self.results],
+            "gate": self.gate.to_json(),
         }
 
     def _run_cell(self, cell: dict[str, Any]) -> CellOutcome:
@@ -243,6 +260,34 @@ class PoweredExecutor:
         call_id = cell["expected_call_id"]
         provider_res = self.provider.complete(prompt.text, call_id)
 
+        # ── R4 ORDERING (act §2): PROVIDER RESPONSE → PERSIST RAW → HASH →
+        #    PARSE → MATERIALIZE → EVALUATE → CLASSIFY ──────────────────────
+        # 1. PERSIST RAW RESPONSE BEFORE ANY PARSING. A parser failure must
+        #    NEVER erase the model output. This is the instrument's ear.
+        if self.sealer is not None:
+            self.sealer.write_raw_completion(call_id, provider_res.content)
+            self.sealer.write_provider(call_id, provider_res.to_json())
+            self.sealer.append_ledger({
+                "call_id": call_id,
+                "trajectory_id": tid,
+                "arm": arm,
+                "condition": condition,
+                "stage": stage,
+                "provider_status": provider_res.status,
+                "provider_error": provider_res.error,
+                "model": provider_res.returned_model,
+                "raw_hash": compute_sha256(provider_res.content),
+                "prompt_tokens": provider_res.prompt_tokens,
+                "completion_tokens": provider_res.completion_tokens,
+                "total_tokens": provider_res.total_tokens,
+                "timestamp": provider_res.timestamp,
+            })
+
+        # 2. PARSE
+        target_path = fixture_artifact_path("A", condition, stage)
+        ok, artifact_text = parse_artifact(provider_res.content, target_path)
+
+        # 2b. WORKDIR (materialization + evaluation target)
         workdir = create_isolated_workdir(tid, self.workdir)
         # F1 REPAIR: materialize every fixture-declared predecessor artifact
         # into the trajectory workdir BEFORE successor execution/evaluation.
@@ -251,7 +296,22 @@ class PoweredExecutor:
         # the earlier call in this trajectory must be present as predecessor.
         if condition == "interruption" and stage == 3:
             self._materialize_stage2_output(workdir, tid, arm, condition)
-        ok, artifact_text = parse_artifact(provider_res.content, fixture_artifact_path("A", condition, stage))
+
+        # 3. CONTRACT CHECK (frozen R4 classification)
+        contract_ok = contract_check(provider_res.content, target_path)
+
+        # 4. CLASSIFY (subject vs method vs provider)
+        classification = classify_outcome(
+            provider_status=provider_res.status,
+            provider_error=provider_res.error,
+            raw_content=provider_res.content,
+            parse_ok=ok,
+            contract_ok=contract_ok,
+            target_path=target_path,
+        )
+        self.gate.record(classification.to_json())
+
+        # 5. MATERIALIZE (only on parse success)
         artifact_path = ""
         if ok:
             rel = fixture_artifact_path("A", condition, stage)
@@ -260,17 +320,19 @@ class PoweredExecutor:
             p.write_text(artifact_text)
             artifact_path = str(p)
 
+        # 6. EVALUATE (only when the subject produced a parseable artifact)
         hidden: dict[str, bool] | None = None
-        method_failure = False
-        reason = ""
-        if provider_res.status != "ok":
-            method_failure = True
-            reason = f"provider error: {provider_res.error}"
-        elif not ok:
-            method_failure = True
-            reason = "artifact parse failed"
-        else:
+        if ok:
             hidden = self._evaluate_hidden(workdir, condition)
+
+        # 7. OUTCOME: method_failure is now ONLY true for instrument/provider
+        #    failures — NOT for subject task failures (act §4).
+        method_failure = classification.category in {
+            PROVIDER_RUNTIME_FAILURE,
+            INSTRUMENT_FAILURE,
+            MIXED_AMBIGUOUS,
+        }
+        reason = classification.reason
 
         succ_events = build_successor_events(tid, arm, condition, artifact_text if ok else "")
         score = score_trajectory(
@@ -288,7 +350,7 @@ class PoweredExecutor:
             latency_seconds=provider_res.latency_seconds,
         )
 
-        return CellOutcome(
+        outcome = CellOutcome(
             trajectory_id=tid,
             arm=arm,
             condition=condition,
@@ -303,7 +365,14 @@ class PoweredExecutor:
             prompt_text=prompt.text,
             method_failure=method_failure,
             method_failure_reason=reason,
+            classification=classification.to_json(),
         )
+
+        # 8. PERSIST OUTCOME (incremental durability)
+        if self.sealer is not None:
+            self.sealer.write_cell(call_id, outcome.to_json())
+
+        return outcome
 
     def _prepend_stage2_output(self, pred: list[SessionEvent], tid: str, condition: str) -> list[SessionEvent]:
         """F5: read the stage-2 artifact from the shared workdir (written by
