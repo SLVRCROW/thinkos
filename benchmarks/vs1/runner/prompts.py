@@ -53,10 +53,9 @@ Where the inherited state or README references a choice between conflicting valu
 OUTPUT FORMAT: Reply with ONLY the file content (the JSON object). No commentary."""
 
 
-TASK_ARTIFACT_PATH = {
-    2: "stage2/config.json",
-    3: "stage3/config.json",
-}
+# Artifact target paths are derived from the frozen fixtures via
+# fixture_artifact_path() — the fixture is the single authority.
+# (Legacy hardcoded TASK_ARTIFACT_PATH map removed per Marc's repair act.)
 
 
 def fixture_artifact_path(task: str, condition: str, stage: int) -> str:
