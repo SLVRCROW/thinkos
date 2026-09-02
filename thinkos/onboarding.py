@@ -53,10 +53,11 @@ DEFAULT_CONFIG = {
     },
 }
 
-GITIGNORE_CONTENT = """# ThinkOS runtime database — auto-generated, do not commit
+GITIGNORE_CONTENT = """# ThinkOS runtime database and operational state — auto-generated, do not commit
 thinkos.sqlite
 thinkos.sqlite-wal
 thinkos.sqlite-shm
+project-state.json
 """
 
 

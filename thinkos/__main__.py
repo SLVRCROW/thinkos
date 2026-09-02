@@ -11,6 +11,7 @@ def _print_help():
     print("  thinkos [--help | --version]")
     print("  thinkos init [PROJECT_PATH] [--json]")
     print("  thinkos doctor [PROJECT_PATH] [--json]")
+    print("  thinkos status [PROJECT_PATH] [--json]")
     print("  thinkos onboard inspect [PROJECT_PATH] [--json]")
     print("  thinkos onboard plan [PROJECT_PATH] [--json]")
     print("  thinkos onboard apply [PROJECT_PATH] --approve-plan PLAN_ID [--json]")
@@ -26,6 +27,12 @@ def _print_help():
     print("           Read-only. Checks Python compatibility, ThinkOS version,")
     print("           config presence and validity, sandbox status, store")
     print("           configuration, and SQLite integrity.")
+    print("           Defaults to the current directory.")
+    print()
+    print("  status   Reconcile recorded project state against live git state.")
+    print("           Read-only. Compares the recorded probes in")
+    print("           .thinkos/project-state.json with the live repository.")
+    print("           Exit codes: 0 = CURRENT, 1 = STALE, 2 = UNKNOWN.")
     print("           Defaults to the current directory.")
     print()
     print("  onboard  Agent-led onboarding (P2 v0).")
@@ -106,6 +113,14 @@ def _run_doctor():
     result = _doctor(project_path=project_path, json_output=json_output)
     if result["status"] != "healthy":
         sys.exit(1)
+
+
+def _run_status():
+    from thinkos.status import status as _status
+    project_path, json_output = _parse_init_doctor_args()
+    result = _status(project_path=project_path, json_output=json_output)
+    status_map = {"CURRENT": 0, "STALE": 1, "UNKNOWN": 2}
+    sys.exit(status_map.get(result["status"], 2))
 
 
 def _run_onboard():
@@ -228,6 +243,9 @@ def main():
             return
         if arg0 == "doctor":
             _run_doctor()
+            return
+        if arg0 == "status":
+            _run_status()
             return
         if arg0 == "onboard":
             _run_onboard()
