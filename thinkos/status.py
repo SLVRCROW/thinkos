@@ -1,7 +1,6 @@
 """Thin State Reconciliation v0 (TSR v0) — read-only recorded-vs-live status.
 
-Contract: docs/specs/TSR_V0_SPEC_v1.3.md (controlling, adopted 2026-09-02; SHA-256
-52702a420a4c087fde2db6eb0e2af93ea2b6173aca0cb83e2efc5e2ae03f81ce).
+Contract: docs/specs/TSR_V0_SPEC_v1.3.md (controlling, adopted 2026-09-02).
 v1.1 (SHA-256 eb15926a63027a295029cb9bde9f8235c40728862cf3fd8c1493f85f29afdf6a)
 remains the prior frozen record.
 
