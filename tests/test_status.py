@@ -447,18 +447,26 @@ def test_16_status_zero_fs_objects_created_with_real_initialized_project(tmp_pat
     store.write_bytes(store.read_bytes())  # touch mtime, keep bytes identical
 
     # ── fsmonitor hook fixture (repository-local, observable effect only) ──
-    # The hook creates a marker file inside the temp repo and nothing else.
-    # It must be live (raw Git executes it) and must be suppressed by ThinkOS.
+    # Python-interpreter-backed, fsmonitor protocol v2. Git invokes the
+    # configured hook as: <interpreter> <version> <token>. With core.fsmonitor
+    # set to the already-running sys.executable and core.fsmonitorHookVersion=2,
+    # the repository-local file literally named "2" is executed. This avoids
+    # /bin/sh, bash, chmod, exec-bit, PATHEXT, and .cmd/.bat dependence, so the
+    # fixture is alive on both Ubuntu and native Windows runners.
     marker = repo / "fsmonitor_marker.txt"
-    hook = repo / "fsmonitor_hook.sh"
     marker_posix = str(marker).replace("\\", "/")
-    hook.write_text(
-        "#!/bin/sh\n: > \"" + marker_posix + "\"\necho \"token\"\n",
+    hook_script = repo / "2"
+    hook_script.write_text(
+        "import sys\n"
+        f"marker = {marker_posix!r}\n"
+        "with open(marker, 'w', encoding='utf-8') as f:\n"
+        "    f.write('fsmonitor\\n')\n"
+        "# minimally valid v2 response: empty list = no changed paths\n"
+        "sys.exit(0)\n",
         encoding="utf-8",
     )
-    if os.name != "nt":
-        hook.chmod(0o755)
-    _git(repo, "config", "core.fsmonitor", str(hook))
+    _git(repo, "config", "core.fsmonitor", str(sys.executable))
+    _git(repo, "config", "core.fsmonitorHookVersion", "2")
 
     # Raw-fixture proof: the equivalent raw Git worktree-status command
     # WITHOUT the core.fsmonitor=false override MUST execute the hook.
