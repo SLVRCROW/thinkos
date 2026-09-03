@@ -549,11 +549,15 @@ def test_16b_worktree_probe_forces_fsmonitor_off_and_optional_locks_off(
 
     result = status_mod._probe_worktree_dirty(Path("/tmp/fake-repo"))
 
-    # Exact argument vector — no weaker assertion.
+    # Exact argument vector — no weaker assertion. The empty config value
+    # `core.fsmonitor=` is the legacy-compatible suppression: Git ≤2.35.1
+    # interprets non-empty values as hook command pathnames (so "false" would
+    # be executed), while an empty value disables fsmonitor under both legacy
+    # pathname semantics and modern boolean semantics.
     assert captured_args == [
         [
             "-c",
-            "core.fsmonitor=false",
+            "core.fsmonitor=",
             "--no-optional-locks",
             "status",
             "--porcelain",

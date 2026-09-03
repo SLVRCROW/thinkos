@@ -224,15 +224,18 @@ def _probe_upstream(project_dir: Path) -> dict | None:
 
 def _probe_worktree_dirty(project_dir: Path) -> dict | None:
     """git status --porcelain: non-empty -> {dirty: true}, empty -> {dirty: false}."""
-    # Both -c core.fsmonitor=false and --no-optional-locks are GLOBAL git
-    # options and must precede the subcommand. The -c override is command-local
-    # only: it prevents repository-configured fsmonitor hook/daemon execution
-    # (hidden external code), and --no-optional-locks suppresses the optional
-    # index refresh/lock acquisition. Together they keep status
-    # side-effect-free (spec §8: no git state mutations, no hidden execution).
+    # Both -c core.fsmonitor= and --no-optional-locks are GLOBAL git options
+    # and must precede the subcommand. The -c override is command-local only.
+    # The EMPTY value is the legacy-compatible fsmonitor suppression: Git
+    # <=2.35.1 interprets non-empty values as hook command pathnames (so
+    # "false" would be executed), while an empty value disables fsmonitor under
+    # both legacy pathname semantics and modern boolean semantics.
+    # --no-optional-locks suppresses the optional index refresh/lock
+    # acquisition. Together they keep status side-effect-free (spec §8: no git
+    # state mutations, no hidden execution).
     result = _git_run(
         project_dir,
-        ["-c", "core.fsmonitor=false", "--no-optional-locks", "status", "--porcelain"],
+        ["-c", "core.fsmonitor=", "--no-optional-locks", "status", "--porcelain"],
     )
     if result is None or result.returncode != 0:
         return None
