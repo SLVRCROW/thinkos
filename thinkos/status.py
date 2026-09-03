@@ -186,11 +186,13 @@ def _probe_head_sha(project_dir: Path) -> dict | None:
 def _probe_branch(project_dir: Path) -> dict | None:
     """symbolic-ref -> attached; else rev-parse HEAD ok -> detached; else non-evaluated."""
     result = _git_run(project_dir, ["symbolic-ref", "-q", "--short", "HEAD"])
-    if isinstance(result, _DecodeFailedProcess):
-        # Branch name could not be decoded faithfully; do NOT misreport as
-        # detached — treat as unevaluable (spec §6 fail-closed).
+    if result is None or isinstance(result, _DecodeFailedProcess):
+        # symbolic-ref could not be launched (None) or its output could not be
+        # decoded faithfully: treat the probe as unevaluable (spec §6
+        # fail-closed). Do NOT fall through to rev-parse HEAD and misreport
+        # the repository as detached on a launch failure.
         return None
-    if result is not None and result.returncode == 0:
+    if result.returncode == 0:
         name = result.stdout.strip()
         if name:
             return {"detached": False, "branch": name}

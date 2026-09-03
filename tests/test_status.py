@@ -740,3 +740,101 @@ def test_19b_memory_error_in_state_load_fails_closed_unknown_exit2(
     result = json.loads(captured.out)
     assert result["status"] == "UNKNOWN"
     assert _tree(repo) == before
+
+
+# ── Branch-probe launch-failure fail-closed repair (2026-09-03) ────────────
+# Distinction (TSR v0 §3/§6):
+#   A. symbolic-ref CANNOT LAUNCH (_git_run returns None) -> probe UNEVALUABLE
+#   B. symbolic-ref LAUNCHES with a DEFINED nonzero exit and rev-parse HEAD
+#      succeeds -> probe DETACHED
+# Case A must NOT fall through to rev-parse HEAD and misreport detached.
+def _branch_probe_returns(monkeypatch, symref_result):
+    """Targeted _git_run wrapper: branch command returns symref_result;
+    delegate ALL other git calls to the original _git_run."""
+    import thinkos.status as status_mod
+
+    original = status_mod._git_run
+
+    def wrapped(project_dir, args):
+        if args == ["symbolic-ref", "-q", "--short", "HEAD"]:
+            return symref_result
+        return original(project_dir, args)
+
+    monkeypatch.setattr(status_mod, "_git_run", wrapped)
+
+
+def _write_branch_only_state(repo: Path):
+    d = _state_dir(repo)
+    d.mkdir(exist_ok=True)
+    (d / "project-state.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "tsr.v0",
+                "recorded_at": "2026-09-03T00:00:00Z",
+                "probes": {
+                    "branch": {"detached": False, "branch": "main"},
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+def test_21_branch_launch_failure_fails_closed_unknown_exit2(
+    tmp_path, monkeypatch, capsys
+):
+    # Case A: symbolic-ref CANNOT LAUNCH (None) -> probe UNEVALUABLE, NOT
+    # detached; valid state with only the branch probe -> zero evaluated
+    # probes -> UNKNOWN / exit 2 / reasons [] / no mutation.
+    repo = _make_repo(tmp_path)  # real attached "main" repository
+    _write_branch_only_state(repo)
+    _branch_probe_returns(monkeypatch, None)
+    before = _tree(repo)
+
+    code = _run_status_in_process(repo, capsys)
+
+    assert code == 2
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    result = json.loads(captured.out)
+    assert result["status"] == "UNKNOWN"
+    assert result["reasons"] == []
+    branch = next(p for p in result["probes"] if p["key"] == "branch")
+    assert branch["recorded"] == {"detached": False, "branch": "main"}
+    assert branch["live"] is None
+    assert branch["evaluated"] is False
+    assert branch["matches"] is False
+    assert _tree(repo) == before
+
+
+def test_22_defined_branch_failure_remains_detached_stale_exit1(
+    tmp_path, monkeypatch, capsys
+):
+    # Case B: symbolic-ref LAUNCHES with a DEFINED returncode != 0 and
+    # rev-parse HEAD succeeds -> probe DETACHED (TSR v0 §3 preserved).
+    # Recorded state says attached main -> evaluated True, matches False
+    # -> STALE / exit 1.
+    repo = _make_repo(tmp_path)
+    _write_branch_only_state(repo)
+    defined_failure = subprocess.CompletedProcess(
+        args=["git", "symbolic-ref", "-q", "--short", "HEAD"],
+        returncode=1,
+        stdout="",
+        stderr="",
+    )
+    _branch_probe_returns(monkeypatch, defined_failure)
+    before = _tree(repo)
+
+    code = _run_status_in_process(repo, capsys)
+
+    assert code == 1
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    result = json.loads(captured.out)
+    assert result["status"] == "STALE"
+    branch = next(p for p in result["probes"] if p["key"] == "branch")
+    assert branch["live"] == {"detached": True, "branch": None}
+    assert branch["recorded"] == {"detached": False, "branch": "main"}
+    assert branch["evaluated"] is True
+    assert branch["matches"] is False
+    assert _tree(repo) == before
