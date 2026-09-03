@@ -446,36 +446,42 @@ def test_16_status_zero_fs_objects_created_with_real_initialized_project(tmp_pat
     store = repo / ".thinkos" / "thinkos.sqlite"
     store.write_bytes(store.read_bytes())  # touch mtime, keep bytes identical
 
-    # ── fsmonitor hook fixture (repository-local, observable effect only) ──
-    # Python-interpreter-backed, fsmonitor protocol v2. Git invokes the
-    # configured hook as: <interpreter> <version> <token>. With core.fsmonitor
-    # set to the already-running sys.executable and core.fsmonitorHookVersion=2,
-    # the repository-local file literally named "2" is executed. This avoids
-    # /bin/sh, bash, chmod, exec-bit, PATHEXT, and .cmd/.bat dependence, so the
-    # fixture is alive on both Ubuntu and native Windows runners.
-    marker = repo / "fsmonitor_marker.txt"
-    marker_posix = str(marker).replace("\\", "/")
-    hook_script = repo / "2"
-    hook_script.write_text(
-        "import sys\n"
-        f"marker = {marker_posix!r}\n"
-        "with open(marker, 'w', encoding='utf-8') as f:\n"
-        "    f.write('fsmonitor\\n')\n"
-        "# minimally valid v2 response: empty list = no changed paths\n"
-        "sys.exit(0)\n",
-        encoding="utf-8",
-    )
-    _git(repo, "config", "core.fsmonitor", str(sys.executable))
-    _git(repo, "config", "core.fsmonitorHookVersion", "2")
+    # ── fsmonitor real-substrate fixture (Linux only) ─────────────────────
+    # Two consecutive Windows CI runs (33784791794, 33786583121) proved the
+    # real executable fsmonitor-hook fixture is NOT portable to native
+    # Windows. The empirical substrate proof therefore runs on Linux only;
+    # the cross-platform command-shape proof is test_16b. On Windows the
+    # physical read-only assertions below still run — only the real-hook
+    # fixture is platform-scoped.
+    if sys.platform == "linux":
+        # Python-interpreter-backed, fsmonitor protocol v2. Git invokes the
+        # configured hook as: <interpreter> <version> <token>. With
+        # core.fsmonitor = sys.executable and core.fsmonitorHookVersion = 2,
+        # the repository-local file literally named "2" is executed.
+        marker = repo / "fsmonitor_marker.txt"
+        marker_posix = str(marker).replace("\\", "/")
+        hook_script = repo / "2"
+        hook_script.write_text(
+            "import sys\n"
+            f"marker = {marker_posix!r}\n"
+            "with open(marker, 'w', encoding='utf-8') as f:\n"
+            "    f.write('fsmonitor\\n')\n"
+            "# minimally valid v2 response: empty list = no changed paths\n"
+            "sys.exit(0)\n",
+            encoding="utf-8",
+        )
+        _git(repo, "config", "core.fsmonitor", str(sys.executable))
+        _git(repo, "config", "core.fsmonitorHookVersion", "2")
 
-    # Raw-fixture proof: the equivalent raw Git worktree-status command
-    # WITHOUT the core.fsmonitor=false override MUST execute the hook.
-    raw = _git(repo, "--no-optional-locks", "status", "--porcelain")
-    assert raw.returncode == 0, raw.stderr
-    assert marker.exists(), (
-        "fsmonitor fixture not live: raw git status did not execute the hook"
-    )
-    marker.unlink()
+        # Raw-fixture proof: raw Git WITHOUT the core.fsmonitor=false override
+        # MUST execute the hook (proves repository fsmonitor execution is
+        # reachable on this substrate).
+        raw = _git(repo, "--no-optional-locks", "status", "--porcelain")
+        assert raw.returncode == 0, raw.stderr
+        assert marker.exists(), (
+            "fsmonitor fixture not live: raw git status did not execute the hook"
+        )
+        marker.unlink()
 
     # Force a stale index stat-cache entry: change ONLY the tracked file's
     # mtime without changing its contents. Large explicit shift avoids
@@ -494,11 +500,13 @@ def test_16_status_zero_fs_objects_created_with_real_initialized_project(tmp_pat
         assert json.loads(r.stdout)["status"] in ("CURRENT", "STALE", "UNKNOWN")
     after = _tree(repo)
 
-    # The repository-configured fsmonitor hook must NOT execute during
-    # ThinkOS status (spec §8: no hidden execution / no git state mutation).
-    assert not marker.exists(), (
-        "status executed the repository-configured fsmonitor hook (marker created)"
-    )
+    # On Linux, the repository-configured fsmonitor hook must NOT execute
+    # during ThinkOS status (spec §8: no hidden execution / no git state
+    # mutation). On Windows the real-hook fixture is not run (see above).
+    if sys.platform == "linux":
+        assert not marker.exists(), (
+            "status executed the repository-configured fsmonitor hook (marker created)"
+        )
     # Nothing may be created, modified, or deleted — including WAL/SHM.
     assert before == after, (
         "status mutated the filesystem; "
@@ -515,6 +523,45 @@ def test_16_status_zero_fs_objects_created_with_real_initialized_project(tmp_pat
     # Belt-and-braces: no WAL/SHM files may exist after status runs.
     assert not (repo / ".thinkos" / "thinkos.sqlite-wal").exists()
     assert not (repo / ".thinkos" / "thinkos.sqlite-shm").exists()
+
+
+# ── 16b: portable exact-command proof (2026-09-03) ─────────────────────────
+# The real executable fsmonitor-hook fixture is Linux-only (two Windows CI
+# runs proved it non-portable). This platform-neutral test proves that the
+# product logic invokes Git with the EXACT command-local suppression contract
+# on every platform: -c core.fsmonitor=false + --no-optional-locks, both
+# global options before the status subcommand. No product code is changed to
+# satisfy it.
+def test_16b_worktree_probe_forces_fsmonitor_off_and_optional_locks_off(
+    monkeypatch,
+):
+    import thinkos.status as status_mod
+
+    captured_args = []
+
+    def fake_git_run(project_dir, args):
+        captured_args.append(args)
+        return type(
+            "R", (), {"returncode": 0, "stdout": "", "stderr": ""}
+        )()
+
+    monkeypatch.setattr(status_mod, "_git_run", fake_git_run)
+
+    result = status_mod._probe_worktree_dirty(Path("/tmp/fake-repo"))
+
+    # Exact argument vector — no weaker assertion.
+    assert captured_args == [
+        [
+            "-c",
+            "core.fsmonitor=false",
+            "--no-optional-locks",
+            "status",
+            "--porcelain",
+        ]
+    ], f"unexpected git argument vector: {captured_args}"
+    # Ordinary probe semantics through the injected result: empty stdout +
+    # returncode 0 -> clean.
+    assert result == {"dirty": False}
 
 
 # R2 (post-review): pathologically nested JSON must also fail closed with
