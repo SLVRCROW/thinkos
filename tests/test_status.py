@@ -446,6 +446,29 @@ def test_16_status_zero_fs_objects_created_with_real_initialized_project(tmp_pat
     store = repo / ".thinkos" / "thinkos.sqlite"
     store.write_bytes(store.read_bytes())  # touch mtime, keep bytes identical
 
+    # ── fsmonitor hook fixture (repository-local, observable effect only) ──
+    # The hook creates a marker file inside the temp repo and nothing else.
+    # It must be live (raw Git executes it) and must be suppressed by ThinkOS.
+    marker = repo / "fsmonitor_marker.txt"
+    hook = repo / "fsmonitor_hook.sh"
+    marker_posix = str(marker).replace("\\", "/")
+    hook.write_text(
+        "#!/bin/sh\n: > \"" + marker_posix + "\"\necho \"token\"\n",
+        encoding="utf-8",
+    )
+    if os.name != "nt":
+        hook.chmod(0o755)
+    _git(repo, "config", "core.fsmonitor", str(hook))
+
+    # Raw-fixture proof: the equivalent raw Git worktree-status command
+    # WITHOUT the core.fsmonitor=false override MUST execute the hook.
+    raw = _git(repo, "--no-optional-locks", "status", "--porcelain")
+    assert raw.returncode == 0, raw.stderr
+    assert marker.exists(), (
+        "fsmonitor fixture not live: raw git status did not execute the hook"
+    )
+    marker.unlink()
+
     # Force a stale index stat-cache entry: change ONLY the tracked file's
     # mtime without changing its contents. Large explicit shift avoids
     # timestamp-resolution ambiguity. This is fixture setup, not a ThinkOS
@@ -463,6 +486,11 @@ def test_16_status_zero_fs_objects_created_with_real_initialized_project(tmp_pat
         assert json.loads(r.stdout)["status"] in ("CURRENT", "STALE", "UNKNOWN")
     after = _tree(repo)
 
+    # The repository-configured fsmonitor hook must NOT execute during
+    # ThinkOS status (spec §8: no hidden execution / no git state mutation).
+    assert not marker.exists(), (
+        "status executed the repository-configured fsmonitor hook (marker created)"
+    )
     # Nothing may be created, modified, or deleted — including WAL/SHM.
     assert before == after, (
         "status mutated the filesystem; "
