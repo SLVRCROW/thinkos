@@ -224,7 +224,11 @@ def _probe_upstream(project_dir: Path) -> dict | None:
 
 def _probe_worktree_dirty(project_dir: Path) -> dict | None:
     """git status --porcelain: non-empty -> {dirty: true}, empty -> {dirty: false}."""
-    result = _git_run(project_dir, ["status", "--porcelain"])
+    # --no-optional-locks is a GLOBAL git option: it must precede the
+    # subcommand. It suppresses the optional index refresh/lock acquisition
+    # that plain `git status` may perform, keeping status side-effect-free
+    # (spec §8: no git state mutations).
+    result = _git_run(project_dir, ["--no-optional-locks", "status", "--porcelain"])
     if result is None or result.returncode != 0:
         return None
     return {"dirty": bool(result.stdout)}

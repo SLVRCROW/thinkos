@@ -437,10 +437,25 @@ def test_15_non_utf8_state_file_fails_closed_unknown_exit2(tmp_path):
 def test_16_status_zero_fs_objects_created_with_real_initialized_project(tmp_path):
     repo = _make_repo(tmp_path)
     _init_thinkos_project(repo)
+    # Create a normal tracked file with stable content and commit it.
+    tracked = repo / "tracked.txt"
+    tracked.write_text("stable content\n", encoding="utf-8")
+    _git(repo, "add", "tracked.txt")
+    _commit(repo, "add tracked file")
     _write_state(repo, _good_state(repo))
     store = repo / ".thinkos" / "thinkos.sqlite"
     store.write_bytes(store.read_bytes())  # touch mtime, keep bytes identical
 
+    # Force a stale index stat-cache entry: change ONLY the tracked file's
+    # mtime without changing its contents. Large explicit shift avoids
+    # timestamp-resolution ambiguity. This is fixture setup, not a ThinkOS
+    # side effect — it happens BEFORE the pre-status snapshot.
+    old_mtime = tracked.stat().st_mtime
+    new_mtime = old_mtime + 3600  # +1 hour
+    os.utime(tracked, (new_mtime, new_mtime))
+
+    index = repo / ".git" / "index"
+    index_before = index.read_bytes()
     before = _tree(repo)
     for _ in range(3):
         r = _cli_status(repo)
@@ -455,6 +470,12 @@ def test_16_status_zero_fs_objects_created_with_real_initialized_project(tmp_pat
         f"deleted={sorted(set(before) - set(after))} "
         f"modified={sorted(k for k in set(before) & set(after) if before[k] != after[k])}"
     )
+    # The optional index refresh must NOT rewrite .git/index (spec §8).
+    assert index.read_bytes() == index_before, (
+        "status rewrote .git/index (optional index refresh not suppressed)"
+    )
+    # No index lock may exist after status runs.
+    assert not (repo / ".git" / "index.lock").exists()
     # Belt-and-braces: no WAL/SHM files may exist after status runs.
     assert not (repo / ".thinkos" / "thinkos.sqlite-wal").exists()
     assert not (repo / ".thinkos" / "thinkos.sqlite-shm").exists()
