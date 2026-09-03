@@ -507,6 +507,12 @@ def _make_repo_with_invalid_utf8_branch(tmp_path: Path) -> Path:
     return repo
 
 
+@pytest.mark.skipif(
+    sys.platform != "linux",
+    reason="real-substrate invalid-UTF-8 Git ref fixture proven only on Linux; "
+    "Windows Git normalizes invalid bytes (\\xe9 -> \\xef\\xbf\\xbd) before product code runs; "
+    "semantic invariant covered portably by test_18c_*",
+)
 def test_18_non_utf8_git_output_fails_closed_unknown_exit2(tmp_path):
     repo = _make_repo_with_invalid_utf8_branch(tmp_path)
     before = _tree(repo)
@@ -521,6 +527,12 @@ def test_18_non_utf8_git_output_fails_closed_unknown_exit2(tmp_path):
     assert _tree(repo) == before
 
 
+@pytest.mark.skipif(
+    sys.platform != "linux",
+    reason="real-substrate invalid-UTF-8 Git ref fixture proven only on Linux; "
+    "Windows Git normalizes invalid bytes (\\xe9 -> \\xef\\xbf\\xbd) before product code runs; "
+    "semantic invariant covered portably by test_18c_*",
+)
 def test_18b_non_utf8_git_output_with_valid_state_still_fails_closed(tmp_path):
     # With a state file present but the branch probe unevaluable, the
     # remaining evaluated probes may be CURRENT — but the branch probe must
@@ -545,6 +557,12 @@ def test_18b_non_utf8_git_output_with_valid_state_still_fails_closed(tmp_path):
 # must fail closed to UNKNOWN, exit 2, contract JSON, empty stderr, no
 # traceback. Regression runs in a subprocess under a tight address-space
 # ulimit so the MemoryError is real, not mocked.
+@pytest.mark.skipif(
+    sys.platform != "linux",
+    reason="real-substrate ulimit -v subprocess fixture proven only on Linux; "
+    "native Windows routes bash to the WSL stub before product code runs; "
+    "semantic invariant covered portably by test_19b",
+)
 def test_19_memory_error_fails_closed_unknown_exit2(tmp_path):
     repo = _make_repo(tmp_path)
     d = _state_dir(repo)
@@ -604,3 +622,121 @@ def test_20_lifecycle_current_reachable_and_stable(tmp_path):
         assert r.returncode == 0, r.stderr
         assert json.loads(r.stdout)["status"] == "CURRENT"
     assert _git(repo, "status", "--porcelain").stdout == ""
+
+
+# ── Portable fail-closed coverage (2026-09-03, Windows CI repair) ─────────
+# The real-substrate fixtures test_18/18b/19 are proven only on Linux
+# (Windows Git normalizes invalid bytes; bash ulimit routes to the WSL stub).
+# These portable tests exercise the SAME product seams in-process on every
+# platform: targeted _git_run injection for undecodable branch output, and
+# targeted Path.read_text injection for MemoryError inside the real
+# _load_state_file execution. No mock replaces status(), _reconcile(), or the
+# branch probe itself. No product code changes.
+def _run_status_in_process(repo: Path, capsys) -> int:
+    """Invoke the real CLI dispatcher in-process; return the SystemExit code."""
+    import thinkos.__main__ as main
+
+    old_argv = sys.argv
+    sys.argv = ["thinkos", "status", str(repo), "--json"]
+    try:
+        with pytest.raises(SystemExit) as exc:
+            main._run_status()
+        return exc.value.code
+    finally:
+        sys.argv = old_argv
+
+
+def _branch_only_decode_failure(monkeypatch, repo: Path):
+    """Targeted _git_run wrapper: fail decode ONLY for the branch command."""
+    import thinkos.status as status_mod
+
+    original = status_mod._git_run
+
+    def wrapped(project_dir, args):
+        if args == ["symbolic-ref", "-q", "--short", "HEAD"]:
+            return status_mod._DecodeFailedProcess()
+        return original(project_dir, args)
+
+    monkeypatch.setattr(status_mod, "_git_run", wrapped)
+
+
+def test_18c_undecodable_branch_without_state_fails_closed_unknown_exit2(
+    tmp_path, monkeypatch, capsys
+):
+    # Case A: undecodable branch output + no usable state → branch unevaluable
+    # → UNKNOWN / exit 2 / no traceback / no filesystem mutation.
+    repo = _make_repo(tmp_path)
+    _branch_only_decode_failure(monkeypatch, repo)
+    before = _tree(repo)
+
+    code = _run_status_in_process(repo, capsys)
+
+    assert code == 2
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    result = json.loads(captured.out)
+    assert result["status"] == "UNKNOWN"
+    branch = next(p for p in result["probes"] if p["key"] == "branch")
+    assert branch["evaluated"] is False
+    assert branch["live"] is None
+    assert _tree(repo) == before
+
+
+def test_18c_undecodable_branch_with_valid_state_never_misreported(
+    tmp_path, monkeypatch, capsys
+):
+    # Case B: undecodable branch output + valid recorded state → branch
+    # unevaluable, NEVER misreported as detached or matched on corrupted
+    # bytes; other probes remain free to determine the overall status.
+    repo = _make_repo(tmp_path)
+    state = _good_state(repo)
+    state["probes"]["branch"] = {"detached": False, "branch": "main"}
+    _write_state(repo, state)
+    _branch_only_decode_failure(monkeypatch, repo)
+    before = _tree(repo)
+
+    code = _run_status_in_process(repo, capsys)
+
+    assert code in (0, 1, 2)  # remaining probes decide
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    result = json.loads(captured.out)
+    branch = next(p for p in result["probes"] if p["key"] == "branch")
+    assert branch["recorded"] == {"detached": False, "branch": "main"}
+    assert branch["live"] is None
+    assert branch["evaluated"] is False
+    assert branch["matches"] is False
+    assert _tree(repo) == before
+
+
+def test_19b_memory_error_in_state_load_fails_closed_unknown_exit2(
+    tmp_path, monkeypatch, capsys
+):
+    # MemoryError INSIDE the real _load_state_file execution (at the
+    # Path.read_text seam) → UNKNOWN / exit 2 / no traceback / no mutation.
+    # _load_state_file itself is NOT monkeypatched; the real except
+    # (OSError, UnicodeDecodeError, MemoryError) block must contain it.
+    repo = _make_repo(tmp_path)
+    d = _state_dir(repo)
+    d.mkdir()
+    target = d / "project-state.json"
+    target.write_text(json.dumps(_good_state(repo)), encoding="utf-8")
+    before = _tree(repo)
+
+    original_read_text = Path.read_text
+
+    def targeted_read_text(self, *args, **kwargs):
+        if str(self) == str(target):
+            raise MemoryError("simulated constrained-memory read")
+        return original_read_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", targeted_read_text)
+
+    code = _run_status_in_process(repo, capsys)
+
+    assert code == 2
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    result = json.loads(captured.out)
+    assert result["status"] == "UNKNOWN"
+    assert _tree(repo) == before
