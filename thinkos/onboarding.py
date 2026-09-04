@@ -53,10 +53,11 @@ DEFAULT_CONFIG = {
     },
 }
 
-GITIGNORE_CONTENT = """# ThinkOS runtime database — auto-generated, do not commit
+GITIGNORE_CONTENT = """# ThinkOS runtime database and operational state — auto-generated, do not commit
 thinkos.sqlite
 thinkos.sqlite-wal
 thinkos.sqlite-shm
+project-state.json
 """
 
 
@@ -443,6 +444,7 @@ def doctor(
     project_path: str | None = None,
     json_output: bool = False,
     quiet: bool = False,
+    side_effect_free: bool = False,
 ) -> dict:
     """Check ThinkOS installation health for a project.
 
@@ -453,6 +455,13 @@ def doctor(
         project_path: Path to the project directory. Defaults to CWD.
         json_output: If True, print JSON output instead of human-readable.
         quiet: If True, suppress all print output. Overrides json_output.
+        side_effect_free: If True, the SQLite integrity check is replaced by a
+            bounded header/stat inspection that opens NO SQLite connection and
+            therefore creates no WAL/SHM/temp filesystem objects. This is a
+            weaker probe than a full PRAGMA integrity_check and is honestly
+            labeled as such in the finding. Used by the `thinkos status` path
+            (TSR v1.2 §6/§8). Default behavior (False) is unchanged for all
+            existing callers.
     """
     resolved = _resolve_project_path(project_path)
     thinkos_dir_path = _thinkos_dir(resolved)
@@ -706,39 +715,78 @@ def doctor(
                     "detail": f"Store directory does not exist at '{store_dir}'",
                 })
 
-    # ── 8. SQLite integrity (read-only, only if DB exists) ──────────
+    # ── 8. SQLite integrity (read-only; side-effect-free mode opens no DB) ──
     db_path_for_check = safe_store_path
     if db_path_for_check and os.path.isfile(db_path_for_check):
-        try:
-            # Open read-only via URI — no journal, no WAL, no mutation
-            abs_path = str(Path(db_path_for_check).resolve())
-            db_uri = Path(abs_path).as_uri()
-            conn = sqlite3.connect(db_uri + "?mode=ro", uri=True)
+        if side_effect_free:
+            # Bounded header/stat inspection: no SQLite connection, so no
+            # WAL/SHM/temp filesystem objects are created (TSR v1.2 §6/§8).
+            # This is a weaker probe than a full integrity_check and is
+            # honestly labeled as such.
             try:
-                cursor = conn.execute("PRAGMA integrity_check")
-                integrity_result = cursor.fetchone()
-            finally:
-                conn.close()
-            if integrity_result and integrity_result[0] == "ok":
-                findings.append({
-                    "check": "sqlite_integrity",
-                    "status": "ok",
-                    "detail": "SQLite integrity check passed",
-                })
-            else:
+                with open(db_path_for_check, "rb") as f:
+                    header = f.read(16)
+                    f.seek(0, os.SEEK_END)
+                    size = f.tell()
+            except OSError as e:
                 all_healthy = False
                 findings.append({
                     "check": "sqlite_integrity",
                     "status": "unhealthy",
-                    "detail": f"SQLite integrity check failed: {integrity_result}",
+                    "detail": f"Side-effect-free store inspection error: {e}",
                 })
-        except sqlite3.Error as e:
-            all_healthy = False
-            findings.append({
-                "check": "sqlite_integrity",
-                "status": "unhealthy",
-                "detail": f"SQLite integrity check error: {e}",
-            })
+            else:
+                ok = size > 0 and header == b"SQLite format 3\x00"
+                if ok:
+                    findings.append({
+                        "check": "sqlite_integrity",
+                        "status": "ok",
+                        "detail": (
+                            "Side-effect-free store inspection passed "
+                            "(header/stat; no connection opened)"
+                        ),
+                    })
+                else:
+                    all_healthy = False
+                    findings.append({
+                        "check": "sqlite_integrity",
+                        "status": "unhealthy",
+                        "detail": (
+                            "Side-effect-free store inspection failed "
+                            "(invalid or empty SQLite header)"
+                        ),
+                    })
+        else:
+            try:
+                # Open read-only via URI — no journal, no WAL, no mutation
+                abs_path = str(Path(db_path_for_check).resolve())
+                db_uri = Path(abs_path).as_uri()
+                conn = sqlite3.connect(db_uri + "?mode=ro", uri=True)
+                try:
+                    cursor = conn.execute("PRAGMA integrity_check")
+                    integrity_result = cursor.fetchone()
+                finally:
+                    conn.close()
+                if integrity_result and integrity_result[0] == "ok":
+                    findings.append({
+                        "check": "sqlite_integrity",
+                        "status": "ok",
+                        "detail": "SQLite integrity check passed",
+                    })
+                else:
+                    all_healthy = False
+                    findings.append({
+                        "check": "sqlite_integrity",
+                        "status": "unhealthy",
+                        "detail": f"SQLite integrity check failed: {integrity_result}",
+                    })
+            except sqlite3.Error as e:
+                all_healthy = False
+                findings.append({
+                    "check": "sqlite_integrity",
+                    "status": "unhealthy",
+                    "detail": f"SQLite integrity check error: {e}",
+                })
     else:
         findings.append({
             "check": "sqlite_integrity",

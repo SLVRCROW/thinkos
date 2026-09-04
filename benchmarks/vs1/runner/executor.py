@@ -1,0 +1,501 @@
+"""VS-1 powered executor — one frozen run.
+
+Responsibilities:
+1. For each schedule cell: build predecessor state via frozen adapters,
+   build the frozen prompt, make exactly ONE provider call.
+2. Write the model's artifact to the isolated workdir.
+3. Run hidden tests in a SEPARATE subprocess (truth never enters model
+   context; leakage attempts during preflight prove this).
+4. Persist raw evidence: prompt, response, artifact, receipt, score.
+5. Enforce hard call ceiling (108); halt on any deviation.
+6. Write immutable manifest + seal raw evidence BEFORE analysis.
+
+Design constraint: this module imports the frozen measurement package
+(benchmarks/vs1/*) for adapters/scoring, but never modifies it. It does
+NOT touch product runtime, G0, or G1.
+"""
+from __future__ import annotations
+
+import json
+import subprocess
+import sys
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+from benchmarks.vs1.schemas import (
+    ARMS,
+    CONDITIONS,
+    SessionEvent,
+    ToolCallReceipt,
+    EvidenceReference,
+    compute_sha256,
+    json_dumps,
+)
+from benchmarks.vs1.adapters import get_adapter
+from benchmarks.vs1.fixtures import get_fixture, inject_predecessor_state
+from benchmarks.vs1.scorer import score_trajectory
+from benchmarks.vs1.isolation import create_isolated_workdir
+
+from .provider import OllamaCloudAdapter, ProviderCallResult
+from .prompts import build_prompt, fixture_artifact_path
+from .classification import (
+    INSTRUMENT_FAILURE,
+    MIXED_AMBIGUOUS,
+    PROVIDER_RUNTIME_FAILURE,
+    classify_outcome,
+    contract_check,
+)
+from .method_gate import MethodGateState
+
+
+@dataclass(frozen=True)
+class CellOutcome:
+    trajectory_id: str
+    arm: str
+    condition: str
+    replicate: int
+    call_id: str
+    provider: ProviderCallResult
+    artifact_written: bool
+    artifact_path: str
+    hidden_tests: dict[str, bool] | None
+    score: dict
+    prompt_sha256: str
+    prompt_text: str
+    method_failure: bool
+    method_failure_reason: str = ""
+    classification: dict | None = None
+
+    def to_json(self) -> dict:
+        return {
+            "trajectory_id": self.trajectory_id,
+            "arm": self.arm,
+            "condition": self.condition,
+            "replicate": self.replicate,
+            "call_id": self.call_id,
+            "provider": self.provider.to_json(),
+            "artifact_written": self.artifact_written,
+            "artifact_path": self.artifact_path,
+            "hidden_tests": self.hidden_tests,
+            "score": self.score,
+            "prompt_sha256": self.prompt_sha256,
+            "method_failure": self.method_failure,
+            "method_failure_reason": self.method_failure_reason,
+            "classification": self.classification,
+        }
+
+
+def parse_artifact(content: str, target_path: str = "") -> tuple[bool, str]:
+    """Extract an artifact from a model's response.
+
+    F5 REPAIR: the target path's extension determines the expected format.
+    - .json: strip markdown fences, find first balanced JSON object.
+    - .csv: accept the raw text (the frozen interruption stage-2 fixture
+      declares CSV); strip markdown fences if present.
+    Returns (parsed, canonical_text) or (False, raw_text).
+    """
+    import re
+    text = content.strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```[a-zA-Z]*\s*", "", text)
+        text = re.sub(r"\s*```$", "", text)
+    if target_path.endswith(".csv"):
+        # CSV artifact: accept raw text with a header AND at least one data
+        # row (Athena F1: header-only output is NOT a valid artifact — the
+        # frozen fixture requires data rows). Skip leading blank lines
+        # (Athena F2: valid CSV with leading whitespace must not be rejected).
+        lines = [ln for ln in text.splitlines() if ln.strip()]
+        if not lines or "," not in lines[0] or len(lines) < 2:
+            return False, text
+        return True, text
+    start = text.find("{")
+    if start == -1:
+        return False, text
+    depth = 0
+    for i in range(start, len(text)):
+        if text[i] == "{":
+            depth += 1
+        elif text[i] == "}":
+            depth -= 1
+            if depth == 0:
+                candidate = text[start : i + 1]
+                try:
+                    parsed = json.loads(candidate)
+                    return True, json.dumps(parsed, sort_keys=True)
+                except json.JSONDecodeError:
+                    return False, text
+    return False, text
+
+
+def build_predecessor_events(tid: str, condition: str) -> list[SessionEvent]:
+    """Deterministic predecessor events with condition injection (no model)."""
+    fixture = get_fixture("A", condition)
+    content = fixture.stage_artifacts[1].content
+    path = fixture.stage_artifacts[1].path
+    tc = ToolCallReceipt(
+        receipt_id=compute_sha256(tid)[:32],
+        tool="write_file",
+        params={"path": path, "content": content},
+        status="ok",
+        output="ok",
+        evidence_refs=(),
+        timestamp=1.0,
+    )
+    base = [
+        SessionEvent(
+            type="agent_message",
+            session_id=f"{tid}-A",
+            trajectory_id=tid,
+            arm="verified_state",
+            condition=condition,
+            worker_label="A",
+            stage=1,
+            timestamp=1.0,
+            tool_calls=(tc,),
+        )
+    ]
+    return inject_predecessor_state(condition, base)
+
+
+def build_successor_events(tid: str, arm: str, condition: str, artifact: str, stage: int = 3) -> list[SessionEvent]:
+    """Reconstruct the successor event stream from the recorded artifact write
+    (no model call — deterministic)."""
+    rel = fixture_artifact_path("A", condition, stage)
+    tc = ToolCallReceipt(
+        receipt_id=compute_sha256(f"{tid}-succ")[:32],
+        tool="write_file",
+        params={"path": rel, "content": artifact},
+        status="ok",
+        output="ok",
+        evidence_refs=(
+            (EvidenceReference(receipt_id="rct_succ", claim_type="artifact", claim_value=artifact[:64]),)
+            if arm in ("verified_state", "verified_state_procedure")
+            else ()
+        ),
+        timestamp=float(stage),
+    )
+    return [
+        SessionEvent(
+            type="agent_message",
+            session_id=f"{tid}-S",
+            trajectory_id=tid,
+            arm=arm,
+            condition=condition,
+            worker_label="S",
+            stage=3,
+            timestamp=3.0,
+            tool_calls=(tc,),
+        )
+    ]
+
+
+class PoweredExecutor:
+    """One frozen powered run against a schedule."""
+
+    def __init__(
+        self,
+        provider: Any,
+        schedule: dict[str, Any],
+        workdir: Path,
+        model: str,
+        prompt_version: str = "v0.1.0",
+        sealer: Any = None,
+    ):
+        self.provider = provider
+        self.schedule = schedule
+        self.workdir = workdir
+        self.model = model
+        self.prompt_version = prompt_version
+        self.results: list[CellOutcome] = []
+        self.sealer = sealer
+        self.gate = MethodGateState()
+
+    def run(self) -> dict[str, Any]:
+        cells = self.schedule["cells"]
+        planned = self.schedule["expected_calls"]
+        if len(cells) != planned:
+            raise RuntimeError(f"Schedule mismatch: {len(cells)} cells vs {planned} planned")
+
+        call_count = 0
+        for cell in cells:
+            call_count += 1
+            if call_count > self.schedule["hard_max_calls"]:
+                raise RuntimeError("CALL CEILING EXCEEDED — halting per containment")
+            outcome = self._run_cell(cell)
+            self.results.append(outcome)
+            print(
+                f"[{call_count}/{planned}] {cell['trajectory_id']} "
+                f"{cell['arm']:24s} {cell['condition']:14s} "
+                f"status={outcome.provider.status} mf={outcome.method_failure}",
+                flush=True,
+            )
+            # R4: evaluate the method gate after every call
+            if self.gate.halted:
+                raise RuntimeError(f"METHOD GATE HALT: {self.gate.halt_reason}")
+
+        return {
+            "call_count": call_count,
+            "planned": planned,
+            "hard_max": self.schedule["hard_max_calls"],
+            "model": self.model,
+            "outcomes": [o.to_json() for o in self.results],
+            "gate": self.gate.to_json(),
+        }
+
+    def _run_cell(self, cell: dict[str, Any]) -> CellOutcome:
+        arm = cell["arm"]
+        condition = cell["condition"]
+        replicate = cell["replicate"]
+        tid = cell["trajectory_id"]
+        stage = cell["stage"]
+        fixture = get_fixture("A", condition)
+
+        pred = build_predecessor_events(tid, condition)
+        # F5 REPAIR: for interruption stage-3, the stage-2 successor's output
+        # (written by the earlier call in this same trajectory) becomes
+        # predecessor state for the stage-3 successor, rendered through each
+        # architecture's succession mechanism.
+        if condition == "interruption" and stage == 3:
+            pred = self._prepend_stage2_output(pred, tid, condition)
+        state = get_adapter(arm).transform(pred)
+        prompt = build_prompt(arm, condition, stage, state, prompt_version=self.prompt_version)
+
+        call_id = cell["expected_call_id"]
+        provider_res = self.provider.complete(prompt.text, call_id)
+
+        # ── R4 IMMEDIATE VALIDITY FAILURES (Daedalus F3): model identity
+        #    mismatch and evidence persistence failures halt IMMEDIATELY,
+        #    regardless of percentage — they are not gate-counted.
+        if provider_res.returned_model and provider_res.returned_model != self.model:
+            raise RuntimeError(
+                f"IMMEDIATE_VALIDITY_FAILURE: model identity mismatch — "
+                f"expected {self.model}, got {provider_res.returned_model}"
+            )
+
+        # ── R4 ORDERING (act §2): PROVIDER RESPONSE → PERSIST RAW → HASH →
+        #    PARSE → MATERIALIZE → EVALUATE → CLASSIFY ──────────────────────
+        # 1. PERSIST RAW RESPONSE BEFORE ANY PARSING. A parser failure must
+        #    NEVER erase the model output. This is the instrument's ear.
+        if self.sealer is not None:
+            try:
+                self.sealer.write_raw_completion(call_id, provider_res.content)
+                self.sealer.write_provider(call_id, provider_res.to_json())
+                self.sealer.append_ledger({
+                    "call_id": call_id,
+                    "trajectory_id": tid,
+                    "arm": arm,
+                    "condition": condition,
+                    "stage": stage,
+                    "provider_status": provider_res.status,
+                    "provider_error": provider_res.error,
+                    "model": provider_res.returned_model,
+                    "raw_hash": compute_sha256(provider_res.content),
+                    "prompt_tokens": provider_res.prompt_tokens,
+                    "completion_tokens": provider_res.completion_tokens,
+                    "total_tokens": provider_res.total_tokens,
+                    "timestamp": provider_res.timestamp,
+                })
+            except (OSError, UnicodeEncodeError, ValueError) as e:
+                # Evidence persistence failure = immediate validity halt
+                # (Atlas F5: UnicodeEncodeError on surrogate chars is NOT an
+                # OSError — broaden the catch so a write failure can never
+                # silently lose the model output).
+                raise RuntimeError(
+                    f"IMMEDIATE_VALIDITY_FAILURE: evidence persistence failure — {e}"
+                ) from e
+
+        # 2. PARSE
+        target_path = fixture_artifact_path("A", condition, stage)
+        ok, artifact_text = parse_artifact(provider_res.content, target_path)
+
+        # 2b. WORKDIR (materialization + evaluation target)
+        workdir = create_isolated_workdir(tid, self.workdir)
+        # F1 REPAIR: materialize every fixture-declared predecessor artifact
+        # into the trajectory workdir BEFORE successor execution/evaluation.
+        self._materialize_predecessor(workdir, pred, condition, current_stage=stage)
+        # F5 REPAIR: for interruption stage-3, the stage-2 artifact produced by
+        # the earlier call in this trajectory must be present as predecessor.
+        if condition == "interruption" and stage == 3:
+            self._materialize_stage2_output(workdir, tid, arm, condition)
+
+        # 3. CONTRACT CHECK (frozen R4 classification)
+        contract_ok = contract_check(provider_res.content, target_path)
+
+        # 4. CLASSIFY (subject vs method vs provider)
+        classification = classify_outcome(
+            provider_status=provider_res.status,
+            provider_error=provider_res.error,
+            raw_content=provider_res.content,
+            parse_ok=ok,
+            contract_ok=contract_ok,
+            target_path=target_path,
+        )
+        self.gate.record(classification.to_json())
+
+        # 5. MATERIALIZE (only on parse success)
+        artifact_path = ""
+        if ok:
+            rel = fixture_artifact_path("A", condition, stage)
+            p = workdir / rel
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(artifact_text)
+            artifact_path = str(p)
+
+        # 6. EVALUATE (only when the subject produced a parseable artifact)
+        hidden: dict[str, bool] | None = None
+        if ok:
+            hidden = self._evaluate_hidden(workdir, condition)
+
+        # 7. OUTCOME: method_failure is now ONLY true for instrument/provider
+        #    failures — NOT for subject task failures (act §4).
+        method_failure = classification.category in {
+            PROVIDER_RUNTIME_FAILURE,
+            INSTRUMENT_FAILURE,
+            MIXED_AMBIGUOUS,
+        }
+        reason = classification.reason
+
+        succ_events = build_successor_events(tid, arm, condition, artifact_text if ok else "")
+        score = score_trajectory(
+            trajectory_id=tid,
+            arm=arm,
+            condition=condition,
+            task="A",
+            predecessor_events=pred,
+            successor_events=succ_events,
+            hidden_test_results=hidden,
+            method_failure=method_failure,
+            method_failure_reason=reason,
+            token_usage=provider_res.total_tokens,
+            provider_calls=1 if provider_res.status == "ok" else 0,
+            latency_seconds=provider_res.latency_seconds,
+        )
+
+        outcome = CellOutcome(
+            trajectory_id=tid,
+            arm=arm,
+            condition=condition,
+            replicate=replicate,
+            call_id=provider_res.provider_invocation_id,
+            provider=provider_res,
+            artifact_written=ok,
+            artifact_path=artifact_path,
+            hidden_tests=hidden,
+            score=score.to_json(),
+            prompt_sha256=prompt.sha256,
+            prompt_text=prompt.text,
+            method_failure=method_failure,
+            method_failure_reason=reason,
+            classification=classification.to_json(),
+        )
+
+        # 8. PERSIST OUTCOME (incremental durability)
+        if self.sealer is not None:
+            self.sealer.write_cell(call_id, outcome.to_json())
+
+        return outcome
+
+    def _prepend_stage2_output(self, pred: list[SessionEvent], tid: str, condition: str) -> list[SessionEvent]:
+        """F5: read the stage-2 artifact from the shared workdir (written by
+        the stage-2 call in this trajectory) and append it as a predecessor
+        event so the stage-3 successor receives it through its architecture.
+        """
+        fixture = get_fixture("A", condition)
+        stage2 = fixture.stage_artifacts.get(2)
+        if stage2 is None:
+            return pred
+        workdir = self.workdir / tid
+        p = workdir / stage2.path
+        if not p.exists():
+            return pred
+        content = p.read_text()
+        tc = ToolCallReceipt(
+            receipt_id=compute_sha256(f"{tid}-s2out")[:32],
+            tool="write_file",
+            params={"path": stage2.path, "content": content},
+            status="ok",
+            output="ok",
+            evidence_refs=(),
+            timestamp=2.0,
+        )
+        ev = SessionEvent(
+            type="agent_message",
+            session_id=f"{tid}-S2",
+            trajectory_id=tid,
+            arm="verified_state",
+            condition=condition,
+            worker_label="S2",
+            stage=2,
+            timestamp=2.0,
+            tool_calls=(tc,),
+        )
+        return list(pred) + [ev]
+
+    def _materialize_predecessor(self, workdir: Path, pred: list[SessionEvent], condition: str, current_stage: int = 3) -> None:
+        """Write every fixture-declared predecessor artifact into the workdir.
+
+        F1 repair (act §5): the fixture is the authority for what predecessor
+        artifacts a trajectory requires. Materialize every stage artifact
+        declared by the frozen fixture for stages STRICTLY BEFORE the current
+        stage (the successor's own target stage must NOT be pre-written —
+        that would contaminate the hidden-test score). Plus any explicit
+        write_file events in the predecessor stream. Contents come from the
+        frozen fixture — never invented.
+        """
+        fixture = get_fixture("A", condition)
+        for stage, artifact in fixture.stage_artifacts.items():
+            if stage >= current_stage:
+                continue
+            p = workdir / artifact.path
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(artifact.content)
+        # Also honor any explicit write_file events (e.g., injected state)
+        for event in pred:
+            for tc in event.tool_calls:
+                if tc.tool == "write_file":
+                    rel = str(tc.params.get("path", ""))
+                    content = str(tc.params.get("content", ""))
+                    if not rel:
+                        continue
+                    p = workdir / rel
+                    p.parent.mkdir(parents=True, exist_ok=True)
+                    p.write_text(content)
+
+    def _materialize_stage2_output(self, workdir: Path, tid: str, arm: str, condition: str) -> None:
+        """F5 repair: for interruption stage-3, the stage-2 artifact must be
+        present as valid predecessor state. The stage-2 call in this same
+        trajectory already wrote it to the shared workdir; if absent (e.g.,
+        stage-2 call failed), materialize the frozen stage-2 fixture artifact
+        so the stage-3 successor can resume from a valid predecessor.
+        """
+        fixture = get_fixture("A", condition)
+        stage2 = fixture.stage_artifacts.get(2)
+        if stage2 is None:
+            return
+        p = workdir / stage2.path
+        if not p.exists():
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(stage2.content)
+
+    def _evaluate_hidden(self, workdir: Path, condition: str) -> dict[str, bool]:
+        """Run hidden tests in a SEPARATE subprocess (isolation)."""
+        cmd = [
+            sys.executable,
+            "-c",
+            (
+                "import json,sys;"
+                "from benchmarks.vs1.fixtures import get_fixture;"
+                "f=get_fixture('A', sys.argv[1]);"
+                "print(json.dumps(f.run_hidden_test(sys.argv[2])))"
+            ),
+            condition,
+            str(workdir),
+        ]
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        if proc.returncode != 0:
+            return {}
+        try:
+            return json.loads(proc.stdout.strip())
+        except Exception:
+            return {}
