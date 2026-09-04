@@ -1346,12 +1346,27 @@ def test_v14_gitlink_parse_failure_unevaluable(tmp_path, monkeypatch):
     assert _gate(repo) is None
 
 
-def test_v14_tab_in_tracked_pathname_parses(tmp_path):
-    # a tracked pathname containing a literal TAB parses correctly using the
-    # FIRST-TAB split; the pathname is preserved verbatim after the first TAB.
-    repo = _make_repo(tmp_path)
-    weird = repo / "odd\tname.txt"
-    weird.write_text("w\n", encoding="utf-8")
-    _git(repo, "add", "-A")
-    _commit(repo, "init")
-    assert _gate(repo) == "SAFE"
+def test_v14_tab_in_tracked_pathname_parses(tmp_path, monkeypatch):
+    # Platform-neutral synthetic parser/gate test: a tracked pathname containing
+    # a literal TAB parses correctly using the FIRST-TAB split. Windows rejects
+    # real pathnames containing TAB (OSError Errno 22), so the parser is
+    # exercised via monkeypatched _git_run results — no real TAB pathname is
+    # created. The REAL _worktree_hazard_gate implementation is exercised.
+    sha = "a" * 40
+    tab_path = "odd\tname.txt"
+
+    def fake_git_run(project_dir, args):
+        if args == ["-c", "core.fsmonitor=", "ls-files", "--stage", "-z"]:
+            # stage record: FIRST TAB separates header from pathname; the
+            # second TAB is part of the pathname
+            return type("R", (), {"returncode": 0, "stdout": f"100644 {sha} 0\t{tab_path}\0", "stderr": ""})()
+        if args == ["-c", "core.fsmonitor=", "ls-files", "-z"]:
+            return type("R", (), {"returncode": 0, "stdout": f"{tab_path}\0", "stderr": ""})()
+        if args[:1] == ["-c"] and "check-attr" in args:
+            return type("R", (), {"returncode": 0, "stdout": f"{tab_path}\0filter\0unspecified\0", "stderr": ""})()
+        if args[:1] == ["-c"] and "config" in args:
+            return type("R", (), {"returncode": 1, "stdout": "", "stderr": ""})()
+        return type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+
+    monkeypatch.setattr(_status_mod, "_git_run", fake_git_run)
+    assert _gate(tmp_path) == "SAFE"
