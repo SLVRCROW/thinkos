@@ -2,12 +2,16 @@
 
 Contract:
 TSR v1.3 base contract, prospectively amended by
-docs/specs/TSR_V0_SPEC_v1.4.md for worktree observation and reconciliation.
+docs/specs/TSR_V0_SPEC_v1.4.md for worktree observation and reconciliation,
+and by docs/specs/TSR_V0_SPEC_v1.4.1.md for the Git-config-source
+threat-model/security interpretation.
 
 v1.1 (SHA-256 eb15926a63027a295029cb9bde9f8235c40728862cf3fd8c1493f85f29afdf6a)
 remains the prior frozen record.
 
-Read-only. No writes, no network, no shell, no authority changes.
+Read-only. No ThinkOS writes, no shell, no authority changes.
+Within the v1.4.1 trusted-config-source threat model, ThinkOS does not
+intentionally initiate network access.
 All git is invoked via subprocess argument lists only.
 """
 
@@ -245,8 +249,10 @@ def _worktree_hazard_gate(project_dir: Path) -> str | None:
 
     Order: (1) gitlink detection, (2) tracked-path enumeration,
     (3) bounded attribute batching, (4) driver configuration inspection.
-    Executes no filter/helper, writes nothing, accesses no network, and
-    mutates no Git state. _git_run is unchanged.
+    Within the v1.4.1 trusted-config-source threat model, the gate executes no
+    repository-configured filter/helper, writes nothing, and mutates no Git
+    state. Git may read trusted configuration/include/attribute-source inputs
+    as described by TSR v1.4.1.
     """
     # 1) GITLINK DETECTION FIRST — any tracked mode-160000 gitlink is a
     #    conservative hazard: worktree_dirty is UNEVALUABLE and git status
