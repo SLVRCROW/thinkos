@@ -325,6 +325,13 @@ def _worktree_hazard_gate(project_dir: Path) -> str | None:
             inspected.append(path)
             if value not in ("unspecified", "unset"):
                 drivers.add(value)
+            else:
+                # check-attr does not disambiguate the presentation sentinel
+                # from a literal driver assignment (filter=unspecified /
+                # filter=unset are valid driver names). Conservatively
+                # adjudicate the sentinel-named driver too: a false positive
+                # (extra config query) is acceptable; a false SAFE is not.
+                drivers.add(value)
     if inspected != paths:
         return None  # path-accounting mismatch: omission or duplication
 

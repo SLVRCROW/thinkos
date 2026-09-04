@@ -1164,6 +1164,113 @@ def test_v14_no_raw_attribute_file_reads_remain():
         assert bad not in src, f"raw attribute-file read remains: {bad!r}"
 
 
+def _make_sentinel_repo(tmp_path, attr_value, kind="clean"):
+    """Repo with literal filter=<sentinel> assignment + sentinel-named driver."""
+    repo = _make_repo(tmp_path)
+    (repo / "f.txt").write_text("x\n", encoding="utf-8")
+    (repo / ".gitattributes").write_text(
+        f"*.txt filter={attr_value}\n", encoding="utf-8"
+    )
+    _git(repo, "add", "-A")
+    _commit(repo, "init")
+    marker = repo / "marker.txt"
+    marker_posix = str(marker).replace("\\", "/")
+    hook = repo / "f.sh"
+    hook.write_text(f"#!/bin/sh\ntouch {marker_posix}\ncat\n", encoding="utf-8")
+    if os.name != "nt":
+        hook.chmod(0o755)
+    _git(repo, "config", f"filter.{attr_value}.{kind}", str(hook))
+    return repo, marker
+
+
+def test_v14_sentinel_unspecified_clean_unsafe(tmp_path):
+    repo, marker = _make_sentinel_repo(tmp_path, "unspecified", "clean")
+    assert _gate(repo) == _status_mod._HAZARD_UNSAFE
+    r = _cli_status(repo)
+    assert r.returncode == 2
+    assert not marker.exists()
+
+
+def test_v14_sentinel_unspecified_process_unsafe(tmp_path):
+    repo, marker = _make_sentinel_repo(tmp_path, "unspecified", "process")
+    assert _gate(repo) == _status_mod._HAZARD_UNSAFE
+    r = _cli_status(repo)
+    assert r.returncode == 2
+    assert not marker.exists()
+
+
+def test_v14_sentinel_unset_clean_unsafe(tmp_path):
+    repo, marker = _make_sentinel_repo(tmp_path, "unset", "clean")
+    assert _gate(repo) == _status_mod._HAZARD_UNSAFE
+    r = _cli_status(repo)
+    assert r.returncode == 2
+    assert not marker.exists()
+
+
+def test_v14_sentinel_unset_process_unsafe(tmp_path):
+    repo, marker = _make_sentinel_repo(tmp_path, "unset", "process")
+    assert _gate(repo) == _status_mod._HAZARD_UNSAFE
+    r = _cli_status(repo)
+    assert r.returncode == 2
+    assert not marker.exists()
+
+
+def test_v14_sentinel_unspecified_no_driver_safe(tmp_path):
+    # ordinary unspecified attribute with no filter.unspecified execution
+    # config -> SAFE remains reachable
+    repo = _make_repo(tmp_path)
+    (repo / "f.txt").write_text("x\n", encoding="utf-8")
+    (repo / ".gitattributes").write_text("*.txt filter=unspecified\n", encoding="utf-8")
+    _git(repo, "add", "-A")
+    _commit(repo, "init")
+    assert _gate(repo) == "SAFE"
+
+
+def test_v14_sentinel_unset_no_driver_safe(tmp_path):
+    # ordinary unset attribute with no filter.unset execution config -> SAFE
+    repo = _make_repo(tmp_path)
+    (repo / "f.txt").write_text("x\n", encoding="utf-8")
+    (repo / ".gitattributes").write_text("*.txt filter=unset\n", encoding="utf-8")
+    _git(repo, "add", "-A")
+    _commit(repo, "init")
+    assert _gate(repo) == "SAFE"
+
+
+def test_v14_sentinel_status_not_invoked(tmp_path, monkeypatch, capsys):
+    # hostile sentinel case: git status MUST NOT be invoked post-fix
+    repo = _make_repo(tmp_path)
+    (repo / "f.txt").write_text("x\n", encoding="utf-8")
+    (repo / ".gitattributes").write_text(
+        "*.txt filter=unspecified\n", encoding="utf-8"
+    )
+    _git(repo, "add", "-A")
+    _commit(repo, "init")
+    _init_thinkos_project(repo)  # gitignore + config BEFORE filter is configured
+    marker = repo / "marker.txt"
+    marker_posix = str(marker).replace("\\", "/")
+    hook = repo / "f.sh"
+    hook.write_text(f"#!/bin/sh\ntouch {marker_posix}\ncat\n", encoding="utf-8")
+    if os.name != "nt":
+        hook.chmod(0o755)
+    _git(repo, "config", "filter.unspecified.clean", str(hook))
+    calls = []
+    orig = _status_mod._git_run
+
+    def wrapped(project_dir, args):
+        calls.append(args)
+        return orig(project_dir, args)
+
+    monkeypatch.setattr(_status_mod, "_git_run", wrapped)
+    _write_state(repo, _good_state(repo))
+    code = _run_status_in_process(repo, capsys)
+    assert code == 2
+    assert not any(
+        a == ["-c", "core.fsmonitor=", "--no-optional-locks", "status", "--porcelain"]
+        for a in calls
+    )
+    assert not marker.exists()
+
+
 def test_v14_safe_filter_free_repo_status_invoked(tmp_path, monkeypatch, capsys):
     repo = _make_repo(tmp_path)
     (repo / "f.txt").write_text("x\n", encoding="utf-8")
