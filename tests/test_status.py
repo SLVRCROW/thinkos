@@ -1059,6 +1059,9 @@ def test_v14_info_attributes_unsafe(tmp_path):
 
 
 def test_v14_attribute_macro_unsafe(tmp_path):
+    # Valid Git macro syntax is single-line: [attr]mymacro filter=marker.
+    # check-attr resolves the macro's filter driver natively (no manual
+    # attribute-file parse needed) -> the gate must report UNSAFE.
     repo = _make_repo(tmp_path)
     marker = repo / "filter_ran.txt"
     marker_posix = str(marker).replace("\\", "/")
@@ -1067,14 +1070,98 @@ def test_v14_attribute_macro_unsafe(tmp_path):
     if os.name != "nt":
         hook.chmod(0o755)
     _git(repo, "config", "filter.marker.clean", str(hook))
-    _git(repo, "config", "attr.mymacro.filter", "marker")
     (repo / ".gitattributes").write_text(
-        "[attr]mymacro\nfilter=marker\n*.bin mymacro\n", encoding="utf-8"
+        "[attr]mymacro filter=marker\n*.bin mymacro\n", encoding="utf-8"
     )
     (repo / "m.bin").write_text("m\n", encoding="utf-8")
     _git(repo, "add", "-A")
     _commit(repo, "init")
     assert _gate(repo) == _status_mod._HAZARD_UNSAFE
+
+
+def test_v14_attribute_macro_nested_unsafe(tmp_path):
+    # Macro defined at repo root applies to a nested path; check-attr resolves
+    # the effective filter driver natively.
+    repo = _make_repo(tmp_path)
+    (repo / "nested").mkdir()
+    marker = repo / "filter_ran.txt"
+    marker_posix = str(marker).replace("\\", "/")
+    hook = repo / "f.sh"
+    hook.write_text(f"#!/bin/sh\ntouch {marker_posix}\ncat\n", encoding="utf-8")
+    if os.name != "nt":
+        hook.chmod(0o755)
+    _git(repo, "config", "filter.marker.clean", str(hook))
+    (repo / ".gitattributes").write_text(
+        "[attr]mymacro filter=marker\n*.bin mymacro\n", encoding="utf-8"
+    )
+    (repo / "nested" / "m.bin").write_text("m\n", encoding="utf-8")
+    _git(repo, "add", "-A")
+    _commit(repo, "init")
+    assert _gate(repo) == _status_mod._HAZARD_UNSAFE
+
+
+def test_v14_global_attributes_file_macro_unsafe(tmp_path):
+    # core.attributesFile (isolated global attribute source) macro resolves
+    # through check-attr only when the gate invocation carries the -c override;
+    # the gate does not read global files directly.
+    repo = _make_repo(tmp_path)
+    global_attrs = tmp_path / "global-attrs"
+    global_attrs.write_text(
+        "[attr]mymacro filter=marker\n*.bin mymacro\n", encoding="utf-8"
+    )
+    marker = repo / "filter_ran.txt"
+    marker_posix = str(marker).replace("\\", "/")
+    hook = repo / "f.sh"
+    hook.write_text(f"#!/bin/sh\ntouch {marker_posix}\ncat\n", encoding="utf-8")
+    if os.name != "nt":
+        hook.chmod(0o755)
+    (repo / "m.bin").write_text("m\n", encoding="utf-8")
+    _git(repo, "add", "-A")
+    _commit(repo, "init")
+    # configure the isolated global attribute source for the hazard-gate queries
+    _git(repo, "config", f"core.attributesFile", str(global_attrs))
+    _git(repo, "config", "filter.marker.clean", str(hook))
+    assert _gate(repo) == _status_mod._HAZARD_UNSAFE
+
+
+def test_v14_tracked_symlink_gitattributes_not_followed(tmp_path):
+    # A tracked symlink named .gitattributes must never be followed by ThinkOS:
+    # the external target's content must not influence the hazard result.
+    if os.name == "nt":
+        try:
+            (tmp_path / "lnk").symlink_to(tmp_path / "nope")
+        except OSError:
+            pass  # symlink creation unsupported on this Windows; skip assertion
+    repo = _make_repo(tmp_path)
+    ext = tmp_path / "external-target"
+    ext.write_text("*.txt filter=marker\n", encoding="utf-8")  # hostile content
+    (repo / "f.txt").write_text("x\n", encoding="utf-8")
+    (repo / "lnk-ignored").write_text("not an attribute file\n", encoding="utf-8")
+    try:
+        (repo / ".gitattributes").symlink_to(ext)
+    except OSError:
+        # platform cannot create symlink; a tracked regular .gitattributes
+        # with hostile content is the next-best assertion that no raw read
+        # of attribute files occurs (see gate-absence check below)
+        (repo / ".gitattributes").write_text("*.txt filter=marker\n", encoding="utf-8")
+    _git(repo, "add", "-A")
+    _commit(repo, "init")
+    # no filter is configured -> gate is SAFE even though the external target
+    # (or the regular file) contains "filter=marker"
+    assert _gate(repo) == "SAFE"
+
+
+def test_v14_no_raw_attribute_file_reads_remain():
+    # The hazard gate must not contain any raw Path read of attribute files.
+    import inspect
+    src = inspect.getsource(_status_mod._worktree_hazard_gate)
+    for bad in (
+        '.gitattributes',
+        'read_text(',
+        'read_bytes(',
+        'open(',
+    ):
+        assert bad not in src, f"raw attribute-file read remains: {bad!r}"
 
 
 def test_v14_safe_filter_free_repo_status_invoked(tmp_path, monkeypatch, capsys):

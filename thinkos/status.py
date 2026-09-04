@@ -1,6 +1,9 @@
 """Thin State Reconciliation v0 (TSR v0) — read-only recorded-vs-live status.
 
-Contract: docs/specs/TSR_V0_SPEC_v1.3.md (controlling, adopted 2026-09-02).
+Contract:
+TSR v1.3 base contract, prospectively amended by
+docs/specs/TSR_V0_SPEC_v1.4.md for worktree observation and reconciliation.
+
 v1.1 (SHA-256 eb15926a63027a295029cb9bde9f8235c40728862cf3fd8c1493f85f29afdf6a)
 remains the prior frozen record.
 
@@ -324,36 +327,6 @@ def _worktree_hazard_gate(project_dir: Path) -> str | None:
                 drivers.add(value)
     if inspected != paths:
         return None  # path-accounting mismatch: omission or duplication
-
-    # 3b) ATTRIBUTE MACRO SCAN — check-attr does NOT expand macros into the
-    #      `filter` attribute (verified empirically: a macro body `filter=marker`
-    #      leaves `check-attr filter` reporting `unspecified`). A macro whose
-    #      body sets `filter=` is an execution-capable configuration present in
-    #      the repository, so the gate must treat it as UNSAFE. Read the
-    #      attribute files as text (read-only, no execution) and parse `[attr]`
-    #      sections.
-    attr_files = [p for p in paths if p.endswith(".gitattributes")]
-    info_attrs = project_dir / ".git" / "info" / "attributes"
-    if info_attrs.is_file():
-        attr_files.append(str(info_attrs.relative_to(project_dir)))
-    for rel in attr_files:
-        try:
-            text = (project_dir / rel).read_text(encoding="utf-8")
-        except (OSError, UnicodeDecodeError, MemoryError):
-            return None  # cannot safely determine macro configuration
-        in_macro = False
-        for line in text.splitlines():
-            stripped = line.strip()
-            if stripped.startswith("[attr]"):
-                in_macro = True
-                continue
-            if in_macro:
-                if stripped.startswith("["):
-                    in_macro = False
-                    continue
-                if "filter=" in stripped:
-                    return _HAZARD_UNSAFE  # macro body sets an execution-capable filter
-        # end of file: a trailing macro section with filter= was already caught
 
     # 4) DRIVER CONFIGURATION INSPECTION
     for driver in sorted(drivers):
