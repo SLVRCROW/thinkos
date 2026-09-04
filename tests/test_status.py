@@ -549,12 +549,10 @@ def test_16b_worktree_probe_forces_fsmonitor_off_and_optional_locks_off(
 
     result = status_mod._probe_worktree_dirty(Path("/tmp/fake-repo"))
 
-    # Exact argument vector — no weaker assertion. The empty config value
-    # `core.fsmonitor=` is the legacy-compatible suppression: Git ≤2.35.1
-    # interprets non-empty values as hook command pathnames (so "false" would
-    # be executed), while an empty value disables fsmonitor under both legacy
-    # pathname semantics and modern boolean semantics.
-    assert captured_args == [
+    # The hazard gate runs first (ls-files/check-attr/config calls); the
+    # status vector must appear EXACTLY once with the exact suppression shape.
+    status_calls = [a for a in captured_args if "status" in a]
+    assert status_calls == [
         [
             "-c",
             "core.fsmonitor=",
@@ -562,7 +560,7 @@ def test_16b_worktree_probe_forces_fsmonitor_off_and_optional_locks_off(
             "status",
             "--porcelain",
         ]
-    ], f"unexpected git argument vector: {captured_args}"
+    ], f"unexpected status argument vector: {status_calls}"
     # Ordinary probe semantics through the injected result: empty stdout +
     # returncode 0 -> clean.
     assert result == {"dirty": False}
@@ -946,3 +944,414 @@ def test_22_defined_branch_failure_remains_detached_stale_exit1(
     assert branch["evaluated"] is True
     assert branch["matches"] is False
     assert _tree(repo) == before
+
+
+# ── TSR v1.4: worktree hazard gate + all-recorded-probes CURRENT rule ─────
+# (2026-09-03, Work Unit B). The hazard gate must positively establish that no
+# execution-capable conversion/filter configuration applies before git status
+# is reachable. Any tracked gitlink makes the probe UNEVALUABLE. CURRENT
+# requires every well-formed RECORDED probe evaluated and matching.
+import thinkos.status as _status_mod
+
+
+def _gate(repo: Path):
+    return _status_mod._worktree_hazard_gate(repo)
+
+
+def _make_filter_repo(tmp_path, driver="marker", kind="clean", required=False):
+    """Repo with a tracked file under an execution-capable filter driver.
+
+    The filter config is applied AFTER the initial commit so fixture setup
+    (git add) does not execute the filter and create the marker.
+    """
+    repo = _make_repo(tmp_path)
+    (repo / "f.txt").write_text("x\n", encoding="utf-8")
+    _git(repo, "add", "-A")
+    _commit(repo, "init")
+    marker = repo / "filter_ran.txt"
+    marker_posix = str(marker).replace("\\", "/")
+    hook = repo / "f.sh"
+    hook.write_text(
+        f"#!/bin/sh\ntouch {marker_posix}\ncat\n", encoding="utf-8"
+    )
+    if os.name != "nt":
+        hook.chmod(0o755)
+    (repo / ".gitattributes").write_text("f.txt filter=marker\n", encoding="utf-8")
+    _git(repo, "config", f"filter.marker.{kind}", str(hook))
+    if required:
+        _git(repo, "config", "filter.marker.required", "true")
+    return repo, marker
+
+
+def test_v14_clean_filter_unsafe_unevaluable(tmp_path):
+    repo, marker = _make_filter_repo(tmp_path, kind="clean")
+    assert _gate(repo) == _status_mod._HAZARD_UNSAFE
+    # full status: worktree probe unevaluable, no marker created
+    before = _tree(repo)
+    r = _cli_status(repo)
+    assert r.returncode == 2
+    result = json.loads(r.stdout)
+    wt = next(p for p in result["probes"] if p["key"] == "worktree_dirty")
+    assert wt["evaluated"] is False
+    assert wt["live"] is None
+    assert not marker.exists()
+    assert _tree(repo) == before
+
+
+def test_v14_process_filter_unsafe_unevaluable(tmp_path):
+    repo, marker = _make_filter_repo(tmp_path, kind="process")
+    assert _gate(repo) == _status_mod._HAZARD_UNSAFE
+    r = _cli_status(repo)
+    assert r.returncode == 2
+    result = json.loads(r.stdout)
+    wt = next(p for p in result["probes"] if p["key"] == "worktree_dirty")
+    assert wt["evaluated"] is False
+    assert not marker.exists()
+
+
+def test_v14_required_filter_alone_not_execution_capable(tmp_path):
+    # required=true with no clean/process value: not execution-capable by
+    # itself; the gate must not report UNSAFE from required alone.
+    repo = _make_repo(tmp_path)
+    (repo / ".gitattributes").write_text("f.txt filter=marker\n", encoding="utf-8")
+    _git(repo, "config", "filter.marker.required", "true")
+    (repo / "f.txt").write_text("x\n", encoding="utf-8")
+    _git(repo, "add", "-A")
+    _commit(repo, "init")
+    assert _gate(repo) == "SAFE"
+
+
+def test_v14_nested_gitattributes_unsafe(tmp_path):
+    repo = _make_repo(tmp_path)
+    (repo / "nested").mkdir()
+    marker = repo / "filter_ran.txt"
+    marker_posix = str(marker).replace("\\", "/")
+    hook = repo / "f.sh"
+    hook.write_text(f"#!/bin/sh\ntouch {marker_posix}\ncat\n", encoding="utf-8")
+    if os.name != "nt":
+        hook.chmod(0o755)
+    (repo / "nested" / ".gitattributes").write_text(
+        "*.dat filter=marker\n", encoding="utf-8"
+    )
+    _git(repo, "config", "filter.marker.clean", str(hook))
+    (repo / "nested" / "d.dat").write_text("y\n", encoding="utf-8")
+    _git(repo, "add", "-A")
+    _commit(repo, "init")
+    assert _gate(repo) == _status_mod._HAZARD_UNSAFE
+
+
+def test_v14_info_attributes_unsafe(tmp_path):
+    repo = _make_repo(tmp_path)
+    marker = repo / "filter_ran.txt"
+    marker_posix = str(marker).replace("\\", "/")
+    hook = repo / "f.sh"
+    hook.write_text(f"#!/bin/sh\ntouch {marker_posix}\ncat\n", encoding="utf-8")
+    if os.name != "nt":
+        hook.chmod(0o755)
+    (repo / ".git" / "info" / "attributes").write_text(
+        "info.txt filter=marker\n", encoding="utf-8"
+    )
+    _git(repo, "config", "filter.marker.clean", str(hook))
+    (repo / "info.txt").write_text("z\n", encoding="utf-8")
+    _git(repo, "add", "-A")
+    _commit(repo, "init")
+    assert _gate(repo) == _status_mod._HAZARD_UNSAFE
+
+
+def test_v14_attribute_macro_unsafe(tmp_path):
+    repo = _make_repo(tmp_path)
+    marker = repo / "filter_ran.txt"
+    marker_posix = str(marker).replace("\\", "/")
+    hook = repo / "f.sh"
+    hook.write_text(f"#!/bin/sh\ntouch {marker_posix}\ncat\n", encoding="utf-8")
+    if os.name != "nt":
+        hook.chmod(0o755)
+    _git(repo, "config", "filter.marker.clean", str(hook))
+    _git(repo, "config", "attr.mymacro.filter", "marker")
+    (repo / ".gitattributes").write_text(
+        "[attr]mymacro\nfilter=marker\n*.bin mymacro\n", encoding="utf-8"
+    )
+    (repo / "m.bin").write_text("m\n", encoding="utf-8")
+    _git(repo, "add", "-A")
+    _commit(repo, "init")
+    assert _gate(repo) == _status_mod._HAZARD_UNSAFE
+
+
+def test_v14_safe_filter_free_repo_status_invoked(tmp_path, monkeypatch, capsys):
+    repo = _make_repo(tmp_path)
+    (repo / "f.txt").write_text("x\n", encoding="utf-8")
+    _git(repo, "add", "-A")
+    _commit(repo, "init")
+    _init_thinkos_project(repo)  # gitignore so state file stays untracked-clean
+    assert _gate(repo) == "SAFE"
+    # prove git status IS invoked on SAFE (in-process so the monkeypatch applies)
+    calls = []
+    orig = _status_mod._git_run
+
+    def wrapped(project_dir, args):
+        calls.append(args)
+        return orig(project_dir, args)
+
+    monkeypatch.setattr(_status_mod, "_git_run", wrapped)
+    _write_state(repo, _good_state(repo))
+    code = _run_status_in_process(repo, capsys)
+    assert code == 0
+    assert any("status" in a for a in calls)
+
+
+def test_v14_unsafe_git_status_not_invoked(tmp_path, monkeypatch, capsys):
+    repo = _make_repo(tmp_path)
+    (repo / "f.txt").write_text("x\n", encoding="utf-8")
+    _git(repo, "add", "-A")
+    _commit(repo, "init")
+    _init_thinkos_project(repo)  # gitignore + config BEFORE filter is configured
+    marker = repo / "filter_ran.txt"
+    marker_posix = str(marker).replace("\\", "/")
+    hook = repo / "f.sh"
+    hook.write_text(f"#!/bin/sh\ntouch {marker_posix}\ncat\n", encoding="utf-8")
+    if os.name != "nt":
+        hook.chmod(0o755)
+    (repo / ".gitattributes").write_text("f.txt filter=marker\n", encoding="utf-8")
+    _git(repo, "config", "filter.marker.clean", str(hook))
+    calls = []
+    orig = _status_mod._git_run
+
+    def wrapped(project_dir, args):
+        calls.append(args)
+        return orig(project_dir, args)
+
+    monkeypatch.setattr(_status_mod, "_git_run", wrapped)
+    _write_state(repo, _good_state(repo))
+    code = _run_status_in_process(repo, capsys)
+    assert code == 2
+    # the exact worktree status vector must NOT be invoked (doctor's own git
+    # calls are unrelated)
+    assert not any(
+        a == ["-c", "core.fsmonitor=", "--no-optional-locks", "status", "--porcelain"]
+        for a in calls
+    )
+    assert not marker.exists()
+
+
+def test_v14_false_current_regression_unknown(tmp_path, monkeypatch):
+    # four matching recorded probes + unevaluable worktree -> UNKNOWN, never
+    # CURRENT (the v1.4 all-recorded-probes rule).
+    repo = _make_repo(tmp_path)
+    (repo / "f.txt").write_text("x\n", encoding="utf-8")
+    _git(repo, "add", "-A")
+    _commit(repo, "init")
+    state = _good_state(repo)
+    _write_state(repo, state)
+    # force worktree probe unevaluable via hazard gate (clean filter)
+    marker = repo / "filter_ran.txt"
+    marker_posix = str(marker).replace("\\", "/")
+    hook = repo / "f.sh"
+    hook.write_text(f"#!/bin/sh\ntouch {marker_posix}\ncat\n", encoding="utf-8")
+    if os.name != "nt":
+        hook.chmod(0o755)
+    (repo / ".gitattributes").write_text("f.txt filter=marker\n", encoding="utf-8")
+    _git(repo, "config", "filter.marker.clean", str(hook))
+    r = _cli_status(repo)
+    result = json.loads(r.stdout)
+    assert result["status"] == "UNKNOWN"
+    assert r.returncode == 2
+    wt = next(p for p in result["probes"] if p["key"] == "worktree_dirty")
+    assert wt["evaluated"] is False
+
+
+def test_v14_evaluated_mismatch_plus_unevaluable_stale(tmp_path):
+    # evaluated mismatch + unevaluable worktree -> STALE
+    repo = _make_repo(tmp_path)
+    (repo / "f.txt").write_text("x\n", encoding="utf-8")
+    _git(repo, "add", "-A")
+    _commit(repo, "init")
+    state = _good_state(repo)
+    # record a WRONG head_sha so an evaluated probe mismatches
+    state["probes"]["head_sha"] = {"value": "0" * 40}
+    _write_state(repo, state)
+    marker = repo / "filter_ran.txt"
+    marker_posix = str(marker).replace("\\", "/")
+    hook = repo / "f.sh"
+    hook.write_text(f"#!/bin/sh\ntouch {marker_posix}\ncat\n", encoding="utf-8")
+    if os.name != "nt":
+        hook.chmod(0o755)
+    (repo / ".gitattributes").write_text("f.txt filter=marker\n", encoding="utf-8")
+    _git(repo, "config", "filter.marker.clean", str(hook))
+    r = _cli_status(repo)
+    result = json.loads(r.stdout)
+    assert result["status"] == "STALE"
+    assert r.returncode == 1
+
+
+def test_v14_malformed_recorded_probe_still_excluded(tmp_path):
+    # a malformed individual recorded probe stays excluded (v1.3) and does not
+    # by itself force UNKNOWN; the remaining well-formed probes decide.
+    repo = _make_repo(tmp_path)
+    (repo / "f.txt").write_text("x\n", encoding="utf-8")
+    _git(repo, "add", "-A")
+    _commit(repo, "init")
+    _init_thinkos_project(repo)  # gitignore so state file stays untracked-clean
+    state = _good_state(repo)
+    state["probes"]["head_sha"] = {"value": "not-a-sha"}  # malformed
+    _write_state(repo, state)
+    r = _cli_status(repo)
+    result = json.loads(r.stdout)
+    assert result["status"] == "CURRENT"
+    hs = next(p for p in result["probes"] if p["key"] == "head_sha")
+    assert hs["evaluated"] is False
+    assert hs["recorded"] is None
+
+
+def test_v14_multiple_batches_and_partial(tmp_path):
+    # > MAX_PATHS_PER_BATCH paths -> multiple batches; final partial batch;
+    # every path accounted exactly once; SAFE on a filter-free repo.
+    repo = _make_repo(tmp_path)
+    for i in range(300):
+        (repo / f"f{i:04d}.txt").write_text(f"content {i}\n", encoding="utf-8")
+    _git(repo, "add", "-A")
+    _commit(repo, "init")
+    assert _gate(repo) == "SAFE"
+
+
+def test_v14_middle_batch_failure_unevaluable(tmp_path, monkeypatch):
+    repo = _make_repo(tmp_path)
+    for i in range(300):
+        (repo / f"f{i:04d}.txt").write_text(f"content {i}\n", encoding="utf-8")
+    _git(repo, "add", "-A")
+    _commit(repo, "init")
+    calls = []
+    attr_calls = []
+    orig = _status_mod._git_run
+
+    def wrapped(project_dir, args):
+        calls.append(args)
+        if args[:1] == ["-c"] and "check-attr" in args:
+            attr_calls.append(args)
+            if len(attr_calls) == 2:
+                return None  # middle batch launch failure
+        return orig(project_dir, args)
+
+    monkeypatch.setattr(_status_mod, "_git_run", wrapped)
+    assert _gate(repo) is None
+
+
+def test_v14_malformed_middle_batch_unevaluable(tmp_path, monkeypatch):
+    repo = _make_repo(tmp_path)
+    for i in range(300):
+        (repo / f"f{i:04d}.txt").write_text(f"content {i}\n", encoding="utf-8")
+    _git(repo, "add", "-A")
+    _commit(repo, "init")
+    calls = []
+    attr_calls = []
+    orig = _status_mod._git_run
+
+    def wrapped(project_dir, args):
+        calls.append(args)
+        if args[:1] == ["-c"] and "check-attr" in args:
+            attr_calls.append(args)
+            if len(attr_calls) == 2:
+                return type("R", (), {"returncode": 0, "stdout": "malformed", "stderr": ""})()
+        return orig(project_dir, args)
+
+    monkeypatch.setattr(_status_mod, "_git_run", wrapped)
+    assert _gate(repo) is None
+
+
+def test_v14_tracked_submodule_unevaluable(tmp_path):
+    # superproject with a tracked submodule -> worktree probe UNEVALUABLE;
+    # git status NOT invoked; submodule clean/process markers NOT created.
+    sub = tmp_path / "sub"
+    sub.mkdir()
+    _git(sub, "init", "-q")
+    _git(sub, "config", "user.email", "t@t")
+    _git(sub, "config", "user.name", "t")
+    (sub / "s.txt").write_text("s\n", encoding="utf-8")
+    _git(sub, "add", "s.txt")
+    _commit(sub, "init")
+    marker = sub / "sub_filter_ran.txt"
+    marker_posix = str(marker).replace("\\", "/")
+    hook = sub / "f.sh"
+    hook.write_text(f"#!/bin/sh\ntouch {marker_posix}\ncat\n", encoding="utf-8")
+    if os.name != "nt":
+        hook.chmod(0o755)
+    _git(sub, "config", "filter.marker.clean", str(hook))
+    (sub / ".gitattributes").write_text("s.txt filter=marker\n", encoding="utf-8")
+
+    repo = _make_repo(tmp_path, name="sup")
+    _git(repo, "-c", "protocol.file.allow=always", "submodule", "add", "-q", str(sub), "sub")
+    _commit(repo, "add submodule")
+    assert _gate(repo) is None  # gitlink -> UNEVALUABLE
+    r = _cli_status(repo)
+    result = json.loads(r.stdout)
+    wt = next(p for p in result["probes"] if p["key"] == "worktree_dirty")
+    assert wt["evaluated"] is False
+    assert not marker.exists()
+
+
+def test_v14_submodule_unevaluable_unknown_not_current(tmp_path):
+    # four otherwise matching recorded probes + submodule-induced unevaluable
+    # worktree -> UNKNOWN, never CURRENT.
+    sub = tmp_path / "sub"
+    sub.mkdir()
+    _git(sub, "init", "-q")
+    _git(sub, "config", "user.email", "t@t")
+    _git(sub, "config", "user.name", "t")
+    (sub / "s.txt").write_text("s\n", encoding="utf-8")
+    _git(sub, "add", "s.txt")
+    _commit(sub, "init")
+    repo = _make_repo(tmp_path, name="sup")
+    _git(repo, "-c", "protocol.file.allow=always", "submodule", "add", "-q", str(sub), "sub")
+    _commit(repo, "add submodule")
+    _write_state(repo, _good_state(repo))
+    r = _cli_status(repo)
+    result = json.loads(r.stdout)
+    assert result["status"] == "UNKNOWN"
+    assert r.returncode == 2
+
+
+def test_v14_submodule_unevaluable_mismatch_stale(tmp_path):
+    sub = tmp_path / "sub"
+    sub.mkdir()
+    _git(sub, "init", "-q")
+    _git(sub, "config", "user.email", "t@t")
+    _git(sub, "config", "user.name", "t")
+    (sub / "s.txt").write_text("s\n", encoding="utf-8")
+    _git(sub, "add", "s.txt")
+    _commit(sub, "init")
+    repo = _make_repo(tmp_path, name="sup")
+    _git(repo, "-c", "protocol.file.allow=always", "submodule", "add", "-q", str(sub), "sub")
+    _commit(repo, "add submodule")
+    state = _good_state(repo)
+    state["probes"]["head_sha"] = {"value": "0" * 40}  # evaluated mismatch
+    _write_state(repo, state)
+    r = _cli_status(repo)
+    result = json.loads(r.stdout)
+    assert result["status"] == "STALE"
+    assert r.returncode == 1
+
+
+def test_v14_gitlink_parse_failure_unevaluable(tmp_path, monkeypatch):
+    repo = _make_repo(tmp_path)
+    (repo / "f.txt").write_text("x\n", encoding="utf-8")
+    _git(repo, "add", "-A")
+    _commit(repo, "init")
+    orig = _status_mod._git_run
+
+    def wrapped(project_dir, args):
+        if args == ["-c", "core.fsmonitor=", "ls-files", "--stage", "-z"]:
+            return type("R", (), {"returncode": 0, "stdout": "malformed-no-tab", "stderr": ""})()
+        return orig(project_dir, args)
+
+    monkeypatch.setattr(_status_mod, "_git_run", wrapped)
+    assert _gate(repo) is None
+
+
+def test_v14_tab_in_tracked_pathname_parses(tmp_path):
+    # a tracked pathname containing a literal TAB parses correctly using the
+    # FIRST-TAB split; the pathname is preserved verbatim after the first TAB.
+    repo = _make_repo(tmp_path)
+    weird = repo / "odd\tname.txt"
+    weird.write_text("w\n", encoding="utf-8")
+    _git(repo, "add", "-A")
+    _commit(repo, "init")
+    assert _gate(repo) == "SAFE"

@@ -222,8 +222,172 @@ def _probe_upstream(project_dir: Path) -> dict | None:
     return {"configured": True, "ref": ref, "sha": sha}
 
 
+_HAZARD_UNSAFE = "UNSAFE"
+
+_MAX_PATHS_PER_BATCH = 128
+_MAX_BYTES_PER_BATCH = 8192
+
+_MODE_RE = re.compile(r"^[0-7]{6}$")
+_STAGE_RE = re.compile(r"^[0-3]$")
+
+
+def _worktree_hazard_gate(project_dir: Path) -> str | None:
+    """TSR v1.4 read-only hazard gate.
+
+    Returns "SAFE" only when no execution-capable conversion/filter
+    configuration is positively established; "UNSAFE" when an effective
+    driver can execute through clean/process behavior; None (UNEVALUABLE)
+    on any launch failure, decode failure, parse ambiguity, incomplete
+    enumeration, or otherwise uncertain observation.
+
+    Order: (1) gitlink detection, (2) tracked-path enumeration,
+    (3) bounded attribute batching, (4) driver configuration inspection.
+    Executes no filter/helper, writes nothing, accesses no network, and
+    mutates no Git state. _git_run is unchanged.
+    """
+    # 1) GITLINK DETECTION FIRST — any tracked mode-160000 gitlink is a
+    #    conservative hazard: worktree_dirty is UNEVALUABLE and git status
+    #    MUST NOT be invoked (spec v1.4 §3b).
+    #    NOTE: every gate command carries the command-local fsmonitor
+    #    suppression (-c core.fsmonitor=) because ls-files/check-attr also
+    #    consult the index and would otherwise execute a configured fsmonitor
+    #    hook — the gate itself must execute no helper (spec v1.4 §3/§5).
+    stage_result = _git_run(
+        project_dir, ["-c", "core.fsmonitor=", "ls-files", "--stage", "-z"]
+    )
+    if stage_result is None or isinstance(stage_result, _DecodeFailedProcess):
+        return None
+    if stage_result.returncode != 0:
+        return None
+    for record in stage_result.stdout.split("\0"):
+        if not record:
+            continue
+        header, sep, _path = record.partition("\t")
+        if not sep:
+            return None  # malformed record: no TAB separator
+        parts = header.split(" ")
+        if len(parts) != 3:
+            return None  # malformed header
+        mode, sha, stage = parts
+        if not _MODE_RE.fullmatch(mode) or not _SHA_RE.fullmatch(sha):
+            return None  # malformed header
+        if not _STAGE_RE.fullmatch(stage):
+            return None  # malformed stage
+        if mode == "160000":
+            return None  # tracked gitlink -> UNEVALUABLE immediately
+
+    # 2) TRACKED-PATH ENUMERATION
+    list_result = _git_run(project_dir, ["-c", "core.fsmonitor=", "ls-files", "-z"])
+    if list_result is None or isinstance(list_result, _DecodeFailedProcess):
+        return None
+    if list_result.returncode != 0:
+        return None
+    paths = [p for p in list_result.stdout.split("\0") if p != ""]
+    if not paths:
+        return "SAFE"  # no tracked paths can carry a filter
+
+    # 3) BOUNDED ATTRIBUTE BATCHING
+    batches: list[list[str]] = []
+    cur: list[str] = []
+    cur_bytes = 0
+    for p in paths:
+        b = len(p.encode("utf-8"))
+        if cur and (len(cur) >= _MAX_PATHS_PER_BATCH or cur_bytes + b > _MAX_BYTES_PER_BATCH):
+            batches.append(cur)
+            cur = []
+            cur_bytes = 0
+        cur.append(p)
+        cur_bytes += b
+    if cur:
+        batches.append(cur)
+
+    drivers: set[str] = set()
+    inspected: list[str] = []
+    for batch in batches:
+        attr_result = _git_run(
+            project_dir,
+            ["-c", "core.fsmonitor=", "check-attr", "-z", "filter", "--", *batch],
+        )
+        if attr_result is None or isinstance(attr_result, _DecodeFailedProcess):
+            return None
+        if attr_result.returncode != 0:
+            return None
+        fields = [f for f in attr_result.stdout.split("\0") if f != ""]
+        if len(fields) % 3 != 0:
+            return None  # malformed triple output
+        for i in range(0, len(fields), 3):
+            path, attr, value = fields[i], fields[i + 1], fields[i + 2]
+            if attr != "filter":
+                return None  # unexpected attribute field
+            inspected.append(path)
+            if value not in ("unspecified", "unset"):
+                drivers.add(value)
+    if inspected != paths:
+        return None  # path-accounting mismatch: omission or duplication
+
+    # 3b) ATTRIBUTE MACRO SCAN — check-attr does NOT expand macros into the
+    #      `filter` attribute (verified empirically: a macro body `filter=marker`
+    #      leaves `check-attr filter` reporting `unspecified`). A macro whose
+    #      body sets `filter=` is an execution-capable configuration present in
+    #      the repository, so the gate must treat it as UNSAFE. Read the
+    #      attribute files as text (read-only, no execution) and parse `[attr]`
+    #      sections.
+    attr_files = [p for p in paths if p.endswith(".gitattributes")]
+    info_attrs = project_dir / ".git" / "info" / "attributes"
+    if info_attrs.is_file():
+        attr_files.append(str(info_attrs.relative_to(project_dir)))
+    for rel in attr_files:
+        try:
+            text = (project_dir / rel).read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError, MemoryError):
+            return None  # cannot safely determine macro configuration
+        in_macro = False
+        for line in text.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("[attr]"):
+                in_macro = True
+                continue
+            if in_macro:
+                if stripped.startswith("["):
+                    in_macro = False
+                    continue
+                if "filter=" in stripped:
+                    return _HAZARD_UNSAFE  # macro body sets an execution-capable filter
+        # end of file: a trailing macro section with filter= was already caught
+
+    # 4) DRIVER CONFIGURATION INSPECTION
+    for driver in sorted(drivers):
+        for suffix in ("clean", "process", "required"):
+            cfg_result = _git_run(
+                project_dir,
+                ["-c", "core.fsmonitor=", "config", "--get", f"filter.{driver}.{suffix}"],
+            )
+            if cfg_result is None or isinstance(cfg_result, _DecodeFailedProcess):
+                return None
+            if cfg_result.returncode == 0:
+                value = cfg_result.stdout.strip()
+                if suffix in ("clean", "process") and value:
+                    return _HAZARD_UNSAFE
+                if suffix == "required" and value not in ("true", "false"):
+                    return None  # unexplained configuration shape
+            elif cfg_result.returncode != 1:
+                return None  # uncertain config query result
+
+    return "SAFE"
+
+
 def _probe_worktree_dirty(project_dir: Path) -> dict | None:
-    """git status --porcelain: non-empty -> {dirty: true}, empty -> {dirty: false}."""
+    """TSR v1.4: hazard gate first; git status only when SAFE.
+
+    The read-only hazard gate (gitlink detection + bounded attribute/filter
+    inspection) must positively establish that no execution-capable
+    conversion/filter configuration applies before git status is reachable.
+    If the gate is UNSAFE or UNEVALUABLE, the probe is unevaluable and
+    git status MUST NOT be invoked (spec v1.4 §3/§3a/§3b).
+    """
+    hazard = _worktree_hazard_gate(project_dir)
+    if hazard is None or hazard == _HAZARD_UNSAFE:
+        return None  # UNEVALUABLE; git status NOT invoked
     # Both -c core.fsmonitor= and --no-optional-locks are GLOBAL git options
     # and must precede the subcommand. The -c override is command-local only.
     # The EMPTY value is the legacy-compatible fsmonitor suppression: Git
@@ -278,6 +442,11 @@ def _reconcile(project_dir: Path, recorded: dict) -> dict:
         verdict = "UNKNOWN"
     elif any(p["evaluated"] and not p["matches"] for p in probes):
         verdict = "STALE"
+    elif any(p["recorded"] is not None and p["live"] is None for p in probes):
+        # TSR v1.4: a well-formed RECORDED probe with unevaluable live
+        # observation prohibits CURRENT (spec v1.4 §4). Omitted and malformed
+        # probes are excluded by the caller's recorded-value validation.
+        verdict = "UNKNOWN"
     else:
         verdict = "CURRENT"
     return {"status": verdict, "probes": probes, "reasons": reasons}
